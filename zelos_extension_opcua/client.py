@@ -641,7 +641,7 @@ class OPCUAClient:
             }
             for n in self.node_map.nodes
             if n.writable is True
-            or (n.writable is None and self._writable_cache.get(n.node_id, True))
+            or (n.writable is None and self._writable_cache.get(n.node_id, False))
         ]
         return {"nodes": nodes, "count": len(nodes)}
 
