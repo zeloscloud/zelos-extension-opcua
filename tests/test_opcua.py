@@ -8,7 +8,6 @@ Tests core functionality:
 """
 
 import asyncio
-import contextlib
 import json
 import tempfile
 import threading
