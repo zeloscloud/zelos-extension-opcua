@@ -1,0 +1,81 @@
+{
+  "$comment": "OPC-UA extension configuration schema. See https://docs.zeloscloud.io/sdk/how-to/develop-extensions/#configuration",
+  "type": "object",
+  "title": "OPC-UA Configuration",
+  "description": "Configure your OPC-UA server connection and node polling",
+  "properties": {
+    "demo": {
+      "type": "boolean",
+      "title": "Demo Mode",
+      "description": "Use built-in PLC simulator (no hardware required)",
+      "default": false
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Server Endpoint",
+      "description": "OPC-UA server endpoint URL",
+      "default": "opc.tcp://localhost:4840",
+      "ui:placeholder": "opc.tcp://hostname:port/path"
+    },
+    "security_mode": {
+      "type": "string",
+      "title": "Security Mode",
+      "description": "OPC-UA security mode",
+      "enum": ["None", "Sign", "SignAndEncrypt"],
+      "default": "None"
+    },
+    "security_policy": {
+      "type": "string",
+      "title": "Security Policy",
+      "description": "OPC-UA security policy",
+      "enum": ["None", "Basic256Sha256", "Aes128Sha256RsaOaep", "Aes256Sha256RsaPss"],
+      "default": "None"
+    },
+    "username": {
+      "type": "string",
+      "title": "Username",
+      "description": "Username for authentication (leave empty for anonymous)",
+      "default": ""
+    },
+    "password": {
+      "type": "string",
+      "title": "Password",
+      "description": "Password for authentication",
+      "default": "",
+      "ui:widget": "password"
+    },
+    "node_map_file": {
+      "type": "string",
+      "title": "Node Map File",
+      "description": "Path to JSON node map file (optional)",
+      "ui:widget": "file-picker",
+      "ui:options": {
+        "accept": ".json"
+      }
+    },
+    "poll_interval": {
+      "type": "number",
+      "title": "Poll Interval (seconds)",
+      "description": "How often to poll nodes",
+      "default": 1.0,
+      "minimum": 0.1,
+      "maximum": 60.0
+    },
+    "timeout": {
+      "type": "number",
+      "title": "Timeout (seconds)",
+      "description": "OPC-UA request timeout",
+      "default": 5.0,
+      "minimum": 1.0,
+      "maximum": 30.0
+    },
+    "log_level": {
+      "type": "string",
+      "title": "Log Level",
+      "description": "Logging verbosity",
+      "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
+      "default": "INFO"
+    }
+  },
+  "required": ["endpoint"]
+}
