@@ -164,6 +164,7 @@ class SimulatorUpdater:
         self,
         simulator: PLCSimulator,
         node_vars: dict,
+        node_types: dict[str, ua.VariantType],
         interval: float = 0.1,
     ) -> None:
         """Initialize updater.
@@ -171,10 +172,12 @@ class SimulatorUpdater:
         Args:
             simulator: PLCSimulator instance
             node_vars: Dictionary mapping value names to OPC-UA node variables
+            node_types: Dictionary mapping value names to variant types
             interval: Update interval in seconds
         """
         self.simulator = simulator
         self.node_vars = node_vars
+        self.node_types = node_types
         self.interval = interval
         self._running = False
         self._task: asyncio.Task | None = None
@@ -209,11 +212,22 @@ class SimulatorUpdater:
             await asyncio.sleep(self.interval)
 
     async def _update_nodes(self, values: dict) -> None:
-        """Write simulator values to OPC-UA nodes."""
+        """Write simulator values to OPC-UA nodes with correct types."""
         for name, node_var in self.node_vars.items():
             if name in values:
                 try:
-                    await node_var.write_value(values[name])
+                    value = values[name]
+                    variant_type = self.node_types.get(name)
+                    if variant_type:
+                        # Convert to proper type to avoid type mismatch
+                        if variant_type == ua.VariantType.Float:
+                            value = float(value)
+                        elif variant_type == ua.VariantType.UInt32:
+                            value = int(value) & 0xFFFFFFFF
+                        variant = ua.Variant(value, variant_type)
+                        await node_var.write_value(variant)
+                    else:
+                        await node_var.write_value(value)
                 except Exception as e:
                     logger.debug(f"Error updating {name}: {e}")
 
@@ -345,9 +359,31 @@ async def create_demo_server(
         _nodeid(idx, "Status.StatusMessage"), "StatusMessage", "Running", ua.VariantType.String
     )
 
-    # Create simulator and updater
+    # Create simulator and updater with type mapping
+    node_types = {
+        "temp_sensor1": ua.VariantType.Float,
+        "temp_sensor2": ua.VariantType.Float,
+        "temp_setpoint": ua.VariantType.Float,
+        "pressure1": ua.VariantType.Float,
+        "pressure2": ua.VariantType.Float,
+        "motor_speed": ua.VariantType.Float,
+        "motor_speed_setpoint": ua.VariantType.Float,
+        "motor_current": ua.VariantType.Float,
+        "motor_running": ua.VariantType.Boolean,
+        "production_count": ua.VariantType.UInt32,
+        "error_count": ua.VariantType.UInt32,
+        "input1": ua.VariantType.Boolean,
+        "input2": ua.VariantType.Boolean,
+        "output1": ua.VariantType.Boolean,
+        "output2": ua.VariantType.Boolean,
+        "voltage": ua.VariantType.Float,
+        "level": ua.VariantType.Float,
+        "energy_total": ua.VariantType.Double,
+        "device_name": ua.VariantType.String,
+        "status_message": ua.VariantType.String,
+    }
     simulator = PLCSimulator()
-    updater = SimulatorUpdater(simulator, node_vars, interval=0.1)
+    updater = SimulatorUpdater(simulator, node_vars, node_types, interval=0.1)
 
     return server, simulator, updater, node_vars
 
