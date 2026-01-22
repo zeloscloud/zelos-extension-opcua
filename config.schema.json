@@ -27,7 +27,7 @@
     "security_policy": {
       "type": "string",
       "title": "Security Policy",
-      "description": "OPC-UA security policy",
+      "description": "OPC-UA security policy (required when security mode is not None)",
       "enum": ["None", "Basic256Sha256", "Aes128Sha256RsaOaep", "Aes256Sha256RsaPss"],
       "default": "None"
     },
@@ -47,16 +47,17 @@
     "node_map_file": {
       "type": "string",
       "title": "Node Map File",
-      "description": "Path to JSON node map file (optional)",
+      "description": "Path to JSON node map file defining nodes to poll",
       "ui:widget": "file-picker",
       "ui:options": {
         "accept": ".json"
-      }
+      },
+      "ui:help": "JSON file mapping OPC-UA nodes to semantic events"
     },
     "poll_interval": {
       "type": "number",
       "title": "Poll Interval (seconds)",
-      "description": "How often to poll nodes",
+      "description": "How often to poll nodes for value changes",
       "default": 1.0,
       "minimum": 0.1,
       "maximum": 60.0
@@ -77,5 +78,34 @@
       "default": "INFO"
     }
   },
-  "required": ["endpoint"]
+  "required": ["endpoint"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "security_mode": {"enum": ["Sign", "SignAndEncrypt"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "security_policy": {
+            "enum": ["Basic256Sha256", "Aes128Sha256RsaOaep", "Aes256Sha256RsaPss"],
+            "not": {"const": "None"}
+          }
+        },
+        "required": ["security_policy"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "username": {"minLength": 1}
+        },
+        "required": ["username"]
+      },
+      "then": {
+        "required": ["password"]
+      }
+    }
+  ]
 }
