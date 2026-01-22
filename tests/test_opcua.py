@@ -451,13 +451,30 @@ class DemoServer:
         self.port = port
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._shutdown_event: asyncio.Event | None = None
 
     def start(self):
         """Start server in background thread."""
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        # Wait for server to be ready
-        time.sleep(1.5)
+        # Wait for server to be ready by trying to connect
+        self._wait_for_server()
+
+    def _wait_for_server(self, timeout: float = 10.0):
+        """Wait until server is accepting connections."""
+        import socket
+
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                sock.connect((self.host, self.port))
+                sock.close()
+                return  # Server is ready
+            except (ConnectionRefusedError, OSError):
+                time.sleep(0.1)
+        raise TimeoutError(f"Server did not start within {timeout}s")
 
     def _run(self):
         """Run server event loop."""
@@ -465,14 +482,34 @@ class DemoServer:
 
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._shutdown_event = asyncio.Event()
 
-        with contextlib.suppress(Exception):
-            self._loop.run_until_complete(run_demo_server(self.host, self.port))
+        try:
+            self._loop.run_until_complete(
+                run_demo_server(self.host, self.port, self._shutdown_event)
+            )
+        except Exception:
+            pass
+        finally:
+            # Clean up pending tasks
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            # Give tasks time to cancel
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.close()
 
     def stop(self):
-        """Stop the server."""
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        """Stop the server gracefully."""
+        if self._loop and self._shutdown_event:
+            # Signal shutdown to the server
+            self._loop.call_soon_threadsafe(self._shutdown_event.set)
+            # Wait for thread to finish cleanup
+            if self._thread:
+                self._thread.join(timeout=5.0)
 
     @property
     def endpoint(self) -> str:
