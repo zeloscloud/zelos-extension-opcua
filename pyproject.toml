@@ -51,6 +51,10 @@ testpaths = ["tests"]
 addopts = "--log-cli-level=INFO"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # Ignore asyncua server cleanup warnings during test teardown
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.ruff]
 target-version = "py311"
