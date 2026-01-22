@@ -1,0 +1,42 @@
+{
+  "name": "demo_plc",
+  "description": "Demo PLC device with comprehensive node types",
+  "events": {
+    "temperature": [
+      {"name": "sensor1", "node_id": "ns=2;s=Temperature.Sensor1", "datatype": "float32", "unit": "°C"},
+      {"name": "sensor2", "node_id": "ns=2;s=Temperature.Sensor2", "datatype": "float32", "unit": "°C"},
+      {"name": "setpoint", "node_id": "ns=2;s=Temperature.Setpoint", "datatype": "float32", "unit": "°C", "writable": true}
+    ],
+    "pressure": [
+      {"name": "sensor1", "node_id": "ns=2;s=Pressure.Sensor1", "datatype": "float32", "unit": "bar"},
+      {"name": "sensor2", "node_id": "ns=2;s=Pressure.Sensor2", "datatype": "float32", "unit": "bar"}
+    ],
+    "motor": [
+      {"name": "speed", "node_id": "ns=2;s=Motor.Speed", "datatype": "float32", "unit": "RPM"},
+      {"name": "speed_setpoint", "node_id": "ns=2;s=Motor.SpeedSetpoint", "datatype": "float32", "unit": "RPM", "writable": true},
+      {"name": "current", "node_id": "ns=2;s=Motor.Current", "datatype": "float32", "unit": "A"},
+      {"name": "running", "node_id": "ns=2;s=Motor.Running", "datatype": "bool", "writable": true}
+    ],
+    "counters": [
+      {"name": "production_count", "node_id": "ns=2;s=Counters.ProductionCount", "datatype": "uint32"},
+      {"name": "error_count", "node_id": "ns=2;s=Counters.ErrorCount", "datatype": "uint32"}
+    ],
+    "digital_io": [
+      {"name": "input1", "node_id": "ns=2;s=DigitalIO.Input1", "datatype": "bool", "writable": false},
+      {"name": "input2", "node_id": "ns=2;s=DigitalIO.Input2", "datatype": "bool", "writable": false},
+      {"name": "output1", "node_id": "ns=2;s=DigitalIO.Output1", "datatype": "bool", "writable": true},
+      {"name": "output2", "node_id": "ns=2;s=DigitalIO.Output2", "datatype": "bool", "writable": true}
+    ],
+    "analog": [
+      {"name": "voltage", "node_id": "ns=2;s=Analog.Voltage", "datatype": "float32", "unit": "V"},
+      {"name": "tank_level", "node_id": "ns=2;s=Analog.TankLevel", "datatype": "float32", "unit": "%"}
+    ],
+    "energy": [
+      {"name": "total_energy", "node_id": "ns=2;s=Energy.TotalEnergy", "datatype": "float64", "unit": "kWh"}
+    ],
+    "status": [
+      {"name": "device_name", "node_id": "ns=2;s=Status.DeviceName", "datatype": "string", "writable": true},
+      {"name": "status_message", "node_id": "ns=2;s=Status.StatusMessage", "datatype": "string"}
+    ]
+  }
+}
