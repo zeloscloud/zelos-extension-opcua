@@ -465,13 +465,14 @@ class DemoServer:
 
         start = time.time()
         while time.time() - start < timeout:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1.0)
                 sock.connect((self.host, self.port))
                 sock.close()
                 return  # Server is ready
             except (ConnectionRefusedError, OSError):
+                sock.close()
                 time.sleep(0.1)
         raise TimeoutError(f"Server did not start within {timeout}s")
 
