@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -26,6 +26,12 @@ jobs:
           python-version: "3.11"
 
       - uses: extractions/setup-just@v3
+
+      - name: Verify uv.lock is in sync with pyproject.toml
+        # CI runs on Linux only; a stale lock (e.g. a dependency left gated to
+        # one platform, or a version bump not re-locked) otherwise ships in the
+        # marketplace package and fails at install on other platforms.
+        run: uv lock --locked
 
       - name: Install dependencies
         run: just ci-install
