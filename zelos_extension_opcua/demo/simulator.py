@@ -77,9 +77,7 @@ class PLCSimulator:
         t = time.time() - self.start_time
 
         # Temperature with thermal dynamics
-        self.temp_sensor1 = (
-            self.temp_setpoint + 2 * math.sin(t * 0.1) + random.gauss(0, 0.2)
-        )
+        self.temp_sensor1 = self.temp_setpoint + 2 * math.sin(t * 0.1) + random.gauss(0, 0.2)
         self.temp_sensor2 = (
             self.temp_setpoint - 3 + 1.5 * math.sin(t * 0.08) + random.gauss(0, 0.15)
         )

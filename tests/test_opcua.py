@@ -1,28 +1,36 @@
-"""Tests for Zelos OPC-UA extension.
+"""Tests for the Zelos OPC-UA extension.
 
-Tests core functionality:
-- Node map parsing
-- Value encoding/decoding
-- Simulator physics logic
-- Integration tests with demo server
+Covers node map parsing and sanitization, value codecs, connection-error
+classification, the action surface, simulator physics, and integration against
+the real demo OPC-UA server (batch polling, partial failure, reconnection).
 """
 
 import asyncio
 import json
+import logging
+import socket
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
+from asyncua import ua
 
+from zelos_extension_opcua import actions
 from zelos_extension_opcua.client import (
+    READ_CHUNK,
     OPCUAClient,
+    coerce_text,
     decode_value,
     encode_value,
+    is_connection_error,
     parse_node_id_to_ua,
 )
-from zelos_extension_opcua.node_map import Node, NodeMap, parse_node_id
+from zelos_extension_opcua.node_map import Node, NodeMap, parse_node_id, sanitize_name
+
+DEMO_MAP_PATH = Path(__file__).parent.parent / "zelos_extension_opcua" / "demo" / "plc_device.json"
 
 # =============================================================================
 # Node Map Tests
@@ -38,6 +46,7 @@ class TestNode:
         assert node.datatype == "float32"
         assert node.scale == 1.0
         assert node.unit == ""
+        assert node.writable is None
 
     def test_valid_node_id_string(self):
         """String identifier node ID is parsed correctly."""
@@ -65,7 +74,7 @@ class TestNode:
 
     def test_all_datatypes_accepted(self):
         """All valid datatypes are accepted."""
-        valid_types = [
+        for dtype in (
             "bool",
             "uint8",
             "int8",
@@ -78,15 +87,8 @@ class TestNode:
             "int64",
             "float64",
             "string",
-        ]
-        for dtype in valid_types:
-            node = Node(node_id="ns=2;s=Test", name="test", datatype=dtype)
-            assert node.datatype == dtype
-
-    def test_writable_default_none(self):
-        """Writable defaults to None (auto-detect)."""
-        node = Node(node_id="ns=2;s=Test", name="test")
-        assert node.writable is None
+        ):
+            assert Node(node_id="ns=2;s=Test", name="test", datatype=dtype).datatype == dtype
 
     def test_writable_explicit(self):
         """Writable can be explicitly set."""
@@ -99,35 +101,22 @@ class TestNodeIdParsing:
 
     def test_parse_string_id(self):
         """Parse string identifier."""
-        ns, id_type, identifier = parse_node_id("ns=2;s=Temperature.Sensor1")
-        assert ns == 2
-        assert id_type == "s"
-        assert identifier == "Temperature.Sensor1"
+        assert parse_node_id("ns=2;s=Temperature.Sensor1") == (2, "s", "Temperature.Sensor1")
 
     def test_parse_numeric_id(self):
-        """Parse numeric identifier."""
-        ns, id_type, identifier = parse_node_id("ns=0;i=85")
-        assert ns == 0
-        assert id_type == "i"
-        assert identifier == "85"
+        """Parse numeric identifier, converted for asyncua."""
+        assert parse_node_id("ns=0;i=85") == (0, "i", 85)
 
     def test_parse_guid_id(self):
-        """Parse GUID identifier."""
-        ns, id_type, identifier = parse_node_id("ns=1;g=12345678-1234-5678-1234-567812345678")
-        assert ns == 1
-        assert id_type == "g"
-        assert identifier == "12345678-1234-5678-1234-567812345678"
+        """Parse GUID identifier, converted for asyncua."""
+        guid = "12345678-1234-5678-1234-567812345678"
+        assert parse_node_id(f"ns=1;g={guid}") == (1, "g", uuid.UUID(guid))
 
     def test_invalid_format_raises(self):
         """Invalid format raises ValueError."""
-        with pytest.raises(ValueError):
-            parse_node_id("invalid")
-
-        with pytest.raises(ValueError):
-            parse_node_id("ns=2")
-
-        with pytest.raises(ValueError):
-            parse_node_id("i=85")
+        for bad in ("invalid", "ns=2", "i=85"):
+            with pytest.raises(ValueError):
+                parse_node_id(bad)
 
 
 class TestNodeMap:
@@ -137,8 +126,8 @@ class TestNodeMap:
         """Events are correctly parsed from dict."""
         data = {
             "events": {
-                "temperature": [{"name": "sensor1", "node_id": "ns=2;s=Temp.S1"}],
-                "pressure": [{"name": "sensor1", "node_id": "ns=2;s=Press.S1"}],
+                "temperature": [{"name": "temp1", "node_id": "ns=2;s=Temp.S1"}],
+                "pressure": [{"name": "press1", "node_id": "ns=2;s=Press.S1"}],
             }
         }
         node_map = NodeMap.from_dict(data)
@@ -156,11 +145,8 @@ class TestNodeMap:
                 ]
             }
         }
-        node_map = NodeMap.from_dict(data)
-        nodes = node_map.get_event("status")
-        assert nodes[0].datatype == "float32"
-        assert nodes[1].datatype == "bool"
-        assert nodes[2].datatype == "uint32"
+        nodes = NodeMap.from_dict(data).get_event("status")
+        assert [n.datatype for n in nodes] == ["float32", "bool", "uint32"]
 
     def test_from_file(self):
         """Node map loads from JSON file."""
@@ -207,25 +193,127 @@ class TestNodeMap:
                 "sensors": [
                     {"name": "temp", "node_id": "ns=2;s=Temp", "writable": False},
                     {"name": "setpoint", "node_id": "ns=2;s=Setpoint", "writable": True},
-                    {"name": "auto", "node_id": "ns=2;s=Auto"},  # writable=None
+                    {"name": "auto", "node_id": "ns=2;s=Auto"},
                 ],
             }
         }
-        node_map = NodeMap.from_dict(data)
-        writable = node_map.writable_nodes
-        assert len(writable) == 1
-        assert writable[0].name == "setpoint"
+        writable = NodeMap.from_dict(data).writable_nodes
+        assert [n.name for n in writable] == ["setpoint"]
 
     def test_map_name_and_description(self):
         """Name and description are parsed."""
-        data = {
-            "name": "my_device",
-            "description": "Test device",
-            "events": {},
-        }
-        node_map = NodeMap.from_dict(data)
+        node_map = NodeMap.from_dict(
+            {"name": "my_device", "description": "Test device", "events": {}}
+        )
         assert node_map.name == "my_device"
         assert node_map.description == "Test device"
+
+    def test_demo_map_loads(self):
+        """The bundled demo map satisfies the collision rules."""
+        node_map = NodeMap.from_file(DEMO_MAP_PATH)
+        assert node_map.name == "demo_plc"
+        assert len(node_map.nodes) == len({n.name for n in node_map.nodes})
+
+    @pytest.mark.parametrize("node_id", ["ns=2;i=abc", "ns=2;g=not-a-guid", "ns=2;b=not_base64!!"])
+    def test_unconvertible_identifier_rejected_at_load(self, node_id):
+        """A bad identifier is a map error, not a "connection failed" at runtime."""
+        with pytest.raises(ValueError, match=node_id.replace("!!", "")):
+            NodeMap.from_dict({"events": {"e": [{"name": "n", "node_id": node_id}]}})
+
+
+class TestSanitization:
+    """Names that reach a trace must not contain catalog separators."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("Temp.Sensor", "Temp_Sensor"),
+            ("plc@site", "plc_site"),
+            ("ns:2", "ns_2"),
+            ("a;b=c", "a_b_c"),
+            ("path/to/node", "path_to_node"),
+            ("has space", "has space"),
+            ("plain_name", "plain_name"),
+        ],
+    )
+    def test_sanitize_name(self, raw, expected):
+        assert sanitize_name(raw) == expected
+
+    def test_event_names_keep_slash_paths(self):
+        # `/` is the intra-source path separator: legal in events, not fields
+        assert sanitize_name("motor/status", kind="event") == "motor/status"
+        assert sanitize_name("motor/status", kind="field") == "motor_status"
+
+    def test_applied_to_map_event_and_node_names(self):
+        """Sanitization covers the source name, event names and field names."""
+        node_map = NodeMap.from_dict(
+            {
+                "name": "site.plc:1",
+                "events": {"temp/zone a": [{"name": "Sensor.1", "node_id": "ns=2;s=T1"}]},
+            }
+        )
+        assert node_map.name == "site_plc_1"
+        # `/` and spaces are legal in event names under the SDK grammar
+        assert node_map.event_names == ["temp/zone a"]
+        assert node_map.nodes[0].name == "Sensor_1"
+
+    def test_get_by_name_uses_sanitized_name(self):
+        """Lookups use the name the user sees in the trace."""
+        node_map = NodeMap.from_dict(
+            {"events": {"e": [{"name": "Sensor.1", "node_id": "ns=2;s=T1"}]}}
+        )
+        assert node_map.get_by_name("Sensor_1") is not None
+        assert node_map.get_by_name("Sensor.1") is None
+
+    def test_duplicate_event_name_raises(self):
+        """Two events that sanitize to the same name are a hard error."""
+        with pytest.raises(ValueError, match="Duplicate event name"):
+            NodeMap.from_dict(
+                {
+                    "events": {
+                        "zone.a": [{"name": "n1", "node_id": "ns=2;s=A"}],
+                        "zone:a": [{"name": "n2", "node_id": "ns=2;s=B"}],
+                    }
+                }
+            )
+
+    def test_duplicate_node_name_within_event_raises(self):
+        with pytest.raises(ValueError, match="Duplicate node name 'temp'"):
+            NodeMap.from_dict(
+                {
+                    "events": {
+                        "e": [
+                            {"name": "temp", "node_id": "ns=2;s=A"},
+                            {"name": "temp", "node_id": "ns=2;s=B"},
+                        ]
+                    }
+                }
+            )
+
+    def test_duplicate_node_name_across_events_raises(self):
+        """get_by_name must stay unambiguous, so cross-event names collide too."""
+        with pytest.raises(ValueError, match="already defined in event 'a'"):
+            NodeMap.from_dict(
+                {
+                    "events": {
+                        "a": [{"name": "sensor1", "node_id": "ns=2;s=A"}],
+                        "b": [{"name": "sensor1", "node_id": "ns=2;s=B"}],
+                    }
+                }
+            )
+
+    def test_collision_only_after_sanitization_raises(self):
+        with pytest.raises(ValueError, match="Duplicate node name 'a_b'"):
+            NodeMap.from_dict(
+                {
+                    "events": {
+                        "e": [
+                            {"name": "a.b", "node_id": "ns=2;s=A"},
+                            {"name": "a:b", "node_id": "ns=2;s=B"},
+                        ]
+                    }
+                }
+            )
 
 
 # =============================================================================
@@ -296,33 +384,122 @@ class TestValueCodec:
             (True, "bool"),
             ("hello", "string"),
         ]:
-            encoded = encode_value(value, datatype)
-            decoded = decode_value(encoded, datatype)
+            decoded = decode_value(encode_value(value, datatype), datatype)
             if datatype.startswith("float"):
                 assert abs(decoded - value) < 0.0001
             else:
                 assert decoded == value
 
 
+class TestCoerceText:
+    """Write actions take text, so bool and string nodes are writable at all."""
+
+    @pytest.mark.parametrize(
+        "text,datatype,expected",
+        [
+            ("true", "bool", True),
+            ("FALSE", "bool", False),
+            ("1", "bool", True),
+            ("0", "bool", False),
+            ("12.5", "float32", 12.5),
+            ("42", "uint16", 42),
+            ("-7", "int16", -7),
+            ("Test Device", "string", "Test Device"),
+        ],
+    )
+    def test_parses_per_datatype(self, text, datatype, expected):
+        result = coerce_text(text, datatype)
+        assert result == expected
+        assert isinstance(result, type(expected))
+
+    @pytest.mark.parametrize(
+        "text,datatype", [("maybe", "bool"), ("abc", "float32"), ("n/a", "uint16")]
+    )
+    def test_unparseable_raises(self, text, datatype):
+        with pytest.raises(ValueError, match="Cannot parse"):
+            coerce_text(text, datatype)
+
+
 class TestNodeIdToUA:
     """Test node ID conversion to asyncua NodeId."""
 
     def test_string_identifier(self):
-        """String identifier is converted correctly."""
         node_id = parse_node_id_to_ua("ns=2;s=Temperature.Sensor1")
         assert node_id.NamespaceIndex == 2
         assert node_id.Identifier == "Temperature.Sensor1"
+        assert node_id.NodeIdType == ua.NodeIdType.String
 
     def test_numeric_identifier(self):
-        """Numeric identifier is converted correctly."""
-        node_id = parse_node_id_to_ua("ns=0;i=85")
-        assert node_id.NamespaceIndex == 0
-        assert node_id.Identifier == 85
+        node_id = parse_node_id_to_ua("ns=2;i=1001")
+        assert node_id.NamespaceIndex == 2
+        assert node_id.Identifier == 1001
+        # asyncua narrows numeric IDs to TwoByte / FourByte / Numeric by width.
+        assert node_id.NodeIdType in (
+            ua.NodeIdType.TwoByte,
+            ua.NodeIdType.FourByte,
+            ua.NodeIdType.Numeric,
+        )
+
+    def test_guid_identifier_is_a_uuid(self):
+        """A str GUID would be sent as a String identifier and never match."""
+        raw = "12345678-1234-5678-1234-567812345678"
+        node_id = parse_node_id_to_ua(f"ns=1;g={raw}")
+        assert node_id.Identifier == uuid.UUID(raw)
+        assert node_id.NodeIdType == ua.NodeIdType.Guid
+
+    def test_opaque_identifier_is_bytes(self):
+        node_id = parse_node_id_to_ua("ns=1;b=AQID")
+        assert node_id.Identifier == b"\x01\x02\x03"
+        assert node_id.NodeIdType == ua.NodeIdType.ByteString
 
     def test_invalid_format_raises(self):
-        """Invalid format raises ValueError."""
         with pytest.raises(ValueError):
             parse_node_id_to_ua("invalid")
+
+    def test_invalid_guid_raises(self):
+        with pytest.raises(ValueError, match="Invalid GUID"):
+            parse_node_id_to_ua("ns=1;g=not-a-guid")
+
+
+# =============================================================================
+# Connection Error Classification
+# =============================================================================
+
+
+class TestConnectionErrorClassification:
+    """Transport loss is classified by exception type, never by message text."""
+
+    def test_socket_errors(self):
+        """What a killed or stopped server actually produces (verified live)."""
+        assert is_connection_error(ConnectionError("Connection is closed")) is True
+        assert is_connection_error(ConnectionRefusedError(61, "refused")) is True
+        assert is_connection_error(TimeoutError()) is True
+        assert is_connection_error(TimeoutError()) is True
+
+    def test_session_status_codes(self):
+        """Session and channel status codes mean reconnect."""
+        from asyncua.ua.uaerrors import BadSecureChannelClosed, BadSessionIdInvalid
+
+        assert is_connection_error(BadSessionIdInvalid()) is True
+        assert is_connection_error(BadSecureChannelClosed()) is True
+
+    def test_node_level_status_codes_are_not_connection_errors(self):
+        """A bad node id is a node problem, not a transport problem."""
+        from asyncua.ua.uaerrors import BadNodeIdUnknown, BadTypeMismatch
+
+        assert is_connection_error(BadNodeIdUnknown()) is False
+        assert is_connection_error(BadTypeMismatch()) is False
+
+    def test_generic_uaerror_wrapping_a_timeout(self):
+        """A black-holed socket surfaces as a bare UaError caused by a timeout."""
+        err = ua.UaError("Failed to send request to OPC UA server")
+        err.__cause__ = TimeoutError()
+        assert is_connection_error(err) is True
+        assert is_connection_error(ua.UaError("something else")) is False
+
+    def test_unrelated_errors(self):
+        assert is_connection_error(ValueError("bad value")) is False
+        assert is_connection_error(KeyError("missing")) is False
 
 
 # =============================================================================
@@ -337,11 +514,8 @@ class TestPLCSimulator:
         """Update returns complete value dictionary."""
         from zelos_extension_opcua.demo.simulator import PLCSimulator
 
-        sim = PLCSimulator()
-        values = sim.update(dt=0.1)
-
-        # Check all expected fields exist
-        expected = {
+        values = PLCSimulator().update(dt=0.1)
+        assert set(values.keys()) == {
             "temp_sensor1",
             "temp_sensor2",
             "temp_setpoint",
@@ -363,16 +537,12 @@ class TestPLCSimulator:
             "device_name",
             "status_message",
         }
-        assert set(values.keys()) == expected
 
     def test_temperature_near_setpoint(self):
         """Temperature stays near setpoint."""
         from zelos_extension_opcua.demo.simulator import PLCSimulator
 
-        sim = PLCSimulator()
-        values = sim.update(dt=0.1)
-
-        # Should be within ±10°C of setpoint (25°C)
+        values = PLCSimulator().update(dt=0.1)
         assert 15 < values["temp_sensor1"] < 35
         assert 12 < values["temp_sensor2"] < 35
 
@@ -380,9 +550,7 @@ class TestPLCSimulator:
         """Pressure values are positive."""
         from zelos_extension_opcua.demo.simulator import PLCSimulator
 
-        sim = PLCSimulator()
-        values = sim.update(dt=0.1)
-
+        values = PLCSimulator().update(dt=0.1)
         assert values["pressure1"] > 0
         assert values["pressure2"] > 0
 
@@ -391,27 +559,19 @@ class TestPLCSimulator:
         from zelos_extension_opcua.demo.simulator import PLCSimulator
 
         sim = PLCSimulator()
-
-        # Motor not running - speed should be zero/decreasing
         sim.motor_running = False
         sim.motor_speed = 100
-        values = sim.update(dt=1.0)
-        assert values["motor_speed"] < 100
+        assert sim.update(dt=1.0)["motor_speed"] < 100
 
-        # Motor running - speed should increase toward setpoint
         sim.motor_running = True
         sim.motor_speed = 0
-        values = sim.update(dt=1.0)
-        assert values["motor_speed"] > 0
+        assert sim.update(dt=1.0)["motor_speed"] > 0
 
     def test_voltage_near_24v(self):
         """Voltage stays near 24V."""
         from zelos_extension_opcua.demo.simulator import PLCSimulator
 
-        sim = PLCSimulator()
-        values = sim.update(dt=0.1)
-
-        assert 22 < values["voltage"] < 26
+        assert 22 < PLCSimulator().update(dt=0.1)["voltage"] < 26
 
     def test_level_in_valid_range(self):
         """Tank level stays in 0-100% range."""
@@ -419,8 +579,7 @@ class TestPLCSimulator:
 
         sim = PLCSimulator()
         for _ in range(100):
-            values = sim.update(dt=0.1)
-            assert 0 <= values["level"] <= 100
+            assert 0 <= sim.update(dt=0.1)["level"] <= 100
 
     def test_energy_accumulates(self):
         """Energy increases over time when motor is running."""
@@ -430,11 +589,9 @@ class TestPLCSimulator:
         sim.motor_running = True
         sim.motor_speed = 1500
 
-        e1 = sim.energy_total
+        before = sim.energy_total
         sim.update(dt=1.0)
-        e2 = sim.energy_total
-
-        assert e2 > e1
+        assert sim.energy_total > before
 
 
 # =============================================================================
@@ -443,7 +600,7 @@ class TestPLCSimulator:
 
 
 class DemoServer:
-    """Helper to run demo server in background thread."""
+    """Helper to run the demo server in a background thread."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 14840):
         self.host = host
@@ -453,31 +610,29 @@ class DemoServer:
         self._shutdown_event: asyncio.Event | None = None
 
     def start(self):
-        """Start server in background thread."""
+        """Start the server and block until it accepts connections."""
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        # Wait for server to be ready by trying to connect
-        self._wait_for_server()
+        self._wait_for_port(up=True)
 
-    def _wait_for_server(self, timeout: float = 10.0):
-        """Wait until server is accepting connections."""
-        import socket
-
-        start = time.time()
-        while time.time() - start < timeout:
+    def _wait_for_port(self, up: bool, timeout: float = 15.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1.0)
             try:
                 sock.connect((self.host, self.port))
+                if up:
+                    return
+            except OSError:
+                if not up:
+                    return
+            finally:
                 sock.close()
-                return  # Server is ready
-            except (ConnectionRefusedError, OSError):
-                sock.close()
-                time.sleep(0.1)
-        raise TimeoutError(f"Server did not start within {timeout}s")
+            time.sleep(0.1)
+        raise TimeoutError(f"Port {self.port} never went {'up' if up else 'down'}")
 
     def _run(self):
-        """Run server event loop."""
         from zelos_extension_opcua.demo.simulator import run_demo_server
 
         self._loop = asyncio.new_event_loop()
@@ -491,35 +646,29 @@ class DemoServer:
         except Exception:
             pass
         finally:
-            # Clean up pending tasks
             pending = asyncio.all_tasks(self._loop)
             for task in pending:
                 task.cancel()
-            # Give tasks time to cancel
             if pending:
-                self._loop.run_until_complete(
-                    asyncio.gather(*pending, return_exceptions=True)
-                )
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
 
     def stop(self):
-        """Stop the server gracefully."""
+        """Stop the server and block until the port is free."""
         if self._loop and self._shutdown_event:
-            # Signal shutdown to the server
             self._loop.call_soon_threadsafe(self._shutdown_event.set)
-            # Wait for thread to finish cleanup
             if self._thread:
-                self._thread.join(timeout=5.0)
+                self._thread.join(timeout=10.0)
+            self._wait_for_port(up=False)
 
     @property
     def endpoint(self) -> str:
-        """Get server endpoint URL."""
         return f"opc.tcp://{self.host}:{self.port}/freeopcua/server/"
 
 
 @pytest.fixture(scope="module")
 def demo_server():
-    """Fixture that starts demo server for integration tests."""
+    """Demo server shared by every integration test in this module."""
     server = DemoServer(port=14840)
     server.start()
     yield server
@@ -528,198 +677,314 @@ def demo_server():
 
 @pytest.fixture
 def node_map():
-    """Load the demo PLC node map."""
-    map_path = (
-        Path(__file__).parent.parent
-        / "zelos_extension_opcua"
-        / "demo"
-        / "plc_device.json"
-    )
-    return NodeMap.from_file(str(map_path))
+    """The bundled demo PLC node map."""
+    return NodeMap.from_file(DEMO_MAP_PATH)
 
 
 @pytest.fixture
-def client(demo_server, node_map):
-    """Create a connected OPCUAClient."""
-    client = OPCUAClient(
-        endpoint=demo_server.endpoint,
-        node_map=node_map,
-    )
-
-    async def connect():
-        await client.connect()
-
-    asyncio.get_event_loop().run_until_complete(connect())
+async def client(demo_server, node_map):
+    """A connected OPCUAClient, torn down after the test."""
+    client = OPCUAClient(endpoint=demo_server.endpoint, node_map=node_map)
+    assert await client.connect() is True
     yield client
+    await client.disconnect()
 
-    async def disconnect():
-        await client.disconnect()
 
-    asyncio.get_event_loop().run_until_complete(disconnect())
+@pytest.fixture
+async def bound_client(client):
+    """`client`, bound as the actions module's client for the test."""
+    actions.set_client(client)
+    yield client
+    actions.set_client(None)
 
 
 class TestDemoServerIntegration:
     """Integration tests against the demo server."""
 
-    def test_read_float32_node(self, client):
-        """Read float32 node (temperature)."""
-        node = client.node_map.get_by_name("sensor1")
-        assert node is not None
-        assert node.datatype == "float32"
+    @pytest.mark.parametrize(
+        "name,datatype,check",
+        [
+            ("temp_sensor1", "float32", lambda v: 10 < v < 50),
+            ("running", "bool", lambda v: v in (True, False)),
+            ("production_count", "uint32", lambda v: isinstance(v, int) and v >= 0),
+            ("total_energy", "float64", lambda v: isinstance(v, float) and v >= 0),
+            ("device_name", "string", lambda v: isinstance(v, str) and v),
+        ],
+    )
+    async def test_read_node_types(self, client, name, datatype, check):
+        """Every mapped datatype reads back as the right Python type."""
+        node = client.node_map.get_by_name(name)
+        assert node.datatype == datatype
+        assert check(await client.read_node_value(node))
 
-        async def read():
-            return await client.read_node_value(node)
-
-        value = asyncio.get_event_loop().run_until_complete(read())
-        assert value is not None
-        assert 10 < value < 50  # Reasonable temperature range
-
-    def test_read_bool_node(self, client):
-        """Read bool node (motor running)."""
-        node = client.node_map.get_by_name("running")
-        assert node is not None
-        assert node.datatype == "bool"
-
-        async def read():
-            return await client.read_node_value(node)
-
-        value = asyncio.get_event_loop().run_until_complete(read())
-        assert value in (True, False)
-
-    def test_read_uint32_node(self, client):
-        """Read uint32 node (production count)."""
-        node = client.node_map.get_by_name("production_count")
-        assert node is not None
-        assert node.datatype == "uint32"
-
-        async def read():
-            return await client.read_node_value(node)
-
-        value = asyncio.get_event_loop().run_until_complete(read())
-        assert value is not None
-        assert isinstance(value, int)
-        assert value >= 0
-
-    def test_read_float64_node(self, client):
-        """Read float64 node (total energy)."""
-        node = client.node_map.get_by_name("total_energy")
-        assert node is not None
-        assert node.datatype == "float64"
-
-        async def read():
-            return await client.read_node_value(node)
-
-        value = asyncio.get_event_loop().run_until_complete(read())
-        assert value is not None
-        assert isinstance(value, float)
-        assert value >= 0
-
-    def test_read_string_node(self, client):
-        """Read string node (device name)."""
-        node = client.node_map.get_by_name("device_name")
-        assert node is not None
-        assert node.datatype == "string"
-
-        async def read():
-            return await client.read_node_value(node)
-
-        value = asyncio.get_event_loop().run_until_complete(read())
-        assert value is not None
-        assert isinstance(value, str)
-        assert len(value) > 0
-
-    def test_write_float32_node(self, client):
-        """Write float32 node (temperature setpoint)."""
+    async def test_write_float32_node(self, client):
+        """Write and read back a float32 setpoint."""
         node = client.node_map.get_by_name("setpoint")
-        assert node is not None
-        assert node.writable is True
+        await client.write_node_value(node, 30.0)
+        assert abs(await client.read_node_value(node) - 30.0) < 0.1
 
-        async def write_and_read():
-            # Write new value
-            success = await client.write_node_value(node, 30.0)
-            assert success is True
-
-            # Read back
-            value = await client.read_node_value(node)
-            return value
-
-        value = asyncio.get_event_loop().run_until_complete(write_and_read())
-        assert abs(value - 30.0) < 0.1
-
-    def test_write_bool_node(self, client):
-        """Write bool node (motor running)."""
+    async def test_write_bool_node(self, client):
+        """Write and read back a bool."""
         node = client.node_map.get_by_name("running")
-        assert node is not None
-        assert node.writable is True
+        await client.write_node_value(node, True)
+        assert await client.read_node_value(node) is True
+        await client.write_node_value(node, False)
+        assert await client.read_node_value(node) is False
 
-        async def write_and_read():
-            # Write True
-            success = await client.write_node_value(node, True)
-            assert success is True
-            value = await client.read_node_value(node)
-            assert value is True
-
-            # Write False
-            success = await client.write_node_value(node, False)
-            assert success is True
-            value = await client.read_node_value(node)
-            assert value is False
-
-        asyncio.get_event_loop().run_until_complete(write_and_read())
-
-    def test_write_string_node(self, client):
-        """Write string node (device name)."""
+    async def test_write_string_node(self, client):
+        """Write and read back a string."""
         node = client.node_map.get_by_name("device_name")
-        assert node is not None
-        assert node.writable is True
+        await client.write_node_value(node, "Test Device")
+        assert await client.read_node_value(node) == "Test Device"
 
-        async def write_and_read():
-            # Write new value
-            success = await client.write_node_value(node, "Test Device")
-            assert success is True
-
-            # Read back
-            value = await client.read_node_value(node)
-            return value
-
-        value = asyncio.get_event_loop().run_until_complete(write_and_read())
-        assert value == "Test Device"
-
-    def test_write_readonly_fails(self, client):
-        """Writing to read-only node should fail."""
+    async def test_write_readonly_raises(self, client):
+        """A read-only node raises rather than reporting a quiet failure."""
         node = client.node_map.get_by_name("input1")
-        assert node is not None
         assert node.writable is False
+        with pytest.raises(ValueError, match="not writable"):
+            await client.write_node_value(node, True)
 
-        async def try_write():
-            return await client.write_node_value(node, True)
+    async def test_poll_all_events(self, client):
+        """One batch read covers every event in the map."""
+        results = await client._poll_nodes()
+        assert set(results) >= {
+            "temperature",
+            "pressure",
+            "motor",
+            "counters",
+            "digital_io",
+            "analog",
+            "status",
+        }
+        assert 10 < results["temperature"]["temp_sensor1"] < 50
+        assert "pressure_sensor1" in results["pressure"]
 
-        success = asyncio.get_event_loop().run_until_complete(try_write())
-        assert success is False
+    async def test_poll_uses_one_request(self, client, monkeypatch):
+        """The cycle is one read request, not one per node."""
+        calls = 0
+        original = client._client.read_attributes
 
-    def test_poll_all_events(self, client):
-        """Poll all nodes and verify event structure."""
+        async def counting(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return await original(*args, **kwargs)
 
-        async def poll():
-            return await client._poll_nodes()
+        monkeypatch.setattr(client._client, "read_attributes", counting)
+        await client._poll_nodes()
+        assert calls == 1
+        assert len(client._poll_targets) == len(client.node_map.nodes)
 
-        results = asyncio.get_event_loop().run_until_complete(poll())
 
-        # Should have events from node map
-        assert "temperature" in results
-        assert "pressure" in results
-        assert "motor" in results
-        assert "counters" in results
-        assert "digital_io" in results
-        assert "analog" in results
-        assert "status" in results
+class TestBatchPollPartialFailure:
+    """A single bad node must not cost the cycle, or flood the log."""
 
-        # Temperature event should have sensors
-        assert "sensor1" in results["temperature"]
-        assert "sensor2" in results["temperature"]
+    @pytest.fixture
+    async def client_with_bogus_node(self, demo_server):
+        node_map = NodeMap.from_dict(
+            {
+                "name": "partial",
+                "events": {
+                    "mix": [
+                        {"name": "good", "node_id": "ns=2;s=Temperature.Sensor1"},
+                        {"name": "bogus", "node_id": "ns=2;s=Does.Not.Exist"},
+                        {"name": "also_good", "node_id": "ns=2;s=Analog.Voltage"},
+                    ]
+                },
+            }
+        )
+        client = OPCUAClient(endpoint=demo_server.endpoint, node_map=node_map)
+        assert await client.connect() is True
+        yield client
+        await client.disconnect()
 
-        # Check values are reasonable
-        assert 10 < results["temperature"]["sensor1"] < 50
+    async def test_good_nodes_survive_a_bad_one(self, client_with_bogus_node, caplog):
+        """The good nodes are delivered and the bad one is reported once."""
+        with caplog.at_level(logging.ERROR, logger="zelos_extension_opcua.client"):
+            results = await client_with_bogus_node._poll_nodes()
+
+            assert set(results["mix"]) == {"good", "also_good"}
+            errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+            assert len(errors) == 1
+            assert "Does.Not.Exist" in errors[0].getMessage()
+
+            # Second cycle still delivers, and stays silent about the same node.
+            assert set((await client_with_bogus_node._poll_nodes())["mix"]) == {
+                "good",
+                "also_good",
+            }
+            assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 1
+
+    async def test_undecodable_value_costs_only_its_node(self, demo_server, caplog):
+        """A string arriving on a float32 node must not abort the cycle."""
+        node_map = NodeMap.from_dict(
+            {
+                "name": "decode",
+                "events": {
+                    "mix": [
+                        {"name": "good", "node_id": "ns=2;s=Temperature.Sensor1"},
+                        {"name": "wrong_type", "node_id": "ns=2;s=Status.DeviceName"},
+                    ]
+                },
+            }
+        )
+        client = OPCUAClient(endpoint=demo_server.endpoint, node_map=node_map)
+        assert await client.connect() is True
+        try:
+            with caplog.at_level(logging.ERROR, logger="zelos_extension_opcua.client"):
+                for _ in range(3):
+                    assert set((await client._poll_nodes())["mix"]) == {"good"}
+                errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+                assert len(errors) == 1
+                assert "decode failed" in errors[0].getMessage()
+        finally:
+            await client.disconnect()
+
+
+class TestBatchReadChunking:
+    """A map bigger than a server's MaxNodesPerRead must not be one request."""
+
+    async def test_read_is_chunked(self):
+        sizes: list[int] = []
+
+        class FakeClient:
+            async def read_attributes(self, nodes, attribute):
+                sizes.append(len(nodes))
+                return [ua.DataValue(ua.Variant(1.0)) for _ in nodes]
+
+        client = OPCUAClient()
+        client._client = FakeClient()
+        client._connected = True
+        node = Node(node_id="ns=2;i=1", name="n")
+        client._poll_targets = [("e", node, object())] * (READ_CHUNK + 50)
+
+        await client._poll_nodes()
+        assert sizes == [READ_CHUNK, 50]
+
+
+class TestReconnection:
+    """The poll loop survives a server that goes away and comes back."""
+
+    async def test_reconnects_after_server_restart(self):
+        """Values flow, stop the server, restart it, values flow again."""
+        port = 14841
+        node_map = NodeMap.from_dict(
+            {
+                "name": "reconnect_test",
+                "events": {
+                    "temperature": [{"name": "t1", "node_id": "ns=2;s=Temperature.Sensor1"}]
+                },
+            }
+        )
+        server = DemoServer(port=port)
+        server.start()
+
+        client = OPCUAClient(
+            endpoint=server.endpoint, node_map=node_map, poll_interval=0.2, timeout=2.0
+        )
+        client.start()
+        task = asyncio.create_task(client._run_async())
+        try:
+            await _wait_until(lambda: client._poll_count >= 2, 15.0)
+
+            server.stop()
+            await _wait_until(lambda: not client._connected, 15.0)
+            assert not task.done()  # the loop survived the disconnect
+
+            polls_before = client._poll_count
+            server = DemoServer(port=port)
+            server.start()
+
+            # Reconnect is backed off (3s initial), so allow a few attempts.
+            await _wait_until(lambda: client._connected and client._poll_count > polls_before, 30.0)
+            assert (await client._poll_nodes())["temperature"]["t1"] > 0
+        finally:
+            client.stop()
+            await asyncio.wait_for(task, 10.0)
+            server.stop()
+
+    async def test_stop_ends_the_loop_without_a_signal(self):
+        """stop() alone drains the loop and the finally disconnects."""
+        client = OPCUAClient(endpoint="opc.tcp://127.0.0.1:14999", poll_interval=0.1)
+        client.start()
+        task = asyncio.create_task(client._run_async())
+        await asyncio.sleep(0.5)  # let the first (failing) connect attempt land
+        client.stop()
+        await asyncio.wait_for(task, 5.0)
+        assert client._connected is False
+
+    async def test_stop_cancels_an_in_flight_connect(self):
+        """Shutdown must not wait out a connect to an unreachable endpoint."""
+        cancelled = False
+
+        async def slow_connect():
+            nonlocal cancelled
+            try:
+                await asyncio.sleep(30.0)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return False
+
+        client = OPCUAClient(endpoint="opc.tcp://10.255.255.1:4840", timeout=20.0)
+        client._ensure_connected = slow_connect
+        client.start()
+        task = asyncio.create_task(client._run_async())
+        await asyncio.sleep(0.2)
+        client.stop()
+        await asyncio.wait_for(task, 2.0)
+        assert cancelled
+
+    async def test_unclassified_poll_failures_force_a_reconnect(self):
+        """An error is_connection_error does not claim must not wedge the loop."""
+        connects = 0
+
+        async def fake_connect():
+            nonlocal connects
+            connects += 1
+            client._connected = True
+            return True
+
+        async def failing_poll():
+            raise ValueError("not a connection error")
+
+        client = OPCUAClient(endpoint="opc.tcp://127.0.0.1:14999", poll_interval=0.01)
+        client._ensure_connected = fake_connect
+        client._poll_nodes = failing_poll
+        client.start()
+        task = asyncio.create_task(client._run_async())
+        try:
+            await _wait_until(lambda: connects >= 2, 5.0)
+        finally:
+            client.stop()
+            await asyncio.wait_for(task, 5.0)
+        assert client._error_count >= 5
+
+
+class TestTraceSourceEvents:
+    """Events are held by name, never fetched off the source with getattr."""
+
+    def test_event_named_like_a_source_attribute_records(self):
+        """`log` is a method on TraceSourceCacheLast; getattr returned that."""
+        node_map = NodeMap.from_dict(
+            {
+                "name": "shadow_test",
+                "events": {"log": [{"name": "v", "node_id": "ns=2;i=1", "datatype": "float64"}]},
+            }
+        )
+        client = OPCUAClient(node_map=node_map)
+        client._init_trace_source()
+        client._log_values({"log": {"v": 3.5}})
+        assert client._events["log"].v.get() == 3.5
+
+
+async def _wait_until(predicate, timeout: float, interval: float = 0.1) -> None:
+    """Poll `predicate` until true or fail the test."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError(f"Condition not met within {timeout}s")
 
 
 # =============================================================================
@@ -727,172 +992,170 @@ class TestDemoServerIntegration:
 # =============================================================================
 
 
-class TestReconnection:
-    """Tests for connection error detection."""
-
-    def test_is_connection_error_timeout(self):
-        """Timeout errors are detected as connection errors."""
-        client = OPCUAClient()
-        assert client._is_connection_error(Exception("Connection timeout")) is True
-        assert client._is_connection_error(Exception("BadConnection")) is True
-
-    def test_is_connection_error_refused(self):
-        """Connection refused errors are detected."""
-        client = OPCUAClient()
-        assert client._is_connection_error(Exception("Connection refused")) is True
-        assert client._is_connection_error(Exception("connection reset by peer")) is True
-        assert client._is_connection_error(Exception("BadSessionClosed")) is True
-
-    def test_is_connection_error_false_for_other(self):
-        """Non-connection errors return False."""
-        client = OPCUAClient()
-        assert client._is_connection_error(Exception("Invalid node")) is False
-        assert client._is_connection_error(Exception("Value out of range")) is False
-        assert client._is_connection_error(ValueError("bad value")) is False
-
-
 class TestActionsUnit:
-    """Unit tests for SDK actions (no network)."""
+    """Actions with no connection: input validation raises, it does not report."""
 
     @pytest.fixture
-    def client_with_map(self):
-        """Create client with node map but no connection."""
-        data = {
-            "name": "test_device",
-            "events": {
-                "sensors": [
-                    {"name": "temp", "node_id": "ns=2;s=Temp", "datatype": "float32"},
-                    {
-                        "name": "press",
-                        "node_id": "ns=2;s=Press",
-                        "datatype": "float32",
-                        "writable": False,
-                    },
-                ],
-                "controls": [
-                    {
-                        "name": "setpoint",
-                        "node_id": "ns=2;s=Setpoint",
-                        "datatype": "float32",
-                        "writable": True,
-                    },
-                    {
-                        "name": "output",
-                        "node_id": "ns=2;s=Output",
-                        "datatype": "bool",
-                        "writable": True,
-                    },
-                ],
-            },
-        }
-        node_map = NodeMap.from_dict(data)
-        return OPCUAClient(node_map=node_map)
+    def offline_client(self):
+        node_map = NodeMap.from_dict(
+            {
+                "name": "test_device",
+                "events": {
+                    "sensors": [
+                        {"name": "temp", "node_id": "ns=2;s=Temp", "datatype": "float32"},
+                        {
+                            "name": "press",
+                            "node_id": "ns=2;s=Press",
+                            "datatype": "float32",
+                            "writable": False,
+                        },
+                    ],
+                    "controls": [
+                        {
+                            "name": "setpoint",
+                            "node_id": "ns=2;s=Setpoint",
+                            "datatype": "float32",
+                            "writable": True,
+                        },
+                        {
+                            "name": "output",
+                            "node_id": "ns=2;s=Output",
+                            "datatype": "bool",
+                            "writable": True,
+                        },
+                    ],
+                },
+            }
+        )
+        client = OPCUAClient(node_map=node_map)
+        actions.set_client(client)
+        yield client
+        actions.set_client(None)
 
-    def test_get_status_returns_info(self, client_with_map):
-        """Get Status action returns expected fields."""
-        result = client_with_map.get_status()
-        assert "connected" in result
-        assert "endpoint" in result
-        assert "security_mode" in result
-        assert "poll_count" in result
-        assert "nodes" in result
+    def test_registered_action_names(self):
+        """register_actions publishes exactly the documented surface."""
+        from zelos_sdk.actions import ActionsRegistry
+
+        assert sorted(actions.register_actions(ActionsRegistry())) == [
+            "browse_nodes",
+            "get_status",
+            "list_nodes",
+            "list_writable_nodes",
+            "read_named_node",
+            "read_node",
+            "write_named_node",
+            "write_node",
+        ]
+
+    def test_get_status(self, offline_client):
+        result = actions.get_status()
+        assert result["connected"] is False
         assert result["nodes"] == 4
+        assert "endpoint" in result and "security_mode" in result
 
-    def test_list_nodes_returns_all(self, client_with_map):
-        """List Nodes action returns all nodes."""
-        result = client_with_map.list_nodes()
+    def test_list_nodes(self, offline_client):
+        result = actions.list_nodes()
         assert result["count"] == 4
-        names = [n["name"] for n in result["nodes"]]
-        assert "temp" in names
-        assert "press" in names
-        assert "setpoint" in names
-        assert "output" in names
+        assert {n["name"] for n in result["nodes"]} == {"temp", "press", "setpoint", "output"}
 
-    def test_list_writable_nodes_filters(self, client_with_map):
-        """List Writable Nodes only returns writable ones."""
-        result = client_with_map.list_writable_nodes()
-        # Only explicitly writable nodes
-        assert result["count"] == 2
-        names = [n["name"] for n in result["nodes"]]
-        assert "setpoint" in names
-        assert "output" in names
-        assert "press" not in names  # explicitly writable=False
+    def test_list_writable_nodes_filters(self, offline_client):
+        result = actions.list_writable_nodes()
+        assert {n["name"] for n in result["nodes"]} == {"setpoint", "output"}
 
-    def test_list_nodes_no_map(self):
-        """List Nodes with no map returns empty."""
+    def test_no_client_raises(self):
+        actions.set_client(None)
+        with pytest.raises(RuntimeError, match="No OPC-UA client"):
+            actions.get_status()
+
+    def test_no_node_map_raises(self):
+        actions.set_client(OPCUAClient())
+        try:
+            with pytest.raises(ValueError, match="No node map loaded"):
+                actions.read_named_node("anything")
+            with pytest.raises(ValueError, match="No node map loaded"):
+                actions.write_named_node("anything", 100)
+        finally:
+            actions.set_client(None)
+
+    def test_unknown_name_raises(self, offline_client):
+        with pytest.raises(ValueError, match="Unknown node name"):
+            actions.read_named_node("nonexistent")
+        with pytest.raises(ValueError, match="Unknown node name"):
+            actions.write_named_node("nonexistent", 100)
+
+    def test_readonly_node_raises(self, offline_client):
+        """The writability check fires before any connection is attempted."""
+        with pytest.raises(ValueError, match="not writable"):
+            actions.write_named_node("press", 100)
+
+
+class TestActionDispatch:
+    """`_run_coro` is the only path from an action to the event loop."""
+
+    async def test_timeout_cancels_the_coroutine(self):
+        """A timed-out write must not land on the PLC after the action failed."""
+        landed = False
+
+        async def slow_write():
+            nonlocal landed
+            await asyncio.sleep(0.3)
+            landed = True
+
         client = OPCUAClient()
-        result = client.list_nodes()
-        assert result["count"] == 0
-        assert result["nodes"] == []
+        client._loop = asyncio.get_running_loop()
+        with pytest.raises(TimeoutError):
+            await asyncio.to_thread(client._run_coro, slow_write(), 0.1)
+        # Past when the write would have completed had it not been cancelled.
+        await asyncio.sleep(0.6)
+        assert landed is False
 
-    def test_list_writable_no_map(self):
-        """List Writable with no map returns empty."""
-        client = OPCUAClient()
-        result = client.list_writable_nodes()
-        assert result["count"] == 0
+    def test_without_a_running_loop_raises(self):
+        """No ad-hoc connect: it drove the client from a foreign event loop."""
 
-    def test_read_named_no_map(self):
-        """Read Named Node with no map returns error."""
-        client = OPCUAClient()
-        result = client.read_named_node("anything")
-        assert result["success"] is False
-        assert "error" in result
+        async def never_runs():
+            raise AssertionError("must not run")
 
-    def test_read_named_not_found(self, client_with_map):
-        """Read Named Node with unknown name returns error."""
-        result = client_with_map.read_named_node("nonexistent")
-        assert result["success"] is False
-        assert "not found" in result["error"]
-
-    def test_write_named_no_map(self):
-        """Write Named Node with no map returns error."""
-        client = OPCUAClient()
-        result = client.write_named_node("anything", 100)
-        assert result["success"] is False
-        assert "error" in result
-
-    def test_write_named_not_found(self, client_with_map):
-        """Write Named Node with unknown name returns error."""
-        result = client_with_map.write_named_node("nonexistent", 100)
-        assert result["success"] is False
-        assert "not found" in result["error"]
-
-    def test_write_named_not_writable(self, client_with_map):
-        """Write Named Node to read-only node returns error."""
-        result = client_with_map.write_named_node("press", 100)
-        assert result["success"] is False
-        assert "not writable" in result["error"]
+        with pytest.raises(RuntimeError, match="not running"):
+            OPCUAClient()._run_coro(never_runs())
 
 
 class TestActionsIntegration:
-    """Integration tests for SDK actions with demo server."""
+    """Actions against the demo server."""
 
-    def test_list_nodes_action(self, client):
-        """List Nodes action returns all demo nodes."""
-        result = client.list_nodes()
-        assert result["count"] > 0
-        names = [n["name"] for n in result["nodes"]]
-        assert "sensor1" in names
-        assert "running" in names
-        assert "production_count" in names
+    async def test_list_nodes(self, bound_client):
+        names = {n["name"] for n in actions.list_nodes()["nodes"]}
+        assert {"temp_sensor1", "running", "production_count"} <= names
 
-    def test_list_writable_action(self, client):
-        """List Writable action returns writable nodes."""
-        result = client.list_writable_nodes()
-        names = [n["name"] for n in result["nodes"]]
-        assert "setpoint" in names
-        assert "speed_setpoint" in names
-        assert "output1" in names
+    async def test_list_writable(self, bound_client):
+        names = {n["name"] for n in actions.list_writable_nodes()["nodes"]}
+        assert {"setpoint", "speed_setpoint", "output1"} <= names
 
-    def test_get_status_action(self, client):
-        """Get Status action returns info."""
-        result = client.get_status()
+    async def test_get_status(self, bound_client):
+        result = actions.get_status()
         assert result["connected"] is True
-        assert "endpoint" in result
         assert result["nodes"] > 0
 
-    def test_write_named_readonly_fails(self, client):
-        """Write Named to read-only node fails gracefully."""
-        result = client.write_named_node("input1", True)
-        assert result["success"] is False
-        assert "not writable" in result["error"]
+    async def test_write_readonly_raises(self, bound_client):
+        with pytest.raises(ValueError, match="not writable"):
+            actions.write_named_node("input1", 1)
+
+    async def test_action_reuses_the_polling_connection(self, demo_server, node_map):
+        """An action called while polling rides the live session, not a new one."""
+        client = OPCUAClient(endpoint=demo_server.endpoint, node_map=node_map, poll_interval=0.2)
+        client.start()
+        actions.set_client(client)
+        task = asyncio.create_task(client._run_async())
+        try:
+            await _wait_until(lambda: client._poll_count >= 1, 15.0)
+            session = client._client
+
+            # The SDK calls actions from its own thread; to_thread reproduces that
+            # so _run_coro takes the run_coroutine_threadsafe path.
+            result = await asyncio.to_thread(actions.read_named_node, "temp_sensor1")
+            assert 10 < result["value"] < 50
+            assert client._client is session
+            assert client._poll_count > 0
+        finally:
+            actions.set_client(None)
+            client.stop()
+            await asyncio.wait_for(task, 10.0)

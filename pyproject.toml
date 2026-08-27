@@ -1,7 +1,7 @@
 [project]
 name = "zelos-extension-opcua"
 version = "0.1.0"
-description = "OPC-UA protocol extension for Zelos with node mapping, subscriptions, and data type support"
+description = "OPC-UA protocol extension for Zelos with node mapping and data type support"
 authors = [{ name = "Zelos Cloud", email = "support@zeloscloud.io" }]
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,8 +19,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Interface Engine/Protocol Translator",
 ]
 dependencies = [
-    "zelos-sdk>=0.0.8",
-    "asyncua>=1.1.5",
+    # 0.0.11a1 floor: first release with sanitize_name (the trace name grammar)
+    # and the standalone actions harness (zelos_sdk.extensions.actions).
+    "zelos-sdk>=0.0.11a1",
+    # 1.1.8 floor: the poll path reads DataValue.StatusCode_ from batch reads,
+    # verified against 1.1.8 only
+    "asyncua>=1.1.8",
     "rich-click>=1.8.0",
 ]
 

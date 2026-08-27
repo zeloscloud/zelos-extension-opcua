@@ -84,7 +84,8 @@
       "if": {
         "properties": {
           "security_mode": {"enum": ["Sign", "SignAndEncrypt"]}
-        }
+        },
+        "required": ["security_mode"]
       },
       "then": {
         "properties": {

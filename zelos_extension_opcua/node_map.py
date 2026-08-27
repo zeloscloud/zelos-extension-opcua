@@ -20,16 +20,23 @@ Event names become Zelos trace events. Node names become fields within those eve
 Required fields per node: node_id, name
 Optional fields: datatype (default: float32), unit, scale (default: 1.0),
   writable (default: None = auto-detect)
+
+Map name, event names, and node names are sanitized at load (see `sanitize_name`)
+and must be unique after sanitization - see `NodeMap.from_dict`.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import zelos_sdk
 
 logger = logging.getLogger(__name__)
 
@@ -53,17 +60,32 @@ DATATYPES = {
 NODE_ID_PATTERN = re.compile(r"^ns=(\d+);([sigb])=(.+)$")
 
 
-def parse_node_id(node_id: str) -> tuple[int, str, str]:
-    """Parse an OPC-UA node ID string.
+def sanitize_name(name: str, kind: str = "field") -> str:
+    """Make a name addressable in the Zelos trace catalog.
+
+    Delegates to the SDK: the name grammar lives in zelos-trace-types and a
+    hand-rolled character list drifts from it. OPC-UA identifiers routinely
+    carry `. : ; =`, which are separators or syntax in catalog paths.
+    """
+    return zelos_sdk.sanitize_name(name, kind=kind)
+
+
+def parse_node_id(node_id: str) -> tuple[int, str, str | int | uuid.UUID | bytes]:
+    """Parse an OPC-UA node ID string into its converted identifier.
+
+    The identifier is converted here, at map load, not at connect time. An
+    unparseable int/GUID/base64 caught inside connect() surfaced as "Connection
+    failed" and sent the operator after the network instead of the map entry.
 
     Args:
         node_id: Node ID string in format ns=X;Y=Z
 
     Returns:
-        Tuple of (namespace_index, identifier_type, identifier)
+        Tuple of (namespace_index, identifier_type, identifier), the identifier
+        already typed for asyncua's NodeId (int, uuid.UUID, bytes or str)
 
     Raises:
-        ValueError: If node_id format is invalid
+        ValueError: If the format or the identifier itself is invalid
     """
     match = NODE_ID_PATTERN.match(node_id)
     if not match:
@@ -72,9 +94,24 @@ def parse_node_id(node_id: str) -> tuple[int, str, str]:
 
     namespace = int(match.group(1))
     id_type = match.group(2)
-    identifier = match.group(3)
+    raw = match.group(3)
 
-    return namespace, id_type, identifier
+    if id_type == "i":
+        try:
+            return namespace, id_type, int(raw)
+        except ValueError as e:
+            raise ValueError(f"Invalid numeric identifier in node ID '{node_id}': {e}") from e
+    if id_type == "g":
+        try:
+            return namespace, id_type, uuid.UUID(raw)
+        except ValueError as e:
+            raise ValueError(f"Invalid GUID in node ID '{node_id}': {e}") from e
+    if id_type == "b":
+        try:
+            return namespace, id_type, base64.b64decode(raw, validate=True)
+        except Exception as e:
+            raise ValueError(f"Invalid base64 opaque ID in node ID '{node_id}': {e}") from e
+    return namespace, id_type, raw
 
 
 @dataclass
@@ -95,7 +132,7 @@ class Node:
             msg = f"Invalid datatype '{self.datatype}'. Must be one of {list(DATATYPES)}"
             raise ValueError(msg)
 
-        # Validate node ID format
+        # Format and identifier both, so a bad node ID fails the map load.
         parse_node_id(self.node_id)
 
     @property
@@ -111,11 +148,9 @@ class Node:
         return id_type
 
     @property
-    def identifier(self) -> str | int:
-        """Get identifier value from node ID."""
-        _, id_type, identifier = parse_node_id(self.node_id)
-        if id_type == "i":
-            return int(identifier)
+    def identifier(self) -> str | int | uuid.UUID | bytes:
+        """Get identifier value from node ID, typed for asyncua."""
+        _, _, identifier = parse_node_id(self.node_id)
         return identifier
 
 
@@ -150,32 +185,58 @@ class NodeMap:
     def from_dict(cls, data: dict[str, Any]) -> NodeMap:
         """Load node map from dictionary.
 
+        Names are sanitized first, then checked for collisions. A collision is a
+        hard error rather than a warning: silently clobbering one node with
+        another produces a trace that is missing data while looking healthy.
+
         Args:
             data: Dictionary with event/node definitions
 
         Returns:
             NodeMap instance
+
+        Raises:
+            ValueError: On a duplicate event name, or a duplicate node name
+                anywhere in the map (get_by_name must stay unambiguous)
         """
         events: dict[str, list[Node]] = {}
+        seen_nodes: dict[str, str] = {}  # sanitized node name -> owning event
 
-        for event_name, nodes_data in data.get("events", {}).items():
+        for raw_event_name, nodes_data in data.get("events", {}).items():
+            event_name = sanitize_name(raw_event_name, kind="event")
+            if event_name in events:
+                msg = f"Duplicate event name '{event_name}' after sanitization"
+                raise ValueError(msg)
+
             nodes = []
             for node_data in nodes_data:
-                node = Node(
-                    node_id=node_data["node_id"],
-                    name=node_data["name"],
-                    datatype=node_data.get("datatype", "float32"),
-                    unit=node_data.get("unit", ""),
-                    scale=node_data.get("scale", 1.0),
-                    description=node_data.get("description", ""),
-                    writable=node_data.get("writable"),
+                name = sanitize_name(node_data["name"])
+                prior = seen_nodes.get(name)
+                if prior is not None:
+                    msg = (
+                        f"Duplicate node name '{name}' in event '{event_name}' "
+                        f"(already defined in event '{prior}'). Node names must be "
+                        "unique across the whole map."
+                    )
+                    raise ValueError(msg)
+                seen_nodes[name] = event_name
+
+                nodes.append(
+                    Node(
+                        node_id=node_data["node_id"],
+                        name=name,
+                        datatype=node_data.get("datatype", "float32"),
+                        unit=node_data.get("unit", ""),
+                        scale=node_data.get("scale", 1.0),
+                        description=node_data.get("description", ""),
+                        writable=node_data.get("writable"),
+                    )
                 )
-                nodes.append(node)
             events[event_name] = nodes
 
         return cls(
             events=events,
-            name=data.get("name", "opcua"),
+            name=sanitize_name(data.get("name", "opcua"), kind="source"),
             description=data.get("description", ""),
         )
 
@@ -207,7 +268,8 @@ class NodeMap:
         """Find node by name across all events.
 
         Args:
-            name: Node name
+            name: Sanitized node name, i.e. the name that appears in traces and
+                in `list_nodes` output
 
         Returns:
             Node if found, None otherwise
