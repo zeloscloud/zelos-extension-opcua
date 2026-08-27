@@ -22,8 +22,11 @@ dist/
 *.egg-info/
 pip-wheel-metadata/
 zelos_opcua_extension.egg-info/
-zelos-opcua-extension-v*.tar.gz
+# `zelos extensions package` emits <slug>-<version>.tar.gz (opc-ua-0.1.0.tar.gz).
+*.tar.gz
 scripts/__pycache__/
+# Standalone action inventory: regenerated from the code on every package run.
+actions.json
 
 # Logs and temp files
 *.log

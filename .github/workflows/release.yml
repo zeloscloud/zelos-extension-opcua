@@ -11,13 +11,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+# Tests run before packaging; without this their bytecode ends up in the archive
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -53,6 +57,13 @@ jobs:
           fi
           echo "✓ pyproject.toml version matches: $PYPROJECT_VERSION"
 
+      - name: Install Zelos CLI
+        run: |
+          curl -fsSL https://release.zeloscloud.io/cli/install.sh | bash
+          echo "$HOME/.zelos/bin" >> $GITHUB_PATH
+        env:
+          INSTALLER_NO_MODIFY_PATH: 1
+
       - name: Install dependencies
         run: just ci-install
 
@@ -67,7 +78,7 @@ jobs:
 
       - name: Verify package was created
         run: |
-          PACKAGE_FILE="*-v${{ steps.version.outputs.VERSION }}.tar.gz"
+          PACKAGE_FILE="*-${{ steps.version.outputs.VERSION }}.tar.gz"
           if ! ls $PACKAGE_FILE 1> /dev/null 2>&1; then
             echo "Error: Package file not found: $PACKAGE_FILE"
             exit 1
@@ -75,8 +86,8 @@ jobs:
           echo "✓ Package created: $(ls $PACKAGE_FILE)"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2.4.1
+        uses: softprops/action-gh-release@v2.5.0
         with:
-          files: "*-v${{ steps.version.outputs.VERSION }}.tar.gz"
+          files: "*-${{ steps.version.outputs.VERSION }}.tar.gz"
           generate_release_notes: true
           fail_on_unmatched_files: true
