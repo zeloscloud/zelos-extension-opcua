@@ -1,122 +1,75 @@
 #!/usr/bin/env python3
 """Zelos OPC-UA Extension - CLI entry point.
 
-This module provides the command-line interface for the OPC-UA extension.
-It can run in several modes:
+Modes:
 
-1. App mode (default): Loads configuration from config.json when run from Zelos App
-2. Demo mode: Uses built-in PLC simulator (no hardware required)
-3. CLI trace mode: Direct command-line usage with explicit arguments
+1. App mode (default): configuration comes from the Zelos App
+2. Demo mode: built-in PLC simulator, no hardware
+3. CLI trace mode: explicit endpoint and node map on the command line
 
 Examples:
-    # Run from Zelos App (uses config.json)
-    uv run main.py
-
-    # Demo mode (simulated PLC)
-    uv run main.py demo
-
-    # CLI trace mode
+    uv run main.py                                          # app mode
+    uv run main.py demo                                     # simulated PLC
     uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json
 """
 
 from __future__ import annotations
 
 import logging
-import signal
 import sys
-from types import FrameType
-from typing import TYPE_CHECKING
 
 import rich_click as click
-import zelos_sdk
 from zelos_sdk.hooks.logging import TraceLoggingHandler
 
-if TYPE_CHECKING:
-    from zelos_extension_opcua.client import OPCUAClient
+from zelos_extension_opcua import ACTION_PREFIX as _ACTION_PREFIX
+from zelos_extension_opcua.cli import app as app_mode
 
-# Configure logging - INFO level prevents debug noise
+#: Re-exported so a packaging-time action inventory - which reads this entry
+#: module - sees the same namespace the live registration uses. See the
+#: definition in `zelos_extension_opcua/__init__.py`.
+ACTION_PREFIX = _ACTION_PREFIX
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Global client reference for shutdown handler
-_client: OPCUAClient | None = None
+# asyncua logs a record per request at INFO, which at a 1 Hz poll is a permanent
+# stream into the trace through the handler below. Only DEBUG re-opens it - see
+# cli/app.apply_log_level.
+logging.getLogger("asyncua").setLevel(logging.WARNING)
 
-
-def shutdown_handler(signum: int, frame: FrameType | None) -> None:
-    """Handle graceful shutdown on SIGTERM or SIGINT."""
-    logger.info("Shutting down...")
-    if _client:
-        _client.stop()
-    sys.exit(0)
-
-
-def set_shutdown_client(client: OPCUAClient) -> None:
-    """Set the client for shutdown handling."""
-    global _client
-    _client = client
+# Capture logs at INFO and above into the trace. DEBUG is excluded so verbose
+# library chatter cannot flood the backend.
+_handler = TraceLoggingHandler("opcua_log")
+_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(_handler)
 
 
 @click.group(invoke_without_command=True)
 @click.option("--demo", is_flag=True, help="Run in demo mode with simulated PLC")
 @click.pass_context
 def cli(ctx: click.Context, demo: bool) -> None:
-    """Zelos OPC-UA Extension - Read, write, and monitor OPC-UA nodes.
+    """Zelos OPC-UA Extension - read, write, and monitor OPC-UA nodes.
 
-    When run without a subcommand, starts in app mode using configuration
-    from the Zelos App (config.json).
-
-    Use --demo flag or 'demo' subcommand for simulated PLC.
-    Use 'trace' subcommand for direct CLI access without Zelos App.
+    Without a subcommand this starts in app mode using the configuration saved
+    by the Zelos App. Use --demo or the 'demo' subcommand for a simulated PLC,
+    and 'trace' for direct CLI access.
     """
-    ctx.ensure_object(dict)
-    ctx.obj["shutdown_handler"] = set_shutdown_client
-    ctx.obj["demo"] = demo
-
     if ctx.invoked_subcommand is None:
-        # App mode - run with Zelos App configuration
-        run_app_mode(ctx, demo=demo)
-
-
-def run_app_mode(ctx: click.Context, demo: bool = False) -> None:
-    """Run in app mode with Zelos SDK initialization."""
-    # Initialize SDK
-    zelos_sdk.init(name="zelos_extension_opcua", actions=True)
-
-    # Add trace logging handler
-    handler = TraceLoggingHandler("zelos_extension_opcua_logger")
-    logging.getLogger().addHandler(handler)
-
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-
-    # Import and run app mode
-    from zelos_extension_opcua.cli.app import run_app_mode as _run_app_mode
-
-    _run_app_mode(demo=demo)
+        app_mode.run_app_mode(demo=demo)
 
 
 @cli.command()
-@click.pass_context
-def demo(ctx: click.Context) -> None:
-    """Run demo mode with simulated PLC.
+def demo() -> None:
+    """Run against the built-in PLC simulator.
 
-    Starts a local OPC-UA server with simulated PLC data
-    and connects to it. No hardware required.
-
-    The simulated PLC includes:
-    - Temperature sensors and setpoint
-    - Pressure sensors
-    - Motor speed, current, and running state
-    - Production and error counters
-    - Digital inputs and outputs
-    - Tank level and voltage
-    - Energy accumulator
+    Starts a local OPC-UA server with simulated temperature, pressure, motor,
+    counter, digital I/O, analog and energy nodes, then traces it. No hardware
+    required.
     """
-    run_app_mode(ctx, demo=True)
+    app_mode.run_app_mode(demo=True)
 
 
 @cli.command()
@@ -138,13 +91,9 @@ def demo(ctx: click.Context) -> None:
 )
 @click.option("--username", "-u", type=str, default="", help="Username for authentication")
 @click.option("--password", type=str, default="", help="Password for authentication")
-@click.option(
-    "--interval", "-i", type=float, default=1.0, help="Poll interval in seconds"
-)
+@click.option("--interval", "-i", type=float, default=1.0, help="Poll interval in seconds")
 @click.option("--timeout", type=float, default=5.0, help="Request timeout in seconds")
-@click.pass_context
 def trace(
-    ctx: click.Context,
     endpoint: str,
     node_map_file: str | None,
     security_mode: str,
@@ -154,68 +103,42 @@ def trace(
     interval: float,
     timeout: float,
 ) -> None:
-    """Trace OPC-UA nodes from command line.
+    """Trace OPC-UA nodes from the command line.
 
-    ENDPOINT is the OPC-UA server endpoint URL (e.g., opc.tcp://192.168.1.100:4840).
-
-    NODE_MAP_FILE is an optional path to a JSON node map file.
+    ENDPOINT is the server URL (e.g. opc.tcp://192.168.1.100:4840).
+    NODE_MAP_FILE is an optional JSON node map.
 
     \b
     Examples:
-        # Connect with node map
         uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json
-
-        # Connect with authentication
-        uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json -u admin --password secret
-
-        # Connect with security
-        uv run main.py trace opc.tcp://server:4840 -s SignAndEncrypt
-
-        # Connect without node map (browse mode)
-        uv run main.py trace opc.tcp://192.168.1.100:4840
+        uv run main.py trace opc.tcp://server:4840 nodes.json -u admin --password secret
+        uv run main.py trace opc.tcp://server:4840 -s SignAndEncrypt -p Basic256Sha256
     """
     from zelos_extension_opcua.client import OPCUAClient
     from zelos_extension_opcua.node_map import NodeMap
 
-    # Initialize SDK for CLI mode
-    zelos_sdk.init(name="zelos_extension_opcua", actions=True)
-
-    # Add trace logging handler
-    handler = TraceLoggingHandler("zelos_extension_opcua_logger")
-    logging.getLogger().addHandler(handler)
-
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-
-    # Load node map if provided
     node_map = None
     if node_map_file:
         try:
             node_map = NodeMap.from_file(node_map_file)
-            logger.info(f"Loaded node map with {len(node_map.nodes)} nodes")
         except Exception as e:
-            raise click.ClickException(f"Invalid node map: {e}") from e
+            logger.error("Failed to load node map '%s': %s", node_map_file, e)
+            sys.exit(1)
+        logger.info("Loaded node map '%s' with %d nodes", node_map.name, len(node_map.nodes))
 
-    # Build client
-    global _client
-    _client = OPCUAClient(
-        endpoint=endpoint,
-        security_mode=security_mode,
-        security_policy=security_policy,
-        username=username,
-        password=password,
-        timeout=timeout,
-        node_map=node_map,
-        poll_interval=interval,
+    logger.info("Starting OPC-UA trace: %s", endpoint)
+    app_mode.serve(
+        OPCUAClient(
+            endpoint=endpoint,
+            security_mode=security_mode,
+            security_policy=security_policy,
+            username=username,
+            password=password,
+            timeout=timeout,
+            node_map=node_map,
+            poll_interval=interval,
+        )
     )
-
-    # Register actions
-    zelos_sdk.actions_registry.register(_client)
-
-    logger.info(f"Starting OPC-UA trace: {endpoint}")
-    _client.start()
-    _client.run()
 
 
 if __name__ == "__main__":

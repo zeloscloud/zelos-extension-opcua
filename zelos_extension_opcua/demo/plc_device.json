@@ -3,13 +3,13 @@
   "description": "Demo PLC device with comprehensive node types",
   "events": {
     "temperature": [
-      {"name": "sensor1", "node_id": "ns=2;s=Temperature.Sensor1", "datatype": "float32", "unit": "°C"},
-      {"name": "sensor2", "node_id": "ns=2;s=Temperature.Sensor2", "datatype": "float32", "unit": "°C"},
+      {"name": "temp_sensor1", "node_id": "ns=2;s=Temperature.Sensor1", "datatype": "float32", "unit": "°C"},
+      {"name": "temp_sensor2", "node_id": "ns=2;s=Temperature.Sensor2", "datatype": "float32", "unit": "°C"},
       {"name": "setpoint", "node_id": "ns=2;s=Temperature.Setpoint", "datatype": "float32", "unit": "°C", "writable": true}
     ],
     "pressure": [
-      {"name": "sensor1", "node_id": "ns=2;s=Pressure.Sensor1", "datatype": "float32", "unit": "bar"},
-      {"name": "sensor2", "node_id": "ns=2;s=Pressure.Sensor2", "datatype": "float32", "unit": "bar"}
+      {"name": "pressure_sensor1", "node_id": "ns=2;s=Pressure.Sensor1", "datatype": "float32", "unit": "bar"},
+      {"name": "pressure_sensor2", "node_id": "ns=2;s=Pressure.Sensor2", "datatype": "float32", "unit": "bar"}
     ],
     "motor": [
       {"name": "speed", "node_id": "ns=2;s=Motor.Speed", "datatype": "float32", "unit": "RPM"},
