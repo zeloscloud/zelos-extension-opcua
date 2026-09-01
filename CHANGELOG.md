@@ -85,6 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standalone actions.
 - CI verifies `uv.lock` is in sync with `pyproject.toml` (`uv lock --locked`), and
   `just check` now enforces `ruff format --check` alongside `ruff check`.
+- Log lines use UTC ISO 8601 timestamps with milliseconds, matching the SDK's Rust tracing format.
 
 ### Removed
 - `scripts/package_extension.py`, superseded by `zelos extensions package`.
