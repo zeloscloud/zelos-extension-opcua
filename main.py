@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 
 import rich_click as click
 from zelos_sdk.hooks.logging import TraceLoggingHandler
@@ -29,9 +30,12 @@ from zelos_extension_opcua.cli import app as app_mode
 #: definition in `zelos_extension_opcua/__init__.py`.
 ACTION_PREFIX = _ACTION_PREFIX
 
+# UTC ISO 8601 with ms, matching the SDK's Rust tracing lines in the same log stream
+logging.Formatter.converter = time.gmtime
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s.%(msecs)03dZ %(levelname)5s %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
