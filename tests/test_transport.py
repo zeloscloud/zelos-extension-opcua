@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 import pytest
 import zelos_sdk
 from asyncua import ua
+from asyncua.ua.uaerrors import UaStructParsingError
 
 from zelos_extension_opcua import client as client_mod
 from zelos_extension_opcua.cli.app import get_demo_node_map_path
@@ -209,3 +210,70 @@ async def test_poll_transport_never_subscribes():
     assert not SUBSCRIPTION_SERVICES & services(sim)
     assert (status["subscribed"], status["polled"]) == (0, len(node_map.nodes))
     assert all(t is not None for e, t, _ in rows.rows if e != HEALTH_EVENT)
+
+
+async def test_publish_decode_failure_during_setup_still_traces_every_node(monkeypatch):
+    """A Publish that fails to decode mid-subscription-setup polls every node, none lost."""
+    real_limits = client_mod.operation_limits
+
+    async def limits(client):
+        browse, read, _ = await real_limits(client)
+        return browse, read, 50  # several CreateMonitoredItems calls
+
+    real_guard = OPCUAClient._guard_publish
+
+    def guard(self, client):
+        session = client.uaclient.session
+        publish, failed = session.publish, []
+
+        async def publish_once_bad(acks):
+            if failed:
+                return await publish(acks)
+            failed.append(True)
+            while len(self._monitored) < 50:  # the first chunk is registered
+                await asyncio.sleep(0.001)
+            raise UaStructParsingError("injected")
+
+        session.publish = publish_once_bad
+        real_guard(self, client)
+
+    monkeypatch.setattr(client_mod, "operation_limits", limits)
+    monkeypatch.setattr(OPCUAClient, "_guard_publish", guard)
+    async with Simulator(port=0, nodes=300) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, poll_interval=0.5)
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs, 20.0)
+            expected = {(event, node.name) for event, node, _ in client._poll_targets}
+            assert len(expected) >= 300
+
+            def traced():
+                return {(e, k) for e, _, f in rows.rows for k in f}
+
+            await wait_until(lambda: expected <= traced(), 10.0)
+            status = client.status()
+            assert (status["subscribed"], status["polled"]) == (0, len(expected))
+
+
+async def test_shutdown_does_not_wait_out_a_hung_request(monkeypatch):
+    """A Read the server never answers is cancelled at stop, not awaited to its timeout."""
+    hung = asyncio.Event()
+    real = client_mod.read_many
+
+    async def read_many(client, items, chunk):
+        if hung.is_set():
+            await asyncio.Event().wait()
+        return await real(client, items, chunk)
+
+    monkeypatch.setattr(client_mod, "read_many", read_many)
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, poll_interval=0.2, timeout=30.0)
+        client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
+        runner = OPCUARunner([client])
+        task = asyncio.create_task(runner._run_async())
+        await wait_until(lambda: client._poll_count >= 2, 10.0)
+        hung.set()
+        await asyncio.sleep(0.5)  # the next health Read is in flight
+        started = time.monotonic()
+        runner.stop()
+        await asyncio.wait_for(task, 10.0)
+        assert time.monotonic() - started < 3.5

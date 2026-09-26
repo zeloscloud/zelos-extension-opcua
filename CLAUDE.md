@@ -91,7 +91,9 @@ into the one polling loop, reusing its session. There is no connect-per-action
 and no ad-hoc `asyncio.run` fallback - mutating client state from a foreign loop
 silently lost every later sample - so a call with no loop running raises
 `RuntimeError("extension is not running")`. A dispatch that times out cancels
-the coroutine, so a late write cannot land after the action reported failure.
+the coroutine, which stops a write not yet sent. A Write request already sent
+cannot be recalled: a timeout after it (`sent`) raises a TimeoutError saying the
+server may have applied it, never a plain failure.
 
 ### Subscriptions
 
