@@ -357,7 +357,7 @@ async def build_device(server: Server, ns: dict[str, int]) -> Drifter:
     )
     await broken.write_value(
         ua.DataValue(
-            ua.Variant(0.0, VT.Double), StatusCode_=ua.StatusCode(ua.StatusCodes.BadSensorFailure)
+            ua.Variant(0.0, VT.Double), StatusCode=ua.StatusCode(ua.StatusCodes.BadSensorFailure)
         )
     )
 

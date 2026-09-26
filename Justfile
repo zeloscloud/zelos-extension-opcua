@@ -26,6 +26,10 @@ check:
 test:
     uv run pytest
 
+# Interop against Microsoft OPC PLC in Docker (needs docker, port 4840 free); manual, pre-release
+e2e-interop *ARGS:
+    ZELOS_INTEROP=1 uv run pytest tests/test_interop.py {{ARGS}}
+
 # Run extension locally (app mode, reads config.json)
 dev:
     uv run python main.py

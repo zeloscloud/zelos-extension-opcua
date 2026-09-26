@@ -27,7 +27,6 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -183,7 +182,8 @@ class _SimProcessor(UaProcessor):
             raise ServiceError(ua.StatusCodes.BadSessionIdInvalid)
         if not self.session.is_activated():
             raise ServiceError(ua.StatusCodes.BadSessionNotActivated)
-        self.session_last_activity = datetime.now(UTC)
+        self.session_last_activity = time.monotonic()
+        self.session.touch()
         limits = self._sim.limits
 
         if service == "Browse":
@@ -235,6 +235,8 @@ class _SimProtocol(OPCUAProtocol):
 
     def connection_made(self, transport) -> None:
         super().connection_made(transport)
+        if self.processor is None:  # refused at max_connections
+            return
         # Swapped before the receive task runs its first message.
         self.processor = _SimProcessor(self.sim, self.iserver, transport, self.limits)
         self.processor.set_policies(self.policies)
@@ -259,7 +261,7 @@ class _SimServer(Server):
     sim: Simulator
 
     async def start(self) -> None:
-        """`Server.start` (asyncua 1.1.8) with `_SimBinaryServer` in place of BinaryServer."""
+        """`Server.start` (asyncua 2.0.1) with `_SimBinaryServer` in place of BinaryServer."""
         await self._setup_server_nodes()
         await self.iserver.start()
         try:

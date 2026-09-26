@@ -8,6 +8,7 @@ server shows up after the next reconnect instead of going stale.
 from __future__ import annotations
 
 import re
+import struct
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from asyncua import Client, ua
+from asyncua.common.utils import NotEnoughData
 from asyncua.ua.uatypes import NodeId
 
 from zelos_extension_opcua.node_map import Node, NodeMap, format_nsu_node_id, sanitize_name
@@ -95,6 +97,11 @@ VENDOR_IDS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], list[str]]], 
 )
 
 
+# Raised client-side while parsing a complete response: the channel is intact.
+_DECODE_ERRORS = (struct.error, ValueError, NotEnoughData)
+_BAD_DECODING = ua.StatusCodes.BadDecodingError
+
+
 def to_nsu_string(node_id: NodeId, namespaces: Sequence[str]) -> str | None:
     """The URI-qualified form of a NodeId, or None if its index is not in `namespaces`."""
     if node_id.NamespaceIndex >= len(namespaces):
@@ -133,23 +140,40 @@ async def operation_limits(client: Client) -> tuple[int, int]:
 
 
 def _good(dv: ua.DataValue) -> bool:
-    return dv.StatusCode_ is None or dv.StatusCode_.is_good()
+    return dv.StatusCode is None or dv.StatusCode.is_good()
 
 
 async def read_many(
     client: Client, items: Sequence[tuple[NodeId, int | None]], chunk: int
 ) -> list[ua.DataValue]:
-    """Read (node, attribute) pairs, `chunk` per request; attribute None = Value."""
+    """Read (node, attribute) pairs, `chunk` per request; attribute None = Value.
+
+    asyncua fails a whole response on one value it cannot decode (a 2-D Variant
+    array, some nested Variants); that chunk is re-read item by item and the
+    undecodable item comes back as BadDecodingError.
+    """
     out: list[ua.DataValue] = []
     for start in range(0, len(items), chunk):
-        params = ua.ReadParameters()
-        for node_id, attribute in items[start : start + chunk]:
-            rv = ua.ReadValueId()
-            rv.NodeId = node_id
-            rv.AttributeId = ua.AttributeIds.Value if attribute is None else attribute
-            params.NodesToRead.append(rv)
-        out.extend(await client.uaclient.read(params))
+        batch = items[start : start + chunk]
+        try:
+            out.extend(await _read(client, batch))
+        except _DECODE_ERRORS:
+            for item in batch:
+                try:
+                    out.extend(await _read(client, [item]))
+                except _DECODE_ERRORS:
+                    out.append(ua.DataValue(StatusCode=ua.StatusCode(_BAD_DECODING)))
     return out
+
+
+async def _read(client: Client, items: Sequence[tuple[NodeId, int | None]]) -> list[ua.DataValue]:
+    params = ua.ReadParameters()
+    for node_id, attribute in items:
+        rv = ua.ReadValueId()
+        rv.NodeId = node_id
+        rv.AttributeId = ua.AttributeIds.Value if attribute is None else attribute
+        params.NodesToRead.append(rv)
+    return await client.uaclient.read(params)
 
 
 @dataclass
@@ -198,6 +222,9 @@ async def _browse_batch(rpc: _Counter, node_ids: list[NodeId]) -> list[list[Any]
     """Forward hierarchical references of each node, following BrowseNext to the end."""
     params = ua.BrowseParameters()
     params.View = ua.ViewDescription()
+    # asyncua defaults the view Timestamp to now; the .NET stack reads that as a
+    # historical view and answers BadNodeNotInView. Null means the current view.
+    params.View.Timestamp = ua.get_win_epoch()
     params.RequestedMaxReferencesPerNode = 0
     for node_id in node_ids:
         desc = ua.BrowseDescription()
@@ -354,6 +381,8 @@ async def describe(
 
 def _from_value(dv: ua.DataValue) -> tuple[str | None, str]:
     """Datatype from the current value's variant, or (None, skip reason)."""
+    if dv.StatusCode is not None and dv.StatusCode.value == _BAD_DECODING:
+        return None, "undecodable"
     variant = dv.Value if _good(dv) else None
     if variant is None or variant.Value is None:
         return None, "no value"
