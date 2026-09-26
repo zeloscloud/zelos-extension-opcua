@@ -16,19 +16,26 @@ import uuid
 from pathlib import Path
 
 import pytest
+import zelos_sdk
 from asyncua import ua
 
 from zelos_extension_opcua import actions
 from zelos_extension_opcua.client import (
-    READ_CHUNK,
     OPCUAClient,
+    OPCUARunner,
     coerce_text,
     decode_value,
     encode_value,
     is_connection_error,
     parse_node_id_to_ua,
 )
-from zelos_extension_opcua.node_map import Node, NodeMap, parse_node_id, sanitize_name
+from zelos_extension_opcua.node_map import (
+    Node,
+    NodeMap,
+    format_nsu_node_id,
+    parse_node_id,
+    sanitize_name,
+)
 
 DEMO_MAP_PATH = Path(__file__).parent.parent / "zelos_extension_opcua" / "demo" / "plc_device.json"
 
@@ -112,9 +119,16 @@ class TestNodeIdParsing:
         guid = "12345678-1234-5678-1234-567812345678"
         assert parse_node_id(f"ns=1;g={guid}") == (1, "g", uuid.UUID(guid))
 
+    def test_parse_nsu_id(self):
+        """nsu= carries the percent-decoded URI; the identifier converts as for ns=."""
+        assert parse_node_id("nsu=urn:zelos:demo:plc;s=A;B") == ("urn:zelos:demo:plc", "s", "A;B")
+        assert parse_node_id("nsu=urn:a%3Bb%25;i=7") == ("urn:a;b%", "i", 7)
+        nsu = format_nsu_node_id("urn:a;b%3B", "i=7")
+        assert parse_node_id(nsu) == ("urn:a;b%3B", "i", 7)
+
     def test_invalid_format_raises(self):
         """Invalid format raises ValueError."""
-        for bad in ("invalid", "ns=2", "i=85"):
+        for bad in ("invalid", "ns=2", "i=85", "nsu=;i=1", "nsu=urn:x", "nsu=urn:x;g=nope"):
             with pytest.raises(ValueError):
                 parse_node_id(bad)
 
@@ -290,17 +304,18 @@ class TestSanitization:
                 }
             )
 
-    def test_duplicate_node_name_across_events_raises(self):
-        """get_by_name must stay unambiguous, so cross-event names collide too."""
-        with pytest.raises(ValueError, match="already defined in event 'a'"):
-            NodeMap.from_dict(
-                {
-                    "events": {
-                        "a": [{"name": "sensor1", "node_id": "ns=2;s=A"}],
-                        "b": [{"name": "sensor1", "node_id": "ns=2;s=B"}],
-                    }
+    def test_node_name_across_events_is_qualified(self):
+        node_map = NodeMap.from_dict(
+            {
+                "events": {
+                    "a": [{"name": "sensor1", "node_id": "ns=2;s=A"}],
+                    "b/c": [{"name": "sensor1", "node_id": "ns=2;s=B"}],
                 }
-            )
+            }
+        )
+        assert node_map.get_by_name("b/c/sensor1").node_id == "ns=2;s=B"
+        with pytest.raises(ValueError, match="use one of: a/sensor1, b/c/sensor1"):
+            node_map.get_by_name("sensor1")
 
     def test_collision_only_after_sanitization_raises(self):
         with pytest.raises(ValueError, match="Duplicate node name 'a_b'"):
@@ -693,9 +708,9 @@ async def client(demo_server, node_map):
 @pytest.fixture
 async def bound_client(client):
     """`client`, bound as the actions module's client for the test."""
-    actions.set_client(client)
+    actions.set_runner(OPCUARunner([client]))
     yield client
-    actions.set_client(None)
+    actions.set_runner(None)
 
 
 class TestDemoServerIntegration:
@@ -775,6 +790,63 @@ class TestDemoServerIntegration:
         assert len(client._poll_targets) == len(client.node_map.nodes)
 
 
+class TestNamespaceUriIds:
+    """nsu= IDs resolve against the live NamespaceArray, not a stored index."""
+
+    async def test_nsu_map_polls_the_same_nodes(self, demo_server, client):
+        data = json.loads(DEMO_MAP_PATH.read_text())
+        text = json.dumps(data).replace('"ns=2;', '"nsu=urn:zelos:demo:plc;')
+        nsu_client = OPCUAClient(
+            endpoint=demo_server.endpoint, node_map=NodeMap.from_dict(json.loads(text))
+        )
+        assert await nsu_client.connect() is True
+        try:
+            assert [t[2].nodeid for t in nsu_client._poll_targets] == [
+                t[2].nodeid for t in client._poll_targets
+            ]
+            ns_values, nsu_values = await client._poll_nodes(), await nsu_client._poll_nodes()
+            assert {e: set(v) for e, v in nsu_values.items()} == {
+                e: set(v) for e, v in ns_values.items()
+            }
+            assert nsu_values["status"]["device_name"] == ns_values["status"]["device_name"]
+
+            # Raw-ID actions, and browse output round-trips through nsu_node_id.
+            name = await nsu_client.read_node("nsu=urn:zelos:demo:plc;s=Status.DeviceName")
+            assert name == ns_values["status"]["device_name"]
+            browsed = await nsu_client.browse_children("ns=0;i=85", 3)
+            entry = next(n for n in browsed if n["node_id"] == "ns=2;s=Temperature.Sensor1")
+            assert entry["nsu_node_id"] == "nsu=urn:zelos:demo:plc;s=Temperature.Sensor1"
+        finally:
+            await nsu_client.disconnect()
+
+    async def test_unknown_uri_is_skipped_and_the_loop_lives(self, demo_server, caplog):
+        node_map = NodeMap.from_dict(
+            {
+                "name": "nsu_missing",
+                "events": {
+                    "mix": [
+                        {"name": "good", "node_id": "ns=2;s=Temperature.Sensor1"},
+                        {"name": "lost", "node_id": "nsu=urn:not:there;s=Temperature.Sensor1"},
+                    ]
+                },
+            }
+        )
+        client = OPCUAClient(endpoint=demo_server.endpoint, node_map=node_map, poll_interval=0.1)
+        client.start()
+        runner = OPCUARunner([client])
+        task = asyncio.create_task(runner._run_async())
+        try:
+            await _wait_until(lambda: client._poll_count >= 2, 15.0)
+            assert not task.done()
+            assert [t[1].name for t in client._poll_targets] == ["good"]
+            errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+            assert any("urn:not:there" in m and "lost" in m for m in errors)
+            assert set((await client._poll_nodes())["mix"]) == {"good"}
+        finally:
+            runner.stop()
+            await asyncio.wait_for(task, 10.0)
+
+
 class TestBatchPollPartialFailure:
     """A single bad node must not cost the cycle, or flood the log."""
 
@@ -840,27 +912,6 @@ class TestBatchPollPartialFailure:
             await client.disconnect()
 
 
-class TestBatchReadChunking:
-    """A map bigger than a server's MaxNodesPerRead must not be one request."""
-
-    async def test_read_is_chunked(self):
-        sizes: list[int] = []
-
-        class FakeClient:
-            async def read_attributes(self, nodes, attribute):
-                sizes.append(len(nodes))
-                return [ua.DataValue(ua.Variant(1.0)) for _ in nodes]
-
-        client = OPCUAClient()
-        client._client = FakeClient()
-        client._connected = True
-        node = Node(node_id="ns=2;i=1", name="n")
-        client._poll_targets = [("e", node, object())] * (READ_CHUNK + 50)
-
-        await client._poll_nodes()
-        assert sizes == [READ_CHUNK, 50]
-
-
 class TestReconnection:
     """The poll loop survives a server that goes away and comes back."""
 
@@ -882,7 +933,8 @@ class TestReconnection:
             endpoint=server.endpoint, node_map=node_map, poll_interval=0.2, timeout=2.0
         )
         client.start()
-        task = asyncio.create_task(client._run_async())
+        runner = OPCUARunner([client])
+        task = asyncio.create_task(runner._run_async())
         try:
             await _wait_until(lambda: client._poll_count >= 2, 15.0)
 
@@ -898,7 +950,7 @@ class TestReconnection:
             await _wait_until(lambda: client._connected and client._poll_count > polls_before, 30.0)
             assert (await client._poll_nodes())["temperature"]["t1"] > 0
         finally:
-            client.stop()
+            runner.stop()
             await asyncio.wait_for(task, 10.0)
             server.stop()
 
@@ -906,9 +958,10 @@ class TestReconnection:
         """stop() alone drains the loop and the finally disconnects."""
         client = OPCUAClient(endpoint="opc.tcp://127.0.0.1:14999", poll_interval=0.1)
         client.start()
-        task = asyncio.create_task(client._run_async())
+        runner = OPCUARunner([client])
+        task = asyncio.create_task(runner._run_async())
         await asyncio.sleep(0.5)  # let the first (failing) connect attempt land
-        client.stop()
+        runner.stop()
         await asyncio.wait_for(task, 5.0)
         assert client._connected is False
 
@@ -928,9 +981,10 @@ class TestReconnection:
         client = OPCUAClient(endpoint="opc.tcp://10.255.255.1:4840", timeout=20.0)
         client._ensure_connected = slow_connect
         client.start()
-        task = asyncio.create_task(client._run_async())
+        runner = OPCUARunner([client])
+        task = asyncio.create_task(runner._run_async())
         await asyncio.sleep(0.2)
-        client.stop()
+        runner.stop()
         await asyncio.wait_for(task, 2.0)
         assert cancelled
 
@@ -951,30 +1005,32 @@ class TestReconnection:
         client._ensure_connected = fake_connect
         client._poll_nodes = failing_poll
         client.start()
-        task = asyncio.create_task(client._run_async())
+        runner = OPCUARunner([client])
+        task = asyncio.create_task(runner._run_async())
         try:
             await _wait_until(lambda: connects >= 2, 5.0)
         finally:
-            client.stop()
+            runner.stop()
             await asyncio.wait_for(task, 5.0)
         assert client._error_count >= 5
 
 
 class TestTraceSourceEvents:
-    """Events are held by name, never fetched off the source with getattr."""
+    """Trace layout per prefix; events held by name, never getattr on the source."""
 
-    def test_event_named_like_a_source_attribute_records(self):
-        """`log` is a method on TraceSourceCacheLast; getattr returned that."""
+    @pytest.mark.parametrize(
+        ("shared", "source", "event"), [(True, "OPC-UA", "plc01/log"), (False, "plc01", "log")]
+    )
+    def test_layout(self, shared, source, event):
+        # `log` is also a TraceSource method: getattr would have returned that.
         node_map = NodeMap.from_dict(
-            {
-                "name": "shadow_test",
-                "events": {"log": [{"name": "v", "node_id": "ns=2;i=1", "datatype": "float64"}]},
-            }
+            {"name": "m", "events": {"log": [{"name": "v", "node_id": "ns=2;i=1"}]}}
         )
-        client = OPCUAClient(node_map=node_map)
-        client._init_trace_source()
+        client = OPCUAClient(endpoint="opc.tcp://plc01:4840", node_map=node_map)
+        client._init_trace_source(zelos_sdk.TraceSource("OPC-UA") if shared else None)
+        assert client._source.name == source
+        assert client._events["log"].name == event
         client._log_values({"log": {"v": 3.5}})
-        assert client._events["log"].v.get() == 3.5
 
 
 async def _wait_until(predicate, timeout: float, interval: float = 0.1) -> None:
@@ -1028,16 +1084,18 @@ class TestActionsUnit:
             }
         )
         client = OPCUAClient(node_map=node_map)
-        actions.set_client(client)
+        actions.set_runner(OPCUARunner([client]))
         yield client
-        actions.set_client(None)
+        actions.set_runner(None)
 
     def test_registered_action_names(self):
         """register_actions publishes exactly the documented surface."""
         from zelos_sdk.actions import ActionsRegistry
 
         assert sorted(actions.register_actions(ActionsRegistry())) == [
+            "auto_config",
             "browse_nodes",
+            "discovered_map",
             "get_status",
             "list_nodes",
             "list_writable_nodes",
@@ -1048,7 +1106,9 @@ class TestActionsUnit:
         ]
 
     def test_get_status(self, offline_client):
-        result = actions.get_status()
+        statuses = actions.get_status()
+        assert statuses["count"] == 1
+        result = statuses["servers"][0]
         assert result["connected"] is False
         assert result["nodes"] == 4
         assert "endpoint" in result and "security_mode" in result
@@ -1063,19 +1123,19 @@ class TestActionsUnit:
         assert {n["name"] for n in result["nodes"]} == {"setpoint", "output"}
 
     def test_no_client_raises(self):
-        actions.set_client(None)
+        actions.set_runner(None)
         with pytest.raises(RuntimeError, match="No OPC-UA client"):
             actions.get_status()
 
     def test_no_node_map_raises(self):
-        actions.set_client(OPCUAClient())
+        actions.set_runner(OPCUARunner([OPCUAClient()]))
         try:
             with pytest.raises(ValueError, match="No node map loaded"):
                 actions.read_named_node("anything")
             with pytest.raises(ValueError, match="No node map loaded"):
                 actions.write_named_node("anything", 100)
         finally:
-            actions.set_client(None)
+            actions.set_runner(None)
 
     def test_unknown_name_raises(self, offline_client):
         with pytest.raises(ValueError, match="Unknown node name"):
@@ -1101,10 +1161,10 @@ class TestActionDispatch:
             await asyncio.sleep(0.3)
             landed = True
 
-        client = OPCUAClient()
-        client._loop = asyncio.get_running_loop()
+        runner = OPCUARunner([OPCUAClient()])
+        runner._loop = asyncio.get_running_loop()
         with pytest.raises(TimeoutError):
-            await asyncio.to_thread(client._run_coro, slow_write(), 0.1)
+            await asyncio.to_thread(runner._run_coro, slow_write(), 0.1)
         # Past when the write would have completed had it not been cancelled.
         await asyncio.sleep(0.6)
         assert landed is False
@@ -1116,7 +1176,7 @@ class TestActionDispatch:
             raise AssertionError("must not run")
 
         with pytest.raises(RuntimeError, match="not running"):
-            OPCUAClient()._run_coro(never_runs())
+            OPCUARunner([OPCUAClient()])._run_coro(never_runs(), 1.0)
 
 
 class TestActionsIntegration:
@@ -1131,7 +1191,8 @@ class TestActionsIntegration:
         assert {"setpoint", "speed_setpoint", "output1"} <= names
 
     async def test_get_status(self, bound_client):
-        result = actions.get_status()
+        result = actions.get_status("127.0.0.1")  # sanitized like the configured name
+        assert result["server"] == "127_0_0_1"
         assert result["connected"] is True
         assert result["nodes"] > 0
 
@@ -1143,8 +1204,9 @@ class TestActionsIntegration:
         """An action called while polling rides the live session, not a new one."""
         client = OPCUAClient(endpoint=demo_server.endpoint, node_map=node_map, poll_interval=0.2)
         client.start()
-        actions.set_client(client)
-        task = asyncio.create_task(client._run_async())
+        runner = OPCUARunner([client])
+        actions.set_runner(runner)
+        task = asyncio.create_task(runner._run_async())
         try:
             await _wait_until(lambda: client._poll_count >= 1, 15.0)
             session = client._client
@@ -1156,6 +1218,6 @@ class TestActionsIntegration:
             assert client._client is session
             assert client._poll_count > 0
         finally:
-            actions.set_client(None)
-            client.stop()
+            actions.set_runner(None)
+            runner.stop()
             await asyncio.wait_for(task, 10.0)

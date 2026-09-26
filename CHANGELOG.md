@@ -15,8 +15,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Node names, event names, and the source name are sanitized (`. @ : ; = /` and
   whitespace become `_`) before reaching the trace catalog; duplicate names
   after sanitization are a hard error at node map load.
+- `demo-server` / `just sim`: standalone simulator with `gateway`, `s7` and `device`
+  profiles, `--secure` with an optional trust list, `--shuffle-namespaces`, `--map`,
+  and a per-session request log.
+- Client certificate handling: a self-signed client certificate generated in
+  the extension data directory and reused, or `advanced.certificate_file` /
+  `private_key_file`; `advanced.server_certificate` `auto` or `strict` pinning.
+- X.509 user identity: `advanced.user_certificate_file` / `user_private_key_file`
+  (operator-issued) log in with a user certificate on a Sign or SignAndEncrypt
+  channel; a server without a Certificate user token policy is refused.
+- `nsu=<uri>;...` node IDs in maps and actions, resolved against the server's NamespaceArray on each connect; `browse_nodes` returns an `nsu_node_id` per result.
+- Live discovery: a server without a node map is browsed on every connect and every
+  scalar variable traced, read-only; `advanced.discovery` turns it off.
+  `discovered_map` returns the discovered set as node map json or csv.
+- Server health event `server` per server (state, clock skew, service level,
+  session and rejected-request counts), read in the poll's own request.
+- `auto_config` standalone action behind the config form's Auto-configure button:
+  localhost well-known ports, the Local Discovery Server and mDNS (`zeroconf`).
+- Simulator `--nodes N` (large address space) and `--secure-only`.
 
 ### Changed
+- Browse and poll requests are chunked by the server's MaxNodesPerBrowse /
+  MaxNodesPerRead, capped at 100.
+- A node name may repeat across events in a node map (`<event>/<name>` in the
+  named actions); only a duplicate within one event is an error.
+- zelos-sdk floor 0.0.12a1.
+- Config format: servers are listed under `servers[]` (name, endpoint, node map,
+  poll interval, per-server security and certificate pin) with shared settings and
+  security defaults under `advanced` (`prefix`, `timeout`, `log_level`, client
+  certificate, default security mode/policy and user certificate). A server's
+  `default` / empty security settings inherit the advanced default. The old flat
+  config is a startup error.
+- Trace paths are now `OPC-UA/<server>/<event>` (source `advanced.prefix`, default
+  `OPC-UA`); clearing the prefix gives each server its own source. The node map
+  `name` no longer names the source.
+- Every action takes an optional `server`; `get_status` and `list_nodes` /
+  `list_writable_nodes` cover every server when it is omitted.
 - Actions moved from client methods to a free-function surface registered under
   the `OPC-UA/` prefix (was `zelos_extension_opcua/`). Actions now reuse the
   live server connection instead of opening a new one per invocation, and
@@ -54,6 +88,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 - `scripts/package_extension.py`, superseded by `zelos extensions package`.
+- Username/password login (`username`, `password`, `trace -u/--password`): no
+  secret is stored in config. A config still setting either is a startup error;
+  use a user certificate.
+
+### Fixed
+- Sign / SignAndEncrypt never engaged: the security call was never awaited, so
+  every session was plaintext. A secure mode now establishes exactly that mode and
+  policy or refuses to connect; it never falls back to None.
 
 ---
 

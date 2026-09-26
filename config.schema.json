@@ -2,7 +2,10 @@
   "$comment": "OPC-UA extension configuration schema. See https://docs.zeloscloud.io/sdk/how-to/develop-extensions/#configuration",
   "type": "object",
   "title": "OPC-UA Configuration",
-  "description": "Configure your OPC-UA server connection and node polling",
+  "description": "Configure OPC-UA server connections and node polling",
+  "ui:options": {
+    "autoconfig": "OPC-UA/auto_config"
+  },
   "properties": {
     "demo": {
       "type": "boolean",
@@ -10,103 +13,228 @@
       "description": "Use built-in PLC simulator (no hardware required)",
       "default": false
     },
-    "endpoint": {
-      "type": "string",
-      "title": "Server Endpoint",
-      "description": "OPC-UA server endpoint URL",
-      "default": "opc.tcp://localhost:4840",
-      "ui:placeholder": "opc.tcp://hostname:port/path"
-    },
-    "security_mode": {
-      "type": "string",
-      "title": "Security Mode",
-      "description": "OPC-UA security mode",
-      "enum": ["None", "Sign", "SignAndEncrypt"],
-      "default": "None"
-    },
-    "security_policy": {
-      "type": "string",
-      "title": "Security Policy",
-      "description": "OPC-UA security policy (required when security mode is not None)",
-      "enum": ["None", "Basic256Sha256", "Aes128Sha256RsaOaep", "Aes256Sha256RsaPss"],
-      "default": "None"
-    },
-    "username": {
-      "type": "string",
-      "title": "Username",
-      "description": "Username for authentication (leave empty for anonymous)",
-      "default": ""
-    },
-    "password": {
-      "type": "string",
-      "title": "Password",
-      "description": "Password for authentication",
-      "default": "",
-      "ui:widget": "password"
-    },
-    "node_map_file": {
-      "type": "string",
-      "title": "Node Map File",
-      "description": "Path to JSON node map file defining nodes to poll",
-      "ui:widget": "file-picker",
-      "ui:options": {
-        "accept": ".json"
-      },
-      "ui:help": "JSON file mapping OPC-UA nodes to semantic events"
-    },
-    "poll_interval": {
-      "type": "number",
-      "title": "Poll Interval (seconds)",
-      "description": "How often to poll nodes for value changes",
-      "default": 1.0,
-      "minimum": 0.1,
-      "maximum": 60.0
-    },
-    "timeout": {
-      "type": "number",
-      "title": "Timeout (seconds)",
-      "description": "OPC-UA request timeout",
-      "default": 5.0,
-      "minimum": 1.0,
-      "maximum": 30.0
-    },
-    "log_level": {
-      "type": "string",
-      "title": "Log Level",
-      "description": "Logging verbosity",
-      "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
-      "default": "INFO"
-    }
-  },
-  "required": ["endpoint"],
-  "allOf": [
-    {
-      "if": {
+    "servers": {
+      "type": "array",
+      "title": "Servers",
+      "description": "OPC-UA servers to poll. At least one unless Demo Mode is on. Click 'Add' to add a server.",
+      "default": [],
+      "items": {
+        "type": "object",
+        "title": "Server",
         "properties": {
-          "security_mode": {"enum": ["Sign", "SignAndEncrypt"]}
-        },
-        "required": ["security_mode"]
-      },
-      "then": {
-        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "Label this server appears under in the trace and the `server` parameter of the actions. Defaults to the endpoint host (e.g. plc01, 192_168_1_10); sanitized like node names.",
+            "default": "",
+            "ui:placeholder": "defaults to endpoint host"
+          },
+          "endpoint": {
+            "type": "string",
+            "title": "Server Endpoint",
+            "description": "OPC-UA server endpoint URL",
+            "default": "opc.tcp://localhost:4840",
+            "ui:placeholder": "opc.tcp://hostname:port/path"
+          },
+          "node_map_file": {
+            "type": "string",
+            "title": "Node Map File",
+            "description": "JSON node map defining the nodes to poll. Leave empty to trace every variable the server exposes (Advanced > Discovery).",
+            "default": "",
+            "ui:widget": "file-picker",
+            "ui:options": {
+              "accept": ".json"
+            },
+            "ui:help": "JSON file mapping OPC-UA nodes to semantic events"
+          },
+          "poll_interval": {
+            "type": "number",
+            "title": "Poll Interval (seconds)",
+            "description": "How often to poll nodes for value changes",
+            "default": 1.0,
+            "minimum": 0.1,
+            "maximum": 60.0
+          },
+          "security_mode": {
+            "type": "string",
+            "title": "Security Mode",
+            "description": "'default' uses Advanced > Security Mode. None under a secure default is allowed and logged as a warning on every connect.",
+            "enum": [
+              "default",
+              "None",
+              "Sign",
+              "SignAndEncrypt"
+            ],
+            "default": "default"
+          },
           "security_policy": {
-            "enum": ["Basic256Sha256", "Aes128Sha256RsaOaep", "Aes256Sha256RsaPss"],
-            "not": {"const": "None"}
+            "type": "string",
+            "title": "Security Policy",
+            "description": "'default' uses Advanced > Security Policy. Required when the security mode is not None.",
+            "enum": [
+              "default",
+              "None",
+              "Basic256Sha256",
+              "Aes128Sha256RsaOaep",
+              "Aes256Sha256RsaPss"
+            ],
+            "default": "default"
+          },
+          "user_certificate_file": {
+            "type": "string",
+            "title": "User Certificate",
+            "description": "X.509 user identity certificate (DER or PEM). Leave empty to use Advanced > User Certificate. Needs Sign or SignAndEncrypt.",
+            "default": "",
+            "ui:widget": "file-picker",
+            "ui:options": {
+              "accept": ".der,.pem,.crt,.cer"
+            }
+          },
+          "user_private_key_file": {
+            "type": "string",
+            "title": "User Private Key",
+            "description": "Unencrypted private key (DER or PEM) for this server's user certificate. Set both or neither.",
+            "default": "",
+            "ui:widget": "file-picker",
+            "ui:options": {
+              "accept": ".pem,.der,.key"
+            }
+          },
+          "server_certificate": {
+            "type": "string",
+            "title": "Server Certificate Policy",
+            "description": "How to treat the server's certificate. 'auto' accepts whatever certificate the server presents and logs its SHA-1 thumbprint, so a server that renews its certificate reconnects with no manual step. 'strict' accepts only the certificate in Server Certificate File: any other is reported and the connection refused.",
+            "enum": [
+              "auto",
+              "strict"
+            ],
+            "default": "auto"
+          },
+          "server_certificate_file": {
+            "type": "string",
+            "title": "Server Certificate File",
+            "description": "With 'strict', the only server certificate accepted (DER or PEM).",
+            "default": "",
+            "ui:widget": "file-picker",
+            "ui:options": {
+              "accept": ".der,.pem,.crt,.cer"
+            }
           }
         },
-        "required": ["security_policy"]
+        "required": [
+          "endpoint"
+        ],
+        "additionalProperties": false
       }
     },
-    {
-      "if": {
-        "properties": {
-          "username": {"minLength": 1}
+    "advanced": {
+      "type": "object",
+      "title": "Advanced",
+      "description": "Settings shared by every server, and the defaults a server inherits.",
+      "properties": {
+        "prefix": {
+          "type": "string",
+          "title": "Prefix",
+          "description": "Leading trace source every server publishes under, so events read '<prefix>/<server>/<event>'. Clear it to give each server its own trace source with unprefixed events.",
+          "default": "OPC-UA",
+          "ui:placeholder": "OPC-UA",
+          "ui:emptyValue": ""
         },
-        "required": ["username"]
+        "timeout": {
+          "type": "number",
+          "title": "Timeout (seconds)",
+          "description": "OPC-UA request timeout",
+          "default": 5.0,
+          "minimum": 1.0,
+          "maximum": 30.0
+        },
+        "log_level": {
+          "type": "string",
+          "title": "Log Level",
+          "description": "Logging verbosity",
+          "enum": [
+            "DEBUG",
+            "INFO",
+            "WARNING",
+            "ERROR"
+          ],
+          "default": "INFO"
+        },
+        "discovery": {
+          "type": "boolean",
+          "title": "Discovery",
+          "description": "For a server without a node map, browse it on every connect and trace every scalar variable found (read-only). Off: such a server polls nothing.",
+          "default": true
+        },
+        "certificate_file": {
+          "type": "string",
+          "title": "Client Certificate",
+          "description": "Client application certificate (DER or PEM). Leave empty to generate one in the extension data directory on the first secure connection and reuse it; trust that certificate on the server.",
+          "default": "",
+          "ui:widget": "file-picker",
+          "ui:options": {
+            "accept": ".der,.pem,.crt,.cer"
+          }
+        },
+        "private_key_file": {
+          "type": "string",
+          "title": "Client Private Key",
+          "description": "Unencrypted private key (DER or PEM) for the client certificate. Set both or neither.",
+          "default": "",
+          "ui:widget": "file-picker",
+          "ui:options": {
+            "accept": ".pem,.der,.key"
+          }
+        },
+        "security_mode": {
+          "type": "string",
+          "title": "Security Mode",
+          "description": "Default OPC-UA security mode for servers set to 'default'",
+          "enum": [
+            "None",
+            "Sign",
+            "SignAndEncrypt"
+          ],
+          "default": "None"
+        },
+        "security_policy": {
+          "type": "string",
+          "title": "Security Policy",
+          "description": "Default OPC-UA security policy for servers set to 'default' (required when the security mode is not None)",
+          "enum": [
+            "None",
+            "Basic256Sha256",
+            "Aes128Sha256RsaOaep",
+            "Aes256Sha256RsaPss"
+          ],
+          "default": "None"
+        },
+        "user_certificate_file": {
+          "type": "string",
+          "title": "User Certificate",
+          "description": "Default X.509 user identity certificate (DER or PEM) issued by the server admin, who maps it to a user. Leave empty to connect as Anonymous. Needs Sign or SignAndEncrypt.",
+          "default": "",
+          "ui:widget": "file-picker",
+          "ui:options": {
+            "accept": ".der,.pem,.crt,.cer"
+          }
+        },
+        "user_private_key_file": {
+          "type": "string",
+          "title": "User Private Key",
+          "description": "Unencrypted private key (DER or PEM) for the user certificate. Set both or neither.",
+          "default": "",
+          "ui:widget": "file-picker",
+          "ui:options": {
+            "accept": ".pem,.der,.key"
+          }
+        }
       },
-      "then": {
-        "required": ["password"]
+      "additionalProperties": false,
+      "default": {},
+      "ui:options": {
+        "collapsed": true
       }
     }
-  ]
+  }
 }

@@ -34,6 +34,10 @@ dev:
 demo:
     uv run python main.py demo
 
+# Run the standalone OPC-UA simulator (opc.tcp://127.0.0.1:4840); see `main.py demo-server --help`
+sim *ARGS:
+    uv run python main.py demo-server {{ARGS}}
+
 # Package for Zelos marketplace
 package:
     zelos extensions package .

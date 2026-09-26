@@ -4,10 +4,9 @@ Free functions, not client methods, so the action surface has one shape whether
 or not a client happens to be running, and so field decorators can reference
 module-level callables (a bound `self` does not exist at decoration time).
 
-The module holds a single client. Unlike CAN, whose config is an array of buses
-and whose actions therefore take a `codec` selector, the OPC-UA config describes
-exactly one server - a registry keyed by name would be a parameter nobody can
-give a second value to. `cli/app.py` calls `set_client` at startup.
+Every action that targets a server takes an optional `server` (its name). With
+one server it may be omitted; with several, omitting it is an error that lists
+the names. `cli/app.py` calls `set_runner` at startup.
 
 Failure convention: raise. The actions protocol derives its verdict from a
 raised exception, so a returned {"success": False} reads as a successful run on
@@ -16,6 +15,7 @@ the wire and any caller chaining on exit status proceeds on bad data.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import sys
@@ -28,30 +28,45 @@ from .client import coerce_text, describe_error
 if TYPE_CHECKING:
     from zelos_sdk.actions import ActionsRegistry
 
-    from .client import OPCUAClient
+    from .client import OPCUAClient, OPCUARunner
     from .node_map import Node
 
 logger = logging.getLogger(__name__)
 
-# Populated by cli/app.py (and any other entrypoint that brings up a client).
-_client: OPCUAClient | None = None
+# Populated by cli/app.py (and any other entrypoint that brings up clients).
+_runner: OPCUARunner | None = None
 
 
-def set_client(client: OPCUAClient | None) -> None:
-    """Bind the client that every action in this module operates on."""
-    global _client
-    _client = client
+def set_runner(runner: OPCUARunner | None) -> None:
+    """Bind the runner whose clients every action in this module operates on."""
+    global _runner
+    _runner = runner
 
 
-def _get_client() -> OPCUAClient:
-    if _client is None:
+def _get_runner() -> OPCUARunner:
+    if _runner is None:
         raise RuntimeError("No OPC-UA client is configured on this extension")
-    return _client
+    return _runner
+
+
+def _get_client(server: str = "") -> OPCUAClient:
+    """The named server's client; the only one when `server` is empty."""
+    clients = _get_runner().clients
+    names = ", ".join(clients)
+    if not server:
+        if len(clients) == 1:
+            return next(iter(clients.values()))
+        raise ValueError(f"Several servers are configured; set server to one of: {names}")
+    # Sanitized like the configured names, so `192.168.1.10` finds `192_168_1_10`.
+    client = clients.get(zelos_sdk.sanitize_name(server.strip(), kind="source"))
+    if client is None:
+        raise ValueError(f"Unknown server '{server}'. Servers: {names}")
+    return client
 
 
 def _get_node(client: OPCUAClient, name: str) -> Node:
     if not client.node_map:
-        raise ValueError("No node map loaded - set node_map_file in the extension config")
+        raise ValueError(f"No node map loaded on server '{client.name}' - set its node_map_file")
     node = client.node_map.get_by_name(name)
     if node is None:
         raise ValueError(f"Unknown node name '{name}'. Use list_nodes to see the available names.")
@@ -66,7 +81,7 @@ def _run(client: OPCUAClient, coro: Any, what: str, timeout: float | None = None
     traceback, so the caller sees a sentence rather than an opaque type name.
     """
     try:
-        return client._run_coro(coro, timeout)
+        return _get_runner()._run_coro(coro, timeout or client.timeout)
     except (ValueError, RuntimeError, TimeoutError, OSError):
         raise
     except Exception as e:
@@ -84,40 +99,94 @@ def _write_timeout(client: OPCUAClient) -> float:
     return 3 * client.timeout + 1.0
 
 
+def _server_field(func: Any) -> Any:
+    return zelos_sdk.action.text(
+        "server",
+        title="Server",
+        required=False,
+        default="",
+        description="Server name; may be omitted when only one is configured",
+    )(func)
+
+
 # ─── Status and discovery ───────────────────────────────────────────────────
 
 
-@zelos_sdk.action("Get Status", "Get connection and polling status")
-def get_status() -> dict[str, Any]:
-    return _get_client().status()
+@zelos_sdk.action("Get Status", "Get connection and polling status; every server when omitted")
+@_server_field
+def get_status(server: str = "") -> dict[str, Any]:
+    if server:
+        return _get_client(server).status()
+    statuses = [c.status() for c in _get_runner().clients.values()]
+    return {"servers": statuses, "count": len(statuses)}
 
 
-@zelos_sdk.action("List Nodes", "List all nodes in the map")
-def list_nodes() -> dict[str, Any]:
-    client = _get_client()
+def _clients_for(server: str) -> list[OPCUAClient]:
+    """The named server, or every server when omitted."""
+    return [_get_client(server)] if server else list(_get_runner().clients.values())
+
+
+@zelos_sdk.action("List Nodes", "List the nodes in the map; every server's when omitted")
+@_server_field
+def list_nodes(server: str = "") -> dict[str, Any]:
     nodes = [
         {
+            "server": c.name,
+            "event": event,
             "name": n.name,
             "node_id": n.node_id,
             "datatype": n.datatype,
             "unit": n.unit,
             "writable": n.writable,
         }
-        for n in (client.node_map.nodes if client.node_map else [])
+        for c in _clients_for(server)
+        for event, nodes in (c.node_map.events.items() if c.node_map else [])
+        for n in nodes
     ]
     return {"nodes": nodes, "count": len(nodes)}
 
 
-@zelos_sdk.action("List Writable Nodes", "List all writable nodes")
-def list_writable_nodes() -> dict[str, Any]:
+@zelos_sdk.action("List Writable Nodes", "List writable nodes; every server's when omitted")
+@_server_field
+def list_writable_nodes(server: str = "") -> dict[str, Any]:
     nodes = [
-        {"name": n.name, "node_id": n.node_id, "datatype": n.datatype, "unit": n.unit}
-        for n in _get_client().known_writable_nodes()
+        {
+            "server": c.name,
+            "name": n.name,
+            "node_id": n.node_id,
+            "datatype": n.datatype,
+            "unit": n.unit,
+        }
+        for c in _clients_for(server)
+        for n in c.known_writable_nodes()
     ]
     return {"nodes": nodes, "count": len(nodes)}
+
+
+@zelos_sdk.action(
+    "Discovered Map",
+    "The nodes discovered on the last connect, as a node map (json) or csv text; "
+    "save it as a node_map_file to pin or edit them",
+)
+@_server_field
+@zelos_sdk.action.select("format", title="Format", choices=["json", "csv"], default="json")
+def discovered_map(format: str = "json", server: str = "") -> dict[str, Any]:
+    client = _get_client(server)
+    if not client.discovery:
+        raise ValueError(f"Server '{client.name}' polls a node map or has discovery off")
+    if not _get_runner().is_running():
+        raise RuntimeError("extension is not running")
+    node_map = client.node_map
+    if node_map is None:
+        raise RuntimeError(f"Server '{client.name}' has not connected yet; nothing discovered")
+    count = len(node_map.nodes)
+    if format == "csv":
+        return {"server": client.name, "format": "csv", "count": count, "csv": node_map.to_csv()}
+    return {"server": client.name, "format": "json", "count": count, "map": node_map.to_dict()}
 
 
 @zelos_sdk.action("Browse Nodes", "Browse OPC-UA address space from a starting node")
+@_server_field
 @zelos_sdk.action.text(
     "start_node_id",
     title="Start Node ID",
@@ -125,8 +194,8 @@ def list_writable_nodes() -> dict[str, Any]:
     description="Node ID to browse from (default: Objects folder)",
 )
 @zelos_sdk.action.number("max_depth", minimum=1, maximum=5, default=1, title="Max Depth")
-def browse_nodes(start_node_id: str, max_depth: int) -> dict[str, Any]:
-    client = _get_client()
+def browse_nodes(start_node_id: str, max_depth: int, server: str = "") -> dict[str, Any]:
+    client = _get_client(server)
     # A deep browse is many round trips; the per-request timeout is the wrong
     # ceiling for the whole walk.
     nodes = _run(
@@ -142,22 +211,24 @@ def browse_nodes(start_node_id: str, max_depth: int) -> dict[str, Any]:
 
 
 @zelos_sdk.action("Read Node", "Read a single node by node ID")
+@_server_field
 @zelos_sdk.action.text("node_id", title="Node ID", description="e.g., ns=2;s=Temperature")
-def read_node(node_id: str) -> dict[str, Any]:
-    client = _get_client()
+def read_node(node_id: str, server: str = "") -> dict[str, Any]:
+    client = _get_client(server)
     value = _run(client, client.read_node(node_id), f"Read of '{node_id}'")
     return {"node_id": node_id, "value": value}
 
 
 @zelos_sdk.action("Write Node", "Write a value to a node by node ID")
+@_server_field
 @zelos_sdk.action.text("node_id", title="Node ID", description="e.g., ns=2;s=Setpoint")
 @zelos_sdk.action.text(
     "value", title="Value", description="Coerced to the node's type; true/false for bools"
 )
-def write_node(node_id: str, value: str) -> dict[str, Any]:
+def write_node(node_id: str, value: str, server: str = "") -> dict[str, Any]:
     # Text, not number: a number field cannot write a bool or a string node at
     # all. The client coerces using the variant type it reads back.
-    client = _get_client()
+    client = _get_client(server)
     _run(
         client,
         client.write_node(node_id, value),
@@ -171,9 +242,10 @@ def write_node(node_id: str, value: str) -> dict[str, Any]:
 
 
 @zelos_sdk.action("Read Named Node", "Read a node by name from the map")
+@_server_field
 @zelos_sdk.action.text("name", title="Node Name")
-def read_named_node(name: str) -> dict[str, Any]:
-    client = _get_client()
+def read_named_node(name: str, server: str = "") -> dict[str, Any]:
+    client = _get_client(server)
     node = _get_node(client, name)
     value = _run(client, client.read_node_value(node), f"Read of '{name}'")
     return {
@@ -186,15 +258,21 @@ def read_named_node(name: str) -> dict[str, Any]:
 
 
 @zelos_sdk.action("Write Named Node", "Write a value to a node by name")
+@_server_field
 @zelos_sdk.action.text("name", title="Node Name")
 @zelos_sdk.action.text(
     "value", title="Value", description="Coerced to the node's datatype; true/false for bools"
 )
-def write_named_node(name: str, value: str) -> dict[str, Any]:
+def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
     # Text, not number: a number field cannot write a bool or a string node at
     # all. The map's datatype decides how it is parsed.
-    client = _get_client()
+    client = _get_client(server)
     node = _get_node(client, name)
+    if client.discovery:
+        raise ValueError(
+            f"Node '{name}' was discovered, and discovered nodes are read-only by name; "
+            f"use write_node with node_id {node.node_id}"
+        )
     # Answered from the map, before dispatching: a declared read-only node needs
     # no connection to reject, and a connect failure here would report the wrong
     # reason. The client repeats the check for the auto-detect path.
@@ -214,6 +292,44 @@ def write_named_node(name: str, value: str) -> dict[str, Any]:
         "unit": node.unit,
         "value": typed,
     }
+
+
+# ─── Config-form hook (standalone: runs with the extension stopped) ─────────
+
+
+@zelos_sdk.action(
+    "Auto-configure",
+    "Find OPC UA servers on this machine (well-known ports, the local discovery "
+    "server) and announced over mDNS, for the config form's Auto-configure button. "
+    "Review, then save and start.",
+    # Read-only and session-less, and the form wants it before a first start.
+    standalone=True,
+)
+def auto_config() -> dict[str, Any]:
+    """The app's auto-configure contract: the keys of `config` replace the form's.
+
+    Only `servers` is returned, so whatever is set under Advanced survives. Runs
+    its own short loop: standalone there is no live client, and live it is
+    dispatched from the actions thread, never the polling loop.
+    """
+    from .autoconfig import find_servers
+
+    servers, notes = asyncio.run(find_servers())
+    if not servers:
+        return {
+            "status": "error",
+            "message": " ".join(
+                [
+                    "No OPC UA server found on this machine's well-known ports, its local "
+                    "discovery server or mDNS. Add a server and enter its endpoint.",
+                    *notes,
+                ]
+            ),
+        }
+    result: dict[str, Any] = {"status": "success", "config": {"servers": servers}}
+    if notes:
+        result["message"] = " ".join(notes)
+    return result
 
 
 # ─── Registration helper ────────────────────────────────────────────────────

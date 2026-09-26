@@ -19,13 +19,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Interface Engine/Protocol Translator",
 ]
 dependencies = [
-    # 0.0.11a1 floor: first release with sanitize_name (the trace name grammar)
-    # and the standalone actions harness (zelos_sdk.extensions.actions).
-    "zelos-sdk>=0.0.11a1",
+    # 0.0.12a1 floor: standalone actions (auto_config runs with the extension
+    # stopped). A prerelease floor on the direct dep is what lets uv resolve it.
+    "zelos-sdk>=0.0.12a1",
     # 1.1.8 floor: the poll path reads DataValue.StatusCode_ from batch reads,
     # verified against 1.1.8 only
     "asyncua>=1.1.8",
     "rich-click>=1.8.0",
+    # mDNS browse for auto_config. LGPL-2.1 like asyncua; wheels for macOS/Linux
+    # and a pure-Python fallback, so no native build on install.
+    "zeroconf>=0.136.0",
 ]
 
 [project.urls]
