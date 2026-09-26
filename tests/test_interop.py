@@ -189,4 +189,4 @@ async def test_auto_config_finds_it(opcplc):
         s["endpoint"]: (s["security_mode"], s["security_policy"])
         for s in result["config"]["servers"]
     }
-    assert found.get(f"{ENDPOINT}/") == ("None", "None"), found
+    assert found.get(f"{ENDPOINT}/") == ("default", "default"), found

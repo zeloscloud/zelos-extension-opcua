@@ -357,7 +357,8 @@ def coerce_text(text: str, datatype: str) -> float | int | bool | str:
     """Parse an action's text input into a node's datatype.
 
     Write actions take text, not a number, so bool and string nodes are
-    writable at all. Numeric text is parsed as a float and truncated for integer
+    writable at all. Integer text stays exact (int64/uint64 exceed a float's 53
+    bits); other numeric text is parsed as a float and truncated for integer
     types, matching what `encode_value` does with a scale.
 
     Args:
@@ -381,11 +382,16 @@ def coerce_text(text: str, datatype: str) -> float | int | bool | str:
             return False
         raise ValueError(f"Cannot parse '{text}' as bool. Use true/false or 1/0.")
 
+    integer = datatype not in ("float32", "float64")
+    try:
+        return int(value) if integer else float(value)
+    except ValueError:
+        pass
     try:
         number = float(value)
     except ValueError:
         raise ValueError(f"Cannot parse '{text}' as {datatype}") from None
-    return number if datatype in ("float32", "float64") else int(number)
+    return int(number) if integer else number
 
 
 def render_text(value: Any) -> str:
@@ -434,8 +440,9 @@ def decode_value(value: Any, datatype: str, scale: float = 1.0) -> float | int |
         return float(value) * scale
     if datatype in INT_DATATYPES:
         # The trace field has the declared width; one out-of-range value would
-        # fail the whole event at emit.
-        out, (low, high) = int(value * scale), INT_RANGES[datatype]
+        # fail the whole event at emit. Unscaled ints stay exact: a float has 53 bits.
+        exact = scale == 1 and isinstance(value, int)
+        out, (low, high) = int(value if exact else value * scale), INT_RANGES[datatype]
         if not low <= out <= high:
             raise ValueError(f"{out} out of range for {datatype}")
         return out
@@ -460,7 +467,8 @@ def encode_value(value: float | int | bool | str, datatype: str, scale: float = 
     if datatype in ("float32", "float64"):
         return float(value) / scale if scale != 0 else float(value)
     if datatype in INT_DATATYPES:
-        return int(value / scale if scale != 0 else value)
+        # Unscaled ints stay exact: a float has 53 bits.
+        return int(value if scale in (0, 1) else value / scale)
     return value
 
 
@@ -686,6 +694,10 @@ class OPCUAClient:
         self._subscription_ids: list[int] = []
         self._polled = 0
         self._jobs: list[_Job] = []
+        # A Publish failed to decode this connection; applied once setup is done
+        # (see _poll_everything).
+        self._subscribing = False
+        self._publish_failed = False
         # Discovered node ids declared BaseDataType, and how many were polled for
         # it this connection (see _start_transport).
         self._variant: set[str] = set()
@@ -1123,11 +1135,12 @@ class OPCUAClient:
         """Read a raw value by node ID. Raises on protocol error."""
         return await (await self._ua_node(node_id)).read_value()
 
-    async def write_node(self, node_id: str, value: Any) -> None:
+    async def write_node(self, node_id: str, value: Any, sent: list[float] | None = None) -> None:
         """Write a value by node ID. Raises on protocol error.
 
         Two round trips, each bounded by `self.timeout` - callers dispatching
-        this must budget for both.
+        this must budget for both. `sent` gets the monotonic time the Write
+        request goes out: past that, a timeout cannot say whether it applied.
         """
         node = await self._ua_node(node_id)
         # Match the server's variant type. A bare Python value lets asyncua guess
@@ -1138,15 +1151,18 @@ class OPCUAClient:
             # Text from the write action: the server's type is the only datatype
             # an unmapped node has.
             value = coerce_text(value, VARIANT_DATATYPES[variant_type])
-        await node.write_value(
-            ua.Variant(value, variant_type) if variant_type else ua.Variant(value)
-        )
+        variant = ua.Variant(value, variant_type) if variant_type else ua.Variant(value)
+        if sent is not None:
+            sent.append(time.monotonic())
+        await node.write_value(variant)
 
     async def read_node_value(self, node: Node) -> float | int | bool | str | None:
         """Read and decode a node using its map definition."""
         return decode_value(await self.read_node(node.node_id), node.datatype, node.scale)
 
-    async def write_node_value(self, node: Node, value: float | int | bool | str) -> None:
+    async def write_node_value(
+        self, node: Node, value: float | int | bool | str, sent: list[float] | None = None
+    ) -> None:
         """Encode and write a node using its map definition.
 
         Raises:
@@ -1161,7 +1177,7 @@ class OPCUAClient:
             if not self._writable_cache[node.node_id]:
                 raise ValueError(f"Node '{node.name}' is not writable (auto-detected)")
 
-        await self.write_node(node.node_id, encode_value(value, node.datatype, node.scale))
+        await self.write_node(node.node_id, encode_value(value, node.datatype, node.scale), sent)
 
     async def _check_writable(self, node_id: str) -> bool:
         """Read the AccessLevel bit. Assumes writable when it cannot be read, so
@@ -1242,6 +1258,7 @@ class OPCUAClient:
         self._groups = {i: [t for _, t in items] for i, items in groups.items()}
         client = self._require_client()
         self._monitored, self._stale, self._subscription_ids = {}, OrderedDict(), []
+        self._subscribing, self._publish_failed = True, False
         on_publish = self._publish_callback(client, self._monitored, self._stale)
         if self.transport == "subscription":
             self._guard_publish(client)
@@ -1278,6 +1295,9 @@ class OPCUAClient:
             )
         self._polled = sum(len(t) for t in polled.values())
         self._jobs = self._schedule(polled)
+        self._subscribing = False
+        if self._publish_failed:
+            await self._poll_everything(client)
 
     async def _subscribe(
         self,
@@ -1387,13 +1407,22 @@ class OPCUAClient:
             try:
                 return await publish(acks)
             except UaStructParsingError:
-                if client is self._client and self._monitored:
+                if client is self._client:
+                    self._publish_failed = True
                     await self._poll_everything(client)
                 raise
 
         session.publish = guarded
 
     async def _poll_everything(self, client: Client) -> None:
+        """Delete this connection's subscriptions and poll every target.
+
+        Deferred while `_start_transport` is subscribing: it would replace these
+        jobs with its own, leaving the chunks already subscribed neither
+        subscribed nor polled. It calls this again once its jobs are in place.
+        """
+        if self._subscribing or not self._monitored:
+            return
         self._log.warning(
             "A Publish response could not be decoded; polling all %d subscribed items "
             "this connection",
@@ -1697,7 +1726,10 @@ class OPCUAClient:
                 # Behind schedule, the next run starts from now rather than bursting.
                 job.due = max(job.due + job.period, time.monotonic())
                 try:
-                    await job.run()
+                    # Raced like connect: a hung server holds a request for up to
+                    # the timeout, past the shutdown budget.
+                    if (await self._or_stop(job.run()))[0]:
+                        break
                     # Only a completed request proves the link; a connect that
                     # never yields data must not clear the backoff.
                     backoff = RECONNECT_INITIAL
@@ -1746,22 +1778,31 @@ class OPCUAClient:
         Returns:
             True if connected, False on failure or on shutdown
         """
-        if self._stop_event is None:
-            return await self._ensure_connected()
+        stopped, connected = await self._or_stop(self._ensure_connected())
+        return not stopped and connected
 
-        connect = asyncio.ensure_future(self._ensure_connected())
+    async def _or_stop(self, coro: Awaitable[Any]) -> tuple[bool, Any]:
+        """Await `coro` unless shutdown is requested first, then cancel it.
+
+        Returns:
+            (True, None) on shutdown, else (False, the result); `coro`'s exception
+            propagates
+        """
+        if self._stop_event is None:
+            return False, await coro
+        work = asyncio.ensure_future(coro)
         stop = asyncio.ensure_future(self._stop_event.wait())
         try:
-            await asyncio.wait({connect, stop}, return_when=asyncio.FIRST_COMPLETED)
-            if connect.done():
-                return connect.result()
-            return False
+            await asyncio.wait({work, stop}, return_when=asyncio.FIRST_COMPLETED)
+            if work.done():
+                return False, work.result()
+            return True, None
         finally:
             stop.cancel()
-            if not connect.done():
-                connect.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await connect
+            if not work.done():
+                work.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await work
 
     async def _wait_or_stop(self, seconds: float) -> bool:
         """Wait up to `seconds`.
@@ -1917,6 +1958,7 @@ class OPCUARunner:
         Raises:
             RuntimeError: If the polling loop is not running
             TimeoutError: If the coroutine outlives `timeout`, having cancelled it
+                (which stops a request not yet sent, never one already sent)
         """
         if self._loop is None or not self._loop.is_running():
             coro.close()
@@ -1926,7 +1968,5 @@ class OPCUARunner:
         try:
             return future.result(timeout=timeout)
         except TimeoutError:
-            # Left running, a timed-out write still lands on the PLC after the
-            # action has already reported failure.
             future.cancel()
             raise

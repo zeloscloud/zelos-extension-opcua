@@ -15,6 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import zelos_sdk
@@ -395,6 +396,14 @@ class TestValueCodec:
         with pytest.raises(ValueError, match="out of range for int16"):
             decode_value(-8258223195483293696, "int16")
         assert decode_value(-(2**63), "int64") == -(2**63)
+
+    def test_wide_ints_stay_exact(self):
+        """int64/uint64 never round-trip through a float's 53 bits."""
+        assert decode_value(2**63 - 1, "int64") == 2**63 - 1
+        assert decode_value(2**64 - 1, "uint64") == 2**64 - 1
+        assert decode_value(2**53 + 1, "uint64") == 2**53 + 1
+        written = encode_value(coerce_text("9007199254740993", "uint64"), "uint64")
+        assert written == 2**53 + 1
 
     def test_decode_none_returns_none(self):
         """None input returns None."""
@@ -1253,3 +1262,23 @@ class TestActionsIntegration:
             actions.set_runner(None)
             runner.stop()
             await asyncio.wait_for(task, 10.0)
+
+
+@pytest.mark.parametrize("sends", [False, True])
+def test_write_timeout_after_send_is_unknown_outcome(monkeypatch, sends):
+    """A timeout once the Write went out cannot claim failure: it may have applied."""
+
+    class Runner:
+        def _run_coro(self, coro, timeout):
+            return asyncio.run(asyncio.wait_for(coro, timeout))
+
+    async def write(sent):
+        if sends:
+            sent.append(time.monotonic())
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(actions, "_get_runner", Runner)
+    sent: list[float] = []
+    with pytest.raises(TimeoutError) as raised:
+        actions._run(SimpleNamespace(timeout=0.05), write(sent), "Write to 'x'", sent=sent)
+    assert ("may have applied it" in str(raised.value)) is sends

@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import logging
 import sys
+import time
 from typing import TYPE_CHECKING, Any
 
 import zelos_sdk
@@ -73,20 +74,38 @@ def _get_node(client: OPCUAClient, name: str) -> Node:
     return node
 
 
-def _run(client: OPCUAClient, coro: Any, what: str, timeout: float | None = None) -> Any:
+def _run(
+    client: OPCUAClient,
+    coro: Any,
+    what: str,
+    timeout: float | None = None,
+    sent: list[float] | None = None,
+) -> Any:
     """Dispatch an action coroutine, normalizing anything unexpected.
 
     Self-describing errors (bad input, a UA status code naming the node) are
     re-raised verbatim; everything else becomes a RuntimeError after a logged
     traceback, so the caller sees a sentence rather than an opaque type name.
+    A timeout after a write's request went out (`sent`) cannot be recalled: its
+    outcome is unknown, and the message says so.
     """
     try:
         return _get_runner()._run_coro(coro, timeout or client.timeout)
-    except (ValueError, RuntimeError, TimeoutError, OSError):
-        raise
     except Exception as e:
+        if sent and _timed_out(e):
+            raise TimeoutError(
+                f"{what} was sent; no response within {time.monotonic() - sent[0]:.1f}s; "
+                "the server may have applied it - read the node to confirm"
+            ) from e
+        if isinstance(e, ValueError | RuntimeError | TimeoutError | OSError):
+            raise
         logger.exception("%s failed", what)
         raise RuntimeError(f"{what} failed: {describe_error(e)}") from e
+
+
+def _timed_out(error: BaseException) -> bool:
+    """A timeout, or asyncua's bare Exception raised from one."""
+    return isinstance(error, TimeoutError) or isinstance(error.__cause__, TimeoutError)
 
 
 def _write_timeout(client: OPCUAClient) -> float:
@@ -229,11 +248,13 @@ def write_node(node_id: str, value: str, server: str = "") -> dict[str, Any]:
     # Text, not number: a number field cannot write a bool or a string node at
     # all. The client coerces using the variant type it reads back.
     client = _get_client(server)
+    sent: list[float] = []
     _run(
         client,
-        client.write_node(node_id, value),
+        client.write_node(node_id, value, sent),
         f"Write to '{node_id}'",
         timeout=_write_timeout(client),
+        sent=sent,
     )
     return {"node_id": node_id, "value": value}
 
@@ -279,11 +300,13 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
     if node.writable is False:
         raise ValueError(f"Node '{name}' is not writable")
     typed = coerce_text(str(value), node.datatype)
+    sent: list[float] = []
     _run(
         client,
-        client.write_node_value(node, typed),
+        client.write_node_value(node, typed, sent),
         f"Write to '{name}'",
         timeout=_write_timeout(client),
+        sent=sent,
     )
     return {
         "name": name,

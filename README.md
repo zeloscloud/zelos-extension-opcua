@@ -103,7 +103,7 @@ The config form's Auto-configure button runs `auto_config` with the extension st
 | Local Discovery Server | FindServers on `opc.tcp://localhost:4840` |
 | mDNS | 2s passive browse for `_opcua-tcp._tcp.local.` |
 
-Servers are deduplicated by ApplicationUri and named after their ApplicationName. Security is None when offered, else the strongest supported policy with SignAndEncrypt (then Sign); the generated client certificate must then be trusted on the server. No subnet sweep, no other ports.
+Servers are deduplicated by ApplicationUri and named after their ApplicationName. Security is `default` when the server accepts None (so a secure Advanced default is never downgraded), else the strongest supported policy with SignAndEncrypt (then Sign); the generated client certificate must then be trusted on the server. No subnet sweep, no other ports.
 
 ## Node Map Format
 

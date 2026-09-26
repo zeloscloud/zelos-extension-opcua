@@ -16,7 +16,7 @@ from zelos_sdk.extensions.actions import get_standalone_actions
 
 from zelos_extension_opcua import ACTION_PREFIX, actions
 from zelos_extension_opcua.cli import app
-from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, SharedSource
+from zelos_extension_opcua.client import SECURITY_POLICIES, OPCUAClient, OPCUARunner, SharedSource
 from zelos_extension_opcua.demo import profiles
 from zelos_extension_opcua.demo.sim_server import Simulator
 from zelos_extension_opcua.discovery import (
@@ -275,7 +275,7 @@ async def test_auto_config_finds_local_servers():
         if s["endpoint"].startswith("opc.tcp://localhost:")
     }
     assert local == {
-        "opc.tcp://localhost:4840/freeopcua/server/": ("None", "None"),
+        "opc.tcp://localhost:4840/freeopcua/server/": ("default", "default"),
         "opc.tcp://localhost:48010/freeopcua/server/": ("SignAndEncrypt", "Basic256Sha256"),
     }
     assert "trusted on the server" in result["message"]
@@ -283,6 +283,28 @@ async def test_auto_config_finds_local_servers():
     schema = json.loads((Path(__file__).parents[1] / "config.schema.json").read_text())
     assert schema["ui:options"]["autoconfig"] == f"{ACTION_PREFIX}/auto_config"
     assert "auto_config" in get_standalone_actions()
+
+
+def test_auto_config_never_downgrades():
+    """A server accepting None gets "default": a secure Advanced default still applies."""
+    from zelos_extension_opcua.autoconfig import _security
+
+    def ep(mode, policy):
+        return ua.EndpointDescription(SecurityMode=mode, SecurityPolicyUri=policy)
+
+    none = ep(ua.MessageSecurityMode.None_, "http://opcfoundation.org/UA/SecurityPolicy#None")
+    secure = ep(ua.MessageSecurityMode.SignAndEncrypt, SECURITY_POLICIES["Basic256Sha256"].URI)
+    mode, policy = _security([none, secure])
+    assert _security([secure]) == ("SignAndEncrypt", "Basic256Sha256")
+
+    config = {
+        "servers": [
+            {"endpoint": "opc.tcp://a:4840", "security_mode": mode, "security_policy": policy}
+        ],
+        "advanced": {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"},
+    }
+    [server] = app.resolve_servers(config, app.resolve_advanced(config))
+    assert (server["security_mode"], server["downgrade_from"]) == ("SignAndEncrypt", "")
 
 
 async def test_reconnect_rebrowses():

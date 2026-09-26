@@ -116,10 +116,15 @@ async def _mdns_urls() -> list[str]:
 
 
 def _security(endpoints: list[ua.EndpointDescription]) -> tuple[str, str] | None:
-    """None when offered, else the strongest supported policy, SignAndEncrypt first."""
+    """ "default" when None is offered, else the strongest supported pair, SignAndEncrypt first.
+
+    Never an explicit None: the action cannot see Advanced, and an explicit None
+    would silently downgrade a secure Advanced default. "default" follows it
+    (None out of the box).
+    """
     offered = {(ep.SecurityMode, _POLICY_NAMES.get(ep.SecurityPolicyUri)) for ep in endpoints}
     if any(mode == ua.MessageSecurityMode.None_ for mode, _ in offered):
-        return "None", "None"
+        return "default", "default"
     for mode in (ua.MessageSecurityMode.SignAndEncrypt, ua.MessageSecurityMode.Sign):
         for policy in POLICY_RANK:
             if (mode, policy) in offered:
@@ -168,7 +173,12 @@ async def find_servers() -> tuple[list[dict[str, Any]], list[str]]:
             notes.append(f"{found.url} offers no security policy this extension supports")
             continue
         servers.append(entry)
-    if any(s["security_mode"] != "None" for s in servers):
+    if any(s["security_mode"] == "default" for s in servers):
+        notes.append(
+            "Servers that accept security None are set to 'default': they follow "
+            "Advanced > Security Mode (None unless changed there)"
+        )
+    if any(s["security_mode"] != "default" for s in servers):
         notes.append(
             "Secure servers need this extension's client certificate trusted on the server; "
             "it is generated on the first connect and its thumbprint logged"
