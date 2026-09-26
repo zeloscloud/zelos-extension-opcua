@@ -23,8 +23,9 @@ from zelos_extension_opcua.node_map import Node, NodeMap, format_nsu_node_id, sa
 # it bounds each response's size and latency against the request timeout.
 MAX_OPERATIONS = 100
 
-#: The per-server health event; a map or discovered event may not take the name.
-HEALTH_EVENT = "server"
+#: The per-server health event. Sanitized map and discovered names never start
+#: with `_`, so neither can take it.
+HEALTH_EVENT = "_server"
 
 # Longest trace event name, including a `<server>/` prefix (zelos-trace grammar).
 TRACE_NAME_BYTES = 128
@@ -390,6 +391,16 @@ def _fit(parts: list[str], max_bytes: int) -> str:
     return event or parts[-1].encode()[:max_bytes].decode(errors="ignore")
 
 
+def namespace_alias(uri: str) -> str:
+    """Last segment of a namespace URI with a letter in it, sanitized; "" if none.
+
+    `http://opcfoundation.org/UA/DI/` -> `DI`, `urn:zelos:sim:gateway` -> `gateway`.
+    """
+    rest = re.sub(r"^[A-Za-z][\w+.-]*:", "", uri)  # scheme
+    segments = [s for s in re.split(r"[/:#?]", rest) if re.search(r"[A-Za-z]", s)]
+    return sanitize_name(segments[-1], kind="field") if segments else ""
+
+
 def assign_names(
     described: list[tuple[Found, str, str, str]],
     namespaces: Sequence[str],
@@ -402,9 +413,10 @@ def assign_names(
     An event over `max_event_bytes` keeps its trailing segments.
 
     Collisions are resolved in node id order, so the result does not depend on
-    browse order: the first keeps the name; a later one gets `_ns<index>` when
-    its namespace differs from the first's, else `_2`, `_3`, ... An event named
-    like the health event takes `_ns<index>` the same way.
+    browse order: the first keeps the name; a later one gets `_<alias>` of its
+    namespace URI when the namespace differs from the first's, else (or when the
+    alias is empty or also taken) `_2`, `_3`, ... The URI, not the index: indexes
+    can shift across server restarts and would rename a signal between runs.
     """
     rows = sorted(
         ((node_id_string(var.node_id, namespaces), var, datatype, unit, desc)
@@ -420,11 +432,9 @@ def assign_names(
         parts = segments[:-1] if segments else list(var.path) or ["Objects"]
         event = _fit([sanitize_name(p, kind="field") for p in parts], max_event_bytes)
         name = sanitize_name(var.name, kind="field")
-        if event == HEALTH_EVENT:
-            renames.append(f"{event} -> {event}_ns{ns} ({node_id})")
-            event = f"{event}_ns{ns}"
         if (event, name) in owners:
-            candidate = f"{name}_ns{ns}" if owners[(event, name)] != ns else ""
+            alias = namespace_alias(namespaces[ns]) if ns < len(namespaces) else ""
+            candidate = f"{name}_{alias}" if alias and owners[(event, name)] != ns else ""
             k = 2
             while not candidate or (event, candidate) in owners:
                 candidate, k = f"{name}_{k}", k + 1

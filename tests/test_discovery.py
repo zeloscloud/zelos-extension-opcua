@@ -46,7 +46,7 @@ async def test_gateway_discovery_and_health():
             assert abs(health["clock_skew_ms"]) < 2000  # asyncua ticks CurrentTime at 1 Hz
             assert health["current_session_count"] == 1
             assert {"current_time", "start_time", "service_level"} <= set(health)
-            assert client._events[HEALTH_EVENT].name == "plc/server"
+            assert client._events[HEALTH_EVENT].name == "plc/_server"
             client._log_values(values)
         finally:
             await client.disconnect()
@@ -133,17 +133,30 @@ def test_collisions_are_renamed_deterministically():
         found("A.x", "x"),  # dotted id: event A
         found(7, "x", path=("A",)),  # browse path A: same event and field
         found("A.x", "x", ns=3),  # same id in another namespace
-        found(8, "v", path=("server",)),  # the health event's name
+        found(8, "v", path=("Server",)),  # no longer reserved
     ]
-    namespaces = ["http://opcfoundation.org/UA/", "urn:s", "urn:a", "urn:b"]
+    namespaces = [
+        "http://opcfoundation.org/UA/",
+        "urn:s",
+        "urn:a",
+        "http://opcfoundation.org/UA/DI/",
+    ]
     events, renames = assign_names(rows, namespaces)
     again, _ = assign_names(rows[::-1], namespaces)
     assert events == again
     assert {e: [n.name for n in nodes] for e, nodes in events.items()} == {
-        "A": ["x", "x_2", "x_ns3"],  # node id order: i=7 first
-        "server_ns2": ["v"],
+        # nsu= id order: DI's A.x keeps x; urn:a i=7 takes the alias; urn:a A.x
+        # would take x_a again, so falls back to _2.
+        "A": ["x", "x_a", "x_2"],
+        "Server": ["v"],
     }
-    assert len(renames) == 3
+    assert len(renames) == 2
+
+    # Index shift across a server restart: same URIs, same names.
+    shifted = [(Found(ua.NodeId(f.node_id.Identifier, f.node_id.NamespaceIndex + 1), f.name,
+                      f.path), *rest) for f, *rest in rows]  # fmt: skip
+    moved, _ = assign_names(shifted, [namespaces[0], "urn:new", *namespaces[1:]])
+    assert moved == events
 
 
 @pytest.mark.parametrize(

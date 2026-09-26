@@ -165,7 +165,7 @@ Collisions after sanitization are hard `ValueError`s at load - duplicate event
 name, or duplicate node name within one event; warn-and-clobber would silently
 drop data. A name may repeat across events (a gateway's identical devices):
 `get_by_name` takes `<event>/<name>` and raises on an ambiguous bare name.
-Event `server` is reserved for the health event.
+The health event is `_server`: sanitized names never start with `_`.
 
 ### Security
 
