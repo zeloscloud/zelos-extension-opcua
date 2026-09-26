@@ -7,6 +7,7 @@ just install      # deps + pre-commit hooks
 just format       # ruff format + ruff check --fix
 just check        # ruff check + ruff format --check
 just test         # pytest (integration tests start a real demo server)
+just e2e-interop  # Microsoft OPC PLC in Docker on :4840; manual, pre-release
 just dev          # app mode, reads the Zelos App config
 just demo         # built-in PLC simulator
 just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --secure, --map, --nodes N
@@ -33,6 +34,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 | `tests/test_security.py` | Secure sessions, cert trust and pinning, config errors, per-server security inheritance |
 | `tests/test_servers.py` | Several servers in one runner: layout, isolation, recovery, action selection |
 | `tests/test_discovery.py` | Discovery per profile, limits, health, `discovered_map`, naming, `auto_config` |
+| `tests/test_interop.py` | Microsoft OPC PLC (.NET stack) in Docker: None, SignAndEncrypt, user cert, `auto_config`; `ZELOS_INTEROP=1` only |
 
 ## Architecture
 
@@ -101,28 +103,42 @@ is Bad or empty is dropped for the connection. Node handles are resolved once
 per connection into `_poll_targets` and rebuilt after each reconnect, so the
 poll path never calls `get_node`.
 
-asyncua returns per-item `DataValue`s with their own `StatusCode`; it raises only
-for a service-level failure. A Bad item is skipped, as is one whose value fails
-`decode_value` (a string arriving on a float32 node), and `_log_node_failure`
+asyncua returns per-item `DataValue`s with their own `StatusCode` (verified on
+2.0.1); it raises only for a service-level failure, or when it cannot parse one
+item's value (a 2-D Variant array, some nested Variants), which fails the whole
+response - `read_many` then re-reads that chunk item by item and returns the
+culprit as BadDecodingError. A Bad item is skipped, as is one whose value fails
+`decode_value` (a string arriving on a float32 node, an integer wider than its
+field: abstract-typed nodes are typed by one sample), and `_log_node_failure`
 guarantees **one ERROR per bad node per process** - an unbounded per-cycle warning
 would flood both the log sink and the trace.
 
 There is no per-cycle health-check read. Disconnection is inferred from poll
 errors via `is_connection_error`, which classifies by type: `OSError` /
 `TimeoutError`, `UaStatusCodeError` in the session / secure-channel / connection
-family, and a bare `UaError` whose `__cause__` is a timeout (the black-holed
-socket case). Never by message text. Five consecutive poll failures that
+family, and any other exception whose `__cause__` is a timeout or `OSError`
+(the black-holed socket: asyncua 2.0.1 raises a bare `Exception` from the
+`TimeoutError`). Never by message text. Five consecutive poll failures that
 `is_connection_error` does *not* claim still force a reconnect, so an
 unclassified error cannot wedge the extension on a dead session.
 
 Reconnect backs off 3s, doubling, capped at 60s, reset on a completed poll (a
 connect that never yields data does not clear it).
 
+asyncua 2.0 starts a connection supervisor on every `connect()`: it reads
+ServerStatus every `watchdog_intervall` with that interval as the timeout, and on
+a miss marks the client disconnected (the next request raises `ConnectionError`,
+which is ours to handle). `watchdog_intervall` is set to the request timeout, as
+the 1s default would drop sessions to any slower server. Its `auto_reconnect`
+is off by default and must stay off: reconnect and re-discovery are ours.
+
 ### Discovery
 
 A server with no `node_map_file` (and `advanced.discovery` on) is browsed on
 every connect, before `_resolve_nodes`, and `node_map` replaced. Walk: BFS over
-forward HierarchicalReferences from Objects, `_browse_chunk` nodes per Browse,
+forward HierarchicalReferences from Objects, `_browse_chunk` nodes per Browse
+(View Timestamp null: asyncua defaults it to now, which .NET servers answer with
+BadNodeNotInView),
 BrowseNext to the end, visited set; not followed: Server (i=2253), Objects
 named `_*`, HasProperty (EngineeringUnits / EURange are recorded). Variables are
 browsed too (struct members, EU properties). Describe: one batched Read of
@@ -188,10 +204,12 @@ because asyncua otherwise invents one.
 ### Simulator
 
 asyncua has no hook for its per-connection `UaProcessor`, so `_SimServer.start`
-re-implements `Server.start` (asyncua 1.1.8) to install `_SimProcessor`. It
+re-implements `Server.start` (asyncua 2.0.1) to install `_SimProcessor`. It
 records every request, and adds what asyncua lacks: enforced OperationLimits,
 a session cap, RequestedMaxReferencesPerNode, BrowseNext, and
-ServerDiagnosticsSummary session counts. Recheck `start` on an asyncua bump.
+ServerDiagnosticsSummary session counts. On an asyncua bump recheck `start`,
+`OPCUAProtocol.connection_made` and what `UaProcessor._process_message` does
+around a request (`_browse` mirrors its session checks and activity stamps).
 Each start gets a unique ApplicationUri (`auto_config` dedupes on it). `--nodes`
 adds variables through one AddNodes call per folder with read-time value
 callbacks: node-by-node creation cost ~1.3 ms each.

@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A node name may repeat across events in a node map (`<event>/<name>` in the
   named actions); only a duplicate within one event is an error.
 - zelos-sdk floor 0.0.12a1.
+- asyncua 2.0.1 (was 1.1.8): fixes BadServerUriInvalid on CreateSession against
+  .NET-stack (Microsoft OPC PLC) and Unified Automation SDK servers.
 - Config format: servers are listed under `servers[]` (name, endpoint, node map,
   poll interval, per-server security and certificate pin) with shared settings and
   security defaults under `advanced` (`prefix`, `timeout`, `log_level`, client
@@ -97,6 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sign / SignAndEncrypt never engaged: the security call was never awaited, so
   every session was plaintext. A secure mode now establishes exactly that mode and
   policy or refuses to connect; it never falls back to None.
+- Discovery found nothing on .NET-stack servers (BadNodeNotInView): Browse now
+  asks for the current view.
+- A value asyncua cannot decode, or an integer outside its field's width, costs
+  only its node instead of failing the whole read or poll cycle.
 
 ---
 

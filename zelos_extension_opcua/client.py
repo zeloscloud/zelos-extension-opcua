@@ -37,6 +37,7 @@ from zelos_extension_opcua.discovery import (
     VARIANT_DATATYPES,
     discover,
     operation_limits,
+    read_many,
     to_nsu_string,
 )
 from zelos_extension_opcua.node_map import Node, NodeMap, parse_node_id
@@ -96,6 +97,9 @@ SDK_DATATYPES = {
 }
 
 INT_DATATYPES = ("uint8", "int8", "uint16", "int16", "uint32", "int32", "uint64", "int64")
+INT_RANGES = {f"int{b}": (-(2 ** (b - 1)), 2 ** (b - 1) - 1) for b in (8, 16, 32, 64)} | {
+    f"uint{b}": (0, 2**b - 1) for b in (8, 16, 32, 64)
+}
 
 # Server health, read in the poll batch: (field, ns=0 Variable).
 HEALTH_NODES = (
@@ -377,7 +381,12 @@ def decode_value(value: Any, datatype: str, scale: float = 1.0) -> float | int |
     if datatype in ("float32", "float64"):
         return float(value) * scale
     if datatype in INT_DATATYPES:
-        return int(value * scale)
+        # The trace field has the declared width; one out-of-range value would
+        # fail the whole event at emit.
+        out, (low, high) = int(value * scale), INT_RANGES[datatype]
+        if not low <= out <= high:
+            raise ValueError(f"{out} out of range for {datatype}")
+        return out
     return value
 
 
@@ -442,15 +451,13 @@ def is_connection_error(error: BaseException) -> bool:
     and a reconnect against the dead port raises ConnectionRefusedError - both
     OSError subclasses. The one case that needs a fallback is a black-holed
     socket (packets dropped, connection still nominally open), where asyncua
-    wraps the timeout in a bare UaError; its __cause__ is the TimeoutError.
+    wraps the timeout in a bare Exception; its __cause__ is the TimeoutError.
     """
     if isinstance(error, (OSError, TimeoutError)):  # ConnectionError is an OSError
         return True
     if isinstance(error, ua.UaStatusCodeError):
         return error.code in CONNECTION_STATUS_CODES
-    if isinstance(error, ua.UaError):
-        return isinstance(error.__cause__, (TimeoutError, OSError))
-    return False
+    return isinstance(error.__cause__, (TimeoutError, OSError))
 
 
 def default_server_name(endpoint: str) -> str:
@@ -587,7 +594,10 @@ class OPCUAClient:
         Raises:
             ConnectionSecurityError: If the requested security cannot be established
         """
-        client = Client(url=self.endpoint, timeout=self.timeout)
+        # asyncua's liveness probe times out at the watchdog interval (1s default),
+        # which would drop sessions to any server slower than that; give it the
+        # request timeout. Its auto_reconnect stays off: reconnect is ours.
+        client = Client(url=self.endpoint, timeout=self.timeout, watchdog_intervall=self.timeout)
         # A secure mode either configures that exact channel or raises: there is
         # no path from here to a None channel.
         if self.security_mode != "None":
@@ -1041,22 +1051,21 @@ class OPCUAClient:
         One request per cycle, not one per node: a 100-node map at 1 Hz would
         otherwise be 100 serial round trips. Per-item Bad status codes come back
         inside the response (asyncua only raises for a service-level failure), so
-        one dead node cannot take the whole cycle down with it.
+        one dead node cannot take the whole cycle down with it; nor can a value
+        asyncua fails to decode (`read_many` isolates it as BadDecodingError).
 
         Returns:
             {event_name: {field_name: value}}
         """
         client = self._require_client()
-        ua_nodes = [n for _, n in self._health_targets]
-        ua_nodes += [n for _, _, n in self._poll_targets]
+        items = [(n.nodeid, None) for _, n in self._health_targets]
+        items += [(n.nodeid, None) for _, _, n in self._poll_targets]
         data_values: list[ua.DataValue] = []
         host_time = time.time()
-        for start in range(0, len(ua_nodes), self._read_chunk):
+        for start in range(0, len(items), self._read_chunk):
             sent = time.time()
             data_values.extend(
-                await client.read_attributes(
-                    ua_nodes[start : start + self._read_chunk], ua.AttributeIds.Value
-                )
+                await read_many(client, items[start : start + self._read_chunk], self._read_chunk)
             )
             if not start:
                 # The health nodes lead the first request; its midpoint is the
@@ -1068,7 +1077,7 @@ class OPCUAClient:
         if health:
             results[HEALTH_EVENT] = self._health_values(data_values[:health], host_time)
         for (event_name, node, _), dv in zip(self._poll_targets, data_values[health:], strict=True):
-            status = dv.StatusCode_
+            status = dv.StatusCode
             if status is not None and not status.is_good():
                 self._log_node_failure(node, status.name)
                 continue
@@ -1094,7 +1103,7 @@ class OPCUAClient:
         values: dict[str, Any] = {}
         missing = []
         for (name, _), dv in zip(self._health_targets, data_values, strict=True):
-            bad = dv.StatusCode_ is not None and not dv.StatusCode_.is_good()
+            bad = dv.StatusCode is not None and not dv.StatusCode.is_good()
             raw = None if bad or not dv.Value else dv.Value.Value
             if raw is None:
                 missing.append(name)

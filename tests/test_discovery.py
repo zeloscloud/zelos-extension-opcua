@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import struct
 import time
 from pathlib import Path
 
@@ -18,7 +19,13 @@ from zelos_extension_opcua.cli import app
 from zelos_extension_opcua.client import OPCUAClient, OPCUARunner
 from zelos_extension_opcua.demo import profiles
 from zelos_extension_opcua.demo.sim_server import Simulator
-from zelos_extension_opcua.discovery import HEALTH_EVENT, Found, assign_names, vendor_segments
+from zelos_extension_opcua.discovery import (
+    HEALTH_EVENT,
+    Found,
+    assign_names,
+    read_many,
+    vendor_segments,
+)
 from zelos_extension_opcua.node_map import NodeMap
 
 
@@ -122,6 +129,23 @@ async def wait_until(predicate, timeout: float) -> None:
     while not predicate():
         assert time.monotonic() < deadline, f"not met within {timeout}s"
         await asyncio.sleep(0.05)
+
+
+async def test_undecodable_value_costs_only_its_item():
+    """asyncua failing to parse one value must not fail the other items read with it."""
+
+    class Session:
+        async def read(self, params):
+            ids = [rv.NodeId.Identifier for rv in params.NodesToRead]
+            if "bad" in ids:
+                raise struct.error("bad char in struct format")
+            return [ua.DataValue(ua.Variant(i)) for i in ids]
+
+    client = type("C", (), {"uaclient": Session()})()
+    items = [(ua.NodeId(i, 2), None) for i in ("a", "bad", "c")]
+    dvs = await read_many(client, items, 100)
+    assert [dv.Value.Value for dv in dvs if dv.StatusCode.is_good()] == ["a", "c"]
+    assert dvs[1].StatusCode.value == ua.StatusCodes.BadDecodingError
 
 
 def found(identifier: str | int, name: str, ns: int = 2, path: tuple = ("Folder",)) -> tuple:

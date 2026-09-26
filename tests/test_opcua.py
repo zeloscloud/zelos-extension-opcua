@@ -366,6 +366,12 @@ class TestValueCodec:
         assert decode_value(1000, "uint16", scale=0.1) == 100
         assert decode_value(100.0, "float32", scale=2.0) == 200.0
 
+    def test_decode_rejects_out_of_range_int(self):
+        """An abstract-typed node can send a wider value than its sampled type."""
+        with pytest.raises(ValueError, match="out of range for int16"):
+            decode_value(-8258223195483293696, "int16")
+        assert decode_value(-(2**63), "int64") == -(2**63)
+
     def test_decode_none_returns_none(self):
         """None input returns None."""
         assert decode_value(None, "float32") is None
@@ -505,9 +511,9 @@ class TestConnectionErrorClassification:
         assert is_connection_error(BadNodeIdUnknown()) is False
         assert is_connection_error(BadTypeMismatch()) is False
 
-    def test_generic_uaerror_wrapping_a_timeout(self):
-        """A black-holed socket surfaces as a bare UaError caused by a timeout."""
-        err = ua.UaError("Failed to send request to OPC UA server")
+    def test_bare_exception_wrapping_a_timeout(self):
+        """A black-holed socket surfaces as a bare Exception caused by a timeout."""
+        err = Exception("Unhandled exception while sending request to OPC UA server")
         err.__cause__ = TimeoutError()
         assert is_connection_error(err) is True
         assert is_connection_error(ua.UaError("something else")) is False
@@ -777,14 +783,14 @@ class TestDemoServerIntegration:
     async def test_poll_uses_one_request(self, client, monkeypatch):
         """The cycle is one read request, not one per node."""
         calls = 0
-        original = client._client.read_attributes
+        original = client._client.uaclient.read
 
         async def counting(*args, **kwargs):
             nonlocal calls
             calls += 1
             return await original(*args, **kwargs)
 
-        monkeypatch.setattr(client._client, "read_attributes", counting)
+        monkeypatch.setattr(client._client.uaclient, "read", counting)
         await client._poll_nodes()
         assert calls == 1
         assert len(client._poll_targets) == len(client.node_map.nodes)
