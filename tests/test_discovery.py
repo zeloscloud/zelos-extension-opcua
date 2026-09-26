@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import struct
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -215,35 +217,74 @@ def found(identifier: str | int, name: str, ns: int = 2, path: tuple = ("Folder"
     return (Found(ua.NodeId(identifier, ns), name, path), "float32", "", "")
 
 
-def test_collisions_are_renamed_deterministically():
+NAMESPACES = ["http://opcfoundation.org/UA/", "urn:s", "urn:a"]
+
+
+def names(rows: list, namespaces: Sequence[str] = NAMESPACES) -> dict[str, dict[str, str]]:
+    """event -> {node id: field}."""
+    events, _ = assign_names(rows, namespaces)
+    return {e: {n.node_id: n.name for n in nodes} for e, nodes in events.items()}
+
+
+def suffix(nsu: str, digits: int = 6) -> str:
+    return "_" + hashlib.sha1(nsu.encode()).hexdigest()[:digits]
+
+
+def test_collisions_hash_every_collider():
     rows = [
-        found("A.x", "x"),  # dotted id: event A
-        found(7, "x", path=("A",)),  # browse path A: same event and field
-        found("A.x", "x", ns=3),  # same id in another namespace
-        found(8, "v", path=("Server",)),  # no longer reserved
+        found(1, "Flow.Rate", path=("A",)),  # sanitized to Flow_Rate
+        found(2, "Flow_Rate", path=("A",)),
+        found(3, "Level", path=("A",)),
+        found("B.x", "x", ns=1),  # same field in another namespace
+        found(4, "x", ns=2, path=("B",)),
     ]
-    namespaces = [
-        "http://opcfoundation.org/UA/",
-        "urn:s",
-        "urn:a",
-        "http://opcfoundation.org/UA/DI/",
-    ]
-    events, renames = assign_names(rows, namespaces)
-    again, _ = assign_names(rows[::-1], namespaces)
-    assert events == again
-    assert {e: [n.name for n in nodes] for e, nodes in events.items()} == {
-        # nsu= id order: DI's A.x keeps x; urn:a i=7 takes the alias; urn:a A.x
-        # would take x_a again, so falls back to _2.
-        "A": ["x", "x_a", "x_2"],
-        "Server": ["v"],
+    got = names(rows)
+    assert got == {
+        "A": {
+            "nsu=urn:a;i=1": "Flow_Rate" + suffix("nsu=urn:a;i=1"),
+            "nsu=urn:a;i=2": "Flow_Rate" + suffix("nsu=urn:a;i=2"),
+            "nsu=urn:a;i=3": "Level",
+        },
+        "B": {
+            "nsu=urn:s;s=B.x": "x" + suffix("nsu=urn:s;s=B.x"),
+            "nsu=urn:a;i=4": "x" + suffix("nsu=urn:a;i=4"),
+        },
     }
-    assert len(renames) == 2
+    _, renames = assign_names(rows, NAMESPACES)
+    assert len(renames) == 4
+    assert names(rows[::-1]) == got
 
     # Index shift across a server restart: same URIs, same names.
     shifted = [(Found(ua.NodeId(f.node_id.Identifier, f.node_id.NamespaceIndex + 1), f.name,
                       f.path), *rest) for f, *rest in rows]  # fmt: skip
-    moved, _ = assign_names(shifted, [namespaces[0], "urn:new", *namespaces[1:]])
-    assert moved == events
+    assert names(shifted, [NAMESPACES[0], "urn:new", *NAMESPACES[1:]]) == got
+
+
+def test_collision_names_never_move():
+    """A new collider leaves existing hashed names alone and ends a plain one."""
+    two = [found(1, "Flow.Rate", path=("A",)), found(2, "Flow_Rate", path=("A",))]
+    before = names(two)["A"]
+    after = names([*two, found(3, "Flow:Rate", path=("A",))])["A"]
+    assert {k: after[k] for k in before} == before
+    assert len(set(after.values())) == 3
+
+    alone = names([found(5, "Speed", path=("M",))])["M"]
+    assert alone == {"nsu=urn:a;i=5": "Speed"}
+    both = names([found(5, "Speed", path=("M",)), found(6, "Speed", path=("M",))])["M"]
+    assert "Speed" not in both.values()
+    assert both["nsu=urn:a;i=5"] == "Speed" + suffix("nsu=urn:a;i=5")
+
+
+def test_truncation_collisions_are_hashed():
+    long = "f" * 200  # both truncate to the same 128 bytes
+    rows = [found(1, long + "1", path=("A",)), found(2, long + "2", path=("A",))]
+    got = names(rows)["A"]
+    for nsu, name in got.items():
+        assert name == "f" * (128 - 7) + suffix(nsu)
+    # Events cut to their trailing segment: A/B/E and C/B/E both become B/E.
+    rows = [found(1, "x", path=("A", "B", "E")), found(2, "x", path=("C", "B", "E"))]
+    events, _ = assign_names(rows, NAMESPACES, max_event_bytes=4)
+    assert [n.name for n in events["B/E"]] == ["x" + suffix(f"nsu=urn:a;i={i}") for i in (1, 2)]
 
 
 @pytest.mark.parametrize(

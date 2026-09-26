@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live discovery: a server without a node map is browsed on every connect and every
   scalar variable traced, read-only; `advanced.discovery` turns it off.
   `discovered_map` returns the discovered set as node map json or csv.
+  Colliding discovered names (same BrowseName, sanitization, truncation) all get
+  `_<hash>` of their `nsu=` node id, so a trace name never re-points to another node.
   A reconnect that finds fields added to an existing event starts a new segment
   of the trace source (one INFO line) and traces them; a field whose datatype
   changed is skipped with one WARNING until restart.
