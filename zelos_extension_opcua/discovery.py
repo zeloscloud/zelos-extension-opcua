@@ -7,6 +7,7 @@ server shows up after the next reconnect instead of going stale.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import struct
 import time
@@ -495,14 +496,11 @@ def _fit(parts: list[str], max_bytes: int) -> str:
     return event or parts[-1].encode()[:max_bytes].decode(errors="ignore")
 
 
-def namespace_alias(uri: str) -> str:
-    """Last segment of a namespace URI with a letter in it, sanitized; "" if none.
-
-    `http://opcfoundation.org/UA/DI/` -> `DI`, `urn:zelos:sim:gateway` -> `gateway`.
-    """
-    rest = re.sub(r"^[A-Za-z][\w+.-]*:", "", uri)  # scheme
-    segments = [s for s in re.split(r"[/:#?]", rest) if re.search(r"[A-Za-z]", s)]
-    return sanitize_name(segments[-1], kind="field") if segments else ""
+def _hashed(name: str, node_id: str, digits: int) -> str:
+    """`name_<hash>`, the base trimmed so the whole fits TRACE_NAME_BYTES."""
+    suffix = "_" + hashlib.sha1(node_id.encode()).hexdigest()[:digits]
+    base = name.encode()[: TRACE_NAME_BYTES - len(suffix)].decode(errors="ignore")
+    return base + suffix
 
 
 def assign_names(
@@ -516,45 +514,42 @@ def assign_names(
     below Objects; field = BrowseName. Both sanitized, segments joined by `/`.
     An event over `max_event_bytes` keeps its trailing segments.
 
-    Collisions are resolved in node id order, so the result does not depend on
-    browse order: the first keeps the name; a later one gets `_<alias>` of its
-    namespace URI when the namespace differs from the first's, else (or when the
-    alias is empty or also taken) `_2`, `_3`, ... The URI, not the index: indexes
-    can shift across server restarts and would rename a signal between runs.
+    Every node whose (event, field) another node also resolves to (same
+    BrowseName, sanitization, truncation) is named `<field>_<hash>`, the hash of
+    its nsu= id (URI, not the shifting index), 10 digits where 6 still collide.
+    None keeps the plain name: a trace name never refers to a different node
+    than it did before; a collision appearing later ends the plain series
+    (rename) rather than re-pointing it.
     """
-    rows = sorted(
-        ((node_id_string(var.node_id, namespaces), var, datatype, unit, desc)
-         for var, datatype, unit, desc in described),
-        key=lambda row: row[0],
-    )  # fmt: skip
-    events: dict[str, list[Node]] = {}
-    owners: dict[tuple[str, str], int] = {}  # (event, field) -> namespace index
-    renames: list[str] = []
-    for node_id, var, datatype, unit, desc in rows:
-        ns = var.node_id.NamespaceIndex
+    rows = []
+    for var, datatype, unit, desc in described:
         segments = vendor_segments(var.node_id, var.name)
         parts = segments[:-1] if segments else list(var.path) or ["Objects"]
         event = _fit([sanitize_name(p, kind="field") for p in parts], max_event_bytes)
-        name = sanitize_name(var.name, kind="field")
-        if (event, name) in owners:
-            alias = namespace_alias(namespaces[ns]) if ns < len(namespaces) else ""
-            candidate = f"{name}_{alias}" if alias and owners[(event, name)] != ns else ""
-            k = 2
-            while not candidate or (event, candidate) in owners:
-                candidate, k = f"{name}_{k}", k + 1
-            renames.append(f"{event}/{name} -> {candidate} ({node_id})")
-            name = candidate
-        owners[(event, name)] = ns
-        events.setdefault(event, []).append(
-            Node(
-                node_id=node_id,
-                name=name,
-                datatype=datatype,
-                unit=unit,
-                description=desc,
-                writable=False,
-            )
+        node = Node(
+            node_id=node_id_string(var.node_id, namespaces),
+            name=sanitize_name(var.name, kind="field"),
+            datatype=datatype,
+            unit=unit,
+            description=desc,
+            writable=False,
         )
+        rows.append((event, node))
+    rows.sort(key=lambda row: row[1].node_id)
+    taken = Counter((event, node.name) for event, node in rows)
+    collided = [(event, node) for event, node in rows if taken[(event, node.name)] > 1]
+    hashed = {id(node): _hashed(node.name, node.node_id, 6) for _, node in collided}
+    again = Counter((event, hashed.get(id(node), node.name)) for event, node in rows)
+    renames: list[str] = []
+    for event, node in collided:
+        name = hashed[id(node)]
+        if again[(event, name)] > 1:
+            name = _hashed(node.name, node.node_id, 10)
+        renames.append(f"{event}/{node.name} -> {name} ({node.node_id})")
+        node.name = name
+    events: dict[str, list[Node]] = {}
+    for event, node in rows:
+        events.setdefault(event, []).append(node)
     return dict(sorted(events.items())), renames
 
 

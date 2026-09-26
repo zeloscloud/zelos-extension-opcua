@@ -206,7 +206,7 @@ rendered as text (`render_text`: bool true/false, DateTime ISO 8601 UTC,
 ByteString hex, StatusCode name, a struct its str()), so a type change never
 fails the node; anything else by the value's kind at its widest (bool, float64,
 string), other kinds skipped; values coerce into the field.
-Naming and collisions: `discovery.assign_names`. Unbounded by design: a limit
+Naming and collisions: `discovery.assign_names`; every collider gets `_<hash>` of its nsu= id, never an ordinal, so a name never re-points. Unbounded by design: a limit
 needs measured data.
 
 A declared trace event's schema is fixed on its `TraceSource` instance (the SDK
