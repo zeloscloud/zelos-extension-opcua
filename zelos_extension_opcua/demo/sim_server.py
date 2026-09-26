@@ -5,16 +5,19 @@ secured endpoint with an optional trust list, shift namespace indices between
 starts, or serve an arbitrary node map. Every service request is recorded per
 session in `Simulator.request_log`.
 
-asyncua 1.1.8 has no hook for its per-connection `UaProcessor`, so `_SimServer`
+asyncua 2.0.1 has no hook for its per-connection `UaProcessor`, so `_SimServer`
 re-implements `Server.start` to swap in `_SimProcessor`. The processor adds what
 asyncua lacks: the request log, enforced OperationLimits, a session cap,
-RequestedMaxReferencesPerNode, and BrowseNext with continuation points.
+RequestedMaxReferencesPerNode, BrowseNext with continuation points, per-session
+caps on subscriptions, monitored items and continuation points, and
+ServerTimestamp on Read.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import logging
 import os
@@ -27,6 +30,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +62,9 @@ class Limits:
     max_nodes_per_read: int
     max_references_per_node: int  # beyond it a Browse result carries a continuation point
     max_sessions: int
+    max_subscriptions: int = 0  # per session; 0 = no cap
+    max_monitored_items: int = 0  # per session; 0 = no cap
+    max_continuation_points: int = 0  # per session; 0 = no cap
 
 
 async def _build_demo(server: Server, ns: dict[str, int]) -> Any:
@@ -88,6 +95,10 @@ PROFILES: dict[str, Profile] = {
             max_nodes_per_read=20,
             max_references_per_node=10,
             max_sessions=4,
+            # S7-1200-shaped caps, scaled to this address space so overflow is reachable.
+            max_subscriptions=5,
+            max_monitored_items=10,
+            max_continuation_points=3,
         ),
     ),
     "device": Profile(
@@ -119,10 +130,18 @@ class _SimProcessor(UaProcessor):
         try:
             if service in ("Browse", "BrowseNext"):
                 return await self._browse(service, requesthdr, seqhdr, body)
-            if service == "Read" and limits:
-                params = struct_from_binary(ua.ReadParameters, body.copy())
-                if len(params.NodesToRead) > limits.max_nodes_per_read:
-                    raise ServiceError(ua.StatusCodes.BadTooManyOperations)
+            if service == "Read":
+                return await self._read(requesthdr, seqhdr, body)
+            if service == "CreateMonitoredItems" and limits and limits.max_monitored_items:
+                return await self._create_monitored_items(requesthdr, seqhdr, body)
+            if (
+                service == "CreateSubscription"
+                and self.session
+                and limits
+                and limits.max_subscriptions
+                and len(self._subscriptions()) >= limits.max_subscriptions
+            ):
+                raise ServiceError(ua.StatusCodes.BadTooManySubscriptions)
             if service == "ActivateSession":
                 identity = await self._check_identity(body)
             if (
@@ -175,15 +194,64 @@ class _SimProcessor(UaProcessor):
         with contextlib.suppress(Exception):  # the server may be stopping
             await self._sim.publish_diagnostics()
 
-    async def _browse(self, service, requesthdr, seqhdr, body) -> bool:
-        # asyncua ignores RequestedMaxReferencesPerNode and has no BrowseNext;
-        # these mirror its session checks, then page the results.
+    def _check_session(self) -> None:
+        """asyncua's session checks and activity stamps, for services handled here."""
         if not self.session:
             raise ServiceError(ua.StatusCodes.BadSessionIdInvalid)
         if not self.session.is_activated():
             raise ServiceError(ua.StatusCodes.BadSessionNotActivated)
         self.session_last_activity = time.monotonic()
         self.session.touch()
+
+    async def _read(self, requesthdr, seqhdr, body) -> bool:
+        # asyncua returns the stored DataValue, stamped at the last write; a real
+        # server stamps ServerTimestamp at the read.
+        self._check_session()
+        params = struct_from_binary(ua.ReadParameters, body)
+        limits = self._sim.limits
+        if limits and len(params.NodesToRead) > limits.max_nodes_per_read:
+            raise ServiceError(ua.StatusCodes.BadTooManyOperations)
+        now = datetime.now(UTC)
+        response = ua.ReadResponse()
+        response.Results = [
+            dataclasses.replace(dv, ServerTimestamp=now, ServerPicoseconds=None)
+            if rv.AttributeId == ua.AttributeIds.Value
+            else dv
+            for rv, dv in zip(params.NodesToRead, await self.session.read(params), strict=True)
+        ]
+        self.send_response(requesthdr.RequestHandle, seqhdr, response)
+        return True
+
+    def _subscriptions(self) -> list[Any]:
+        service = self.session.subscription_service
+        return [
+            s for s in service.subscriptions.values() if s.session_id == self.session.session_id
+        ]
+
+    async def _create_monitored_items(self, requesthdr, seqhdr, body) -> bool:
+        # Items past the session's cap get BadTooManyMonitoredItems, as an S7 does.
+        self._check_session()
+        params = struct_from_binary(ua.CreateMonitoredItemsParameters, body)
+        held = sum(len(s.monitored_item_srv._monitored_items) for s in self._subscriptions())
+        room = max(0, self._sim.limits.max_monitored_items - held)
+        requested = params.ItemsToCreate
+        params.ItemsToCreate = requested[:room]
+        results = await self.session.create_monitored_items(params) if room else []
+        results += [
+            ua.MonitoredItemCreateResult(
+                StatusCode=ua.StatusCode(ua.StatusCodes.BadTooManyMonitoredItems)
+            )
+            for _ in requested[room:]
+        ]
+        response = ua.CreateMonitoredItemsResponse()
+        response.Results = results
+        self.send_response(requesthdr.RequestHandle, seqhdr, response)
+        return True
+
+    async def _browse(self, service, requesthdr, seqhdr, body) -> bool:
+        # asyncua ignores RequestedMaxReferencesPerNode and has no BrowseNext;
+        # this pages the results.
+        self._check_session()
         limits = self._sim.limits
 
         if service == "Browse":
@@ -196,7 +264,8 @@ class _SimProcessor(UaProcessor):
             )
             results = await self.session.browse(params)
             for r in results:
-                r.References, r.ContinuationPoint = self._page(r.References, cap)
+                if r.StatusCode.is_good():
+                    r.StatusCode, r.References, r.ContinuationPoint = self._page(r.References, cap)
             response = ua.BrowseResponse()
             response.Results = results
         else:
@@ -209,7 +278,7 @@ class _SimProcessor(UaProcessor):
                     r.StatusCode = ua.StatusCode(ua.StatusCodes.BadContinuationPointInvalid)
                 elif not params.ReleaseContinuationPoints:
                     # Paging state is per request; a later page uses the server cap.
-                    r.References, r.ContinuationPoint = self._page(refs, self._server_ref_cap())
+                    _, r.References, r.ContinuationPoint = self._page(refs, self._server_ref_cap())
                 results.append(r)
             response = ua.BrowseNextResponse()
             response.Parameters.Results = results
@@ -221,13 +290,18 @@ class _SimProcessor(UaProcessor):
 
     def _page(
         self, refs: list[ua.ReferenceDescription], cap: int
-    ) -> tuple[list[ua.ReferenceDescription], bytes | None]:
+    ) -> tuple[ua.StatusCode, list[ua.ReferenceDescription], bytes | None]:
+        """(status, first page, continuation point or None); a point past the
+        session's cap is BadNoContinuationPoints with no references, per Part 4."""
         if not cap or len(refs) <= cap:
-            return refs, None
+            return ua.StatusCode(), refs, None
+        limits = self._sim.limits
+        if limits and 0 < limits.max_continuation_points <= len(self._continuations):
+            return ua.StatusCode(ua.StatusCodes.BadNoContinuationPoints), [], None
         self._next_cp += 1
         cp = self._next_cp.to_bytes(4, "little")
         self._continuations[cp] = refs[cap:]
-        return refs[:cap], cp
+        return ua.StatusCode(), refs[:cap], cp
 
 
 class _SimProtocol(OPCUAProtocol):

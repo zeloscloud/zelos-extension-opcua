@@ -21,8 +21,9 @@ from test_security import user_cert
 
 from zelos_extension_opcua import actions
 from zelos_extension_opcua import client as client_mod
-from zelos_extension_opcua.client import OPCUAClient, SharedSource
+from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, SharedSource, timestamp_ns
 from zelos_extension_opcua.discovery import HEALTH_EVENT
+from zelos_extension_opcua.node_map import NodeMap
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ZELOS_INTEROP") != "1", reason="set ZELOS_INTEROP=1 (needs docker)"
@@ -110,6 +111,60 @@ async def test_user_certificate_login(opcplc, tmp_path):
     secure = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}
     assert (await polled(**secure, **opcplc))[0] is True
     assert (await polled(**secure, **user_cert(tmp_path / "stranger", "stranger")))[0] is False
+
+
+FAST = NodeMap.from_dict(
+    {
+        "events": {
+            "fast": [
+                {
+                    "name": f"FastUInt{i}",
+                    "node_id": f"nsu=http://microsoft.com/Opc/OpcPlc/;s=FastUInt{i}",
+                    "datatype": "uint32",
+                }
+                for i in range(1, 6)
+            ]
+        }
+    }
+)
+
+
+@pytest.mark.parametrize("node_map", [FAST, None], ids=["fast_map", "discovered"])
+async def test_subscriptions_deliver_fast_nodes_at_source_time(opcplc, monkeypatch, node_map):
+    """Mapped fast nodes stay subscribed; discovering everything, a Publish that
+    asyncua cannot decode (OPC PLC's random Variants) moves it all to polling."""
+    stamped: list[tuple[int, int | None]] = []  # FastUInt1: (logged at, SourceTimestamp)
+
+    client = OPCUAClient(endpoint=ENDPOINT, name="plc", node_map=node_map)
+    real = client._log_samples
+
+    def log_samples(samples, received_ns, refresh=False):
+        samples = list(samples)
+        for _, node, dv in samples:
+            if node.name == "FastUInt1":
+                at = client_mod.sample_time_ns(dv, received_ns, refresh)
+                stamped.append((at, timestamp_ns(dv.SourceTimestamp)))
+        real(samples, received_ns, refresh)
+
+    monkeypatch.setattr(client, "_log_samples", log_samples)
+    client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
+    runner = OPCUARunner([client])
+    task = asyncio.create_task(runner._run_async())
+    try:
+        deadline = time.monotonic() + 20
+        while len(stamped) < 3:
+            assert time.monotonic() < deadline, stamped
+            await asyncio.sleep(0.1)
+        status = client.status()
+    finally:
+        runner.stop()
+        await asyncio.wait_for(task, 10.0)
+
+    assert status["subscribed"] + status["polled"] == status["nodes"] > 0
+    if node_map is FAST:
+        assert status["subscribed"] == 5
+    assert all(source is not None and at == source for at, source in stamped)
+    assert len({at for at, _ in stamped}) == len(stamped)
 
 
 async def test_auto_config_finds_it(opcplc):

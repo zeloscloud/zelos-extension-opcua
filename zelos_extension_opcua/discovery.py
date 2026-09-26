@@ -106,6 +106,7 @@ VENDOR_IDS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], list[str]]], 
 
 # Raised client-side while parsing a complete response: the channel is intact.
 _DECODE_ERRORS = (struct.error, ValueError, NotEnoughData)
+_NO_CONTINUATION_POINTS = ua.StatusCodes.BadNoContinuationPoints
 _BAD_DECODING = ua.StatusCodes.BadDecodingError
 
 
@@ -128,14 +129,16 @@ def node_id_string(node_id: NodeId, namespaces: Sequence[str]) -> str:
     return f"ns={node_id.NamespaceIndex};{bare}"
 
 
-async def operation_limits(client: Client) -> tuple[int, int]:
-    """(nodes per Browse, nodes per Read): the server's OperationLimits capped at
-    MAX_OPERATIONS; a missing or 0 (no limit) value is MAX_OPERATIONS."""
+async def operation_limits(client: Client) -> tuple[int, int, int]:
+    """(nodes per Browse, nodes per Read, items per CreateMonitoredItems): the
+    server's OperationLimits capped at MAX_OPERATIONS; a missing or 0 (no limit)
+    value is MAX_OPERATIONS."""
+    ops = "Server_ServerCapabilities_OperationLimits_"
     dvs = await read_many(
         client,
         [
-            (NodeId(_IDS.Server_ServerCapabilities_OperationLimits_MaxNodesPerBrowse), None),
-            (NodeId(_IDS.Server_ServerCapabilities_OperationLimits_MaxNodesPerRead), None),
+            (NodeId(getattr(_IDS, ops + name)), None)
+            for name in ("MaxNodesPerBrowse", "MaxNodesPerRead", "MaxMonitoredItemsPerCall")
         ],
         MAX_OPERATIONS,
     )
@@ -143,7 +146,7 @@ async def operation_limits(client: Client) -> tuple[int, int]:
     for dv in dvs:
         value = dv.Value.Value if dv.Value and _good(dv) else None
         limits.append(min(int(value), MAX_OPERATIONS) if value else MAX_OPERATIONS)
-    return limits[0], limits[1]
+    return limits[0], limits[1], limits[2]
 
 
 def _good(dv: ua.DataValue) -> bool:
@@ -174,7 +177,8 @@ async def read_many(
 
 
 async def _read(client: Client, items: Sequence[tuple[NodeId, int | None]]) -> list[ua.DataValue]:
-    params = ua.ReadParameters()
+    # Default is Source only; the refresh sweep logs at ServerTimestamp.
+    params = ua.ReadParameters(TimestampsToReturn=ua.TimestampsToReturn.Both)
     for node_id, attribute in items:
         rv = ua.ReadValueId()
         rv.NodeId = node_id
@@ -201,6 +205,7 @@ class Discovery:
     node_map: NodeMap
     skipped: Counter[str] = field(default_factory=Counter)
     renames: list[str] = field(default_factory=list)
+    browse_failed: list[str] = field(default_factory=list)  # `path (status)`
     requests: int = 0
     seconds: float = 0.0
 
@@ -225,8 +230,19 @@ class _Counter:
         return await read_many(self.client, items, chunk)
 
 
-async def _browse_batch(rpc: _Counter, node_ids: list[NodeId]) -> list[list[Any]]:
-    """Forward hierarchical references of each node, following BrowseNext to the end."""
+async def _browse_batch(
+    rpc: _Counter, node_ids: list[NodeId], retry: bool = True
+) -> tuple[list[list[Any]], dict[int, str]]:
+    """Forward hierarchical references of each node, following BrowseNext to the end.
+
+    One request needs a continuation point per large node, and a small server
+    holds few (5-10): past its cap a node gets BadNoContinuationPoints and no
+    references. Those are browsed again one per request once the batch's own
+    points are released, so at most one is held.
+
+    Returns:
+        (references per node, index -> status name of each node that failed)
+    """
     params = ua.BrowseParameters()
     params.View = ua.ViewDescription()
     # asyncua defaults the view Timestamp to now; the .NET stack reads that as a
@@ -247,8 +263,19 @@ async def _browse_batch(rpc: _Counter, node_ids: list[NodeId]) -> list[list[Any]
         )
         params.NodesToBrowse.append(desc)
     results = await rpc.browse(params)
-    refs = [list(r.References or []) for r in results]
-    pending = {i: r.ContinuationPoint for i, r in enumerate(results) if r.ContinuationPoint}
+    refs: list[list[Any]] = [[] for _ in node_ids]
+    failed: dict[int, str] = {}
+    no_point: list[int] = []
+    pending: dict[int, bytes] = {}
+    for i, r in enumerate(results):
+        if r.StatusCode.value == _NO_CONTINUATION_POINTS and retry:
+            no_point.append(i)
+        elif not r.StatusCode.is_good():
+            failed[i] = r.StatusCode.name
+        else:
+            refs[i].extend(r.References or [])
+            if r.ContinuationPoint:
+                pending[i] = r.ContinuationPoint
     while pending:
         next_params = ua.BrowseNextParameters()
         next_params.ReleaseContinuationPoints = False
@@ -256,14 +283,21 @@ async def _browse_batch(rpc: _Counter, node_ids: list[NodeId]) -> list[list[Any]
         page = await rpc.browse_next(next_params)
         cont = {}
         for i, r in zip(pending, page, strict=True):
+            if not r.StatusCode.is_good():
+                failed[i] = r.StatusCode.name  # the pages so far are kept
+                continue
             refs[i].extend(r.References or [])
             if r.ContinuationPoint:
                 cont[i] = r.ContinuationPoint
         pending = cont
-    return refs
+    for i in no_point:
+        ([refs[i]], again) = await _browse_batch(rpc, [node_ids[i]], retry=False)
+        if again:
+            failed[i] = again[0]
+    return refs, failed
 
 
-async def walk(rpc: _Counter, chunk: int) -> list[Found]:
+async def walk(rpc: _Counter, chunk: int) -> tuple[list[Found], list[str]]:
     """Breadth-first from Objects over forward hierarchical references.
 
     Not followed: the Server object (i=2253, the server's own diagnostics), any
@@ -273,16 +307,23 @@ async def walk(rpc: _Counter, chunk: int) -> list[Found]:
     Variable are recorded for describe. Variables are browsed too: struct
     members hang off their parent Variable. A node reached twice is visited
     once, which also breaks reference cycles.
+
+    Returns:
+        (Variables found, `path (status)` of each node whose browse failed)
     """
     objects = NodeId(_IDS.ObjectsFolder)
     visited = {objects, NodeId(_IDS.Server)}
     frontier: list[tuple[NodeId, tuple[str, ...], Found | None]] = [(objects, (), None)]
     found: list[Found] = []
+    failed: list[str] = []
     while frontier:
         next_frontier: list[tuple[NodeId, tuple[str, ...], Found | None]] = []
         for start in range(0, len(frontier), chunk):
             batch = frontier[start : start + chunk]
-            pages = await _browse_batch(rpc, [node_id for node_id, _, _ in batch])
+            pages, bad = await _browse_batch(rpc, [node_id for node_id, _, _ in batch])
+            failed += [
+                f"{'/'.join(batch[i][1]) or 'Objects'} ({status})" for i, status in bad.items()
+            ]
             for (_, path, parent), refs in zip(batch, pages, strict=True):
                 for ref in refs:
                     name = ref.BrowseName.Name
@@ -308,7 +349,7 @@ async def walk(rpc: _Counter, chunk: int) -> list[Found]:
                         found.append(var)
                         next_frontier.append((node_id, (*path, name), var))
         frontier = next_frontier
-    return found
+    return found, failed
 
 
 def _local(node_id: Any) -> NodeId:
@@ -527,13 +568,14 @@ async def discover(
     """
     started = time.monotonic()
     rpc = _Counter(client)
-    found = await walk(rpc, browse_chunk)
+    found, browse_failed = await walk(rpc, browse_chunk)
     described, skipped = await describe(rpc, found, read_chunk)
     events, renames = assign_names(described, namespaces, max_event_bytes)
     return Discovery(
         node_map=NodeMap(events=events, name=name, description="discovered"),
         skipped=skipped,
         renames=renames,
+        browse_failed=browse_failed,
         requests=rpc.requests,
         seconds=time.monotonic() - started,
     )

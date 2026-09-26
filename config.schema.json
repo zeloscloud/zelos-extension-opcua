@@ -50,10 +50,29 @@
           "poll_interval": {
             "type": "number",
             "title": "Poll Interval (seconds)",
-            "description": "How often to poll nodes for value changes",
+            "description": "Sampling and publishing interval of this server's subscriptions, the poll period of anything polled, and the period of the _server health read. A node map event can set its own.",
             "default": 1.0,
             "minimum": 0.1,
             "maximum": 60.0
+          },
+          "transport": {
+            "type": "string",
+            "title": "Transport",
+            "description": "'default' uses Advanced > Transport.",
+            "enum": [
+              "default",
+              "subscription",
+              "poll"
+            ],
+            "default": "default"
+          },
+          "min_update_interval": {
+            "type": "number",
+            "title": "Min Update Interval (seconds)",
+            "description": "0 uses Advanced > Min Update Interval.",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 3600
           },
           "security_mode": {
             "type": "string",
@@ -165,6 +184,24 @@
           "title": "Discovery",
           "description": "For a server without a node map, browse it on every connect and trace every scalar variable found (read-only). Off: such a server polls nothing.",
           "default": true
+        },
+        "transport": {
+          "type": "string",
+          "title": "Transport",
+          "description": "'subscription': the server pushes value changes (monitored items), and anything it refuses (item or subscription limits) is polled for that connection with one warning. 'poll': batched Reads every interval for every node.",
+          "enum": [
+            "subscription",
+            "poll"
+          ],
+          "default": "subscription"
+        },
+        "min_update_interval": {
+          "type": "number",
+          "title": "Min Update Interval (seconds)",
+          "description": "With subscriptions, a node that reports nothing for this long (a static value, or a server that stopped reporting it) is re-read and logged at the server's read time.",
+          "default": 60.0,
+          "minimum": 1.0,
+          "maximum": 3600
         },
         "certificate_file": {
           "type": "string",

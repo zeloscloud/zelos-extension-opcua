@@ -9,13 +9,18 @@ The node map format uses user-defined events to group nodes semantically:
       {"name": "sensor1", "node_id": "ns=2;s=Temp.S1", "datatype": "float32"},
       {"name": "sensor2", "node_id": "ns=2;i=1001", "datatype": "float32"}
     ],
-    "status": [
-      {"name": "running", "node_id": "ns=2;s=Status.Running", "datatype": "bool"}
-    ]
+    "status": {
+      "poll_interval": 0.1,
+      "nodes": [
+        {"name": "running", "node_id": "ns=2;s=Status.Running", "datatype": "bool"}
+      ]
+    }
   }
 }
 
 Event names become Zelos trace events. Node names become fields within those events.
+An event is a node list, or an object with `nodes` and an optional `poll_interval`
+(seconds) overriding the server's for that event.
 
 Required fields per node: node_id, name
 Optional fields: datatype (default: float32), unit, scale (default: 1.0),
@@ -59,6 +64,9 @@ DATATYPES = {
     "float64": 8,
     "string": 0,  # Variable length
 }
+
+# Floor for any poll_interval: Siemens' minimum sampling interval, and the schema's.
+MIN_POLL_INTERVAL = 0.1
 
 # ns=<index> or nsu=<percent-encoded uri>, then [s=<string>|i=<int>|g=<guid>|b=<opaque>].
 # A literal ';' in the URI must be %3B-encoded (OPC 10000-6), so the URI ends at the first ';'.
@@ -175,6 +183,8 @@ class NodeMap:
     events: dict[str, list[Node]] = field(default_factory=dict)
     name: str = "opcua"
     description: str = ""
+    # Event name -> poll_interval seconds, for events that override the server's.
+    intervals: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_file(cls, path: str | Path) -> NodeMap:
@@ -214,16 +224,36 @@ class NodeMap:
             NodeMap instance
 
         Raises:
-            ValueError: On a duplicate event name, or a duplicate node name
-                within one event
+            ValueError: On a duplicate event name, a duplicate node name within
+                one event, or a malformed event object
         """
         events: dict[str, list[Node]] = {}
+        intervals: dict[str, float] = {}
 
-        for raw_event_name, nodes_data in data.get("events", {}).items():
+        for raw_event_name, event_data in data.get("events", {}).items():
             event_name = sanitize_name(raw_event_name, kind="event")
             if event_name in events:
                 msg = f"Duplicate event name '{event_name}' after sanitization"
                 raise ValueError(msg)
+            nodes_data = event_data
+            if isinstance(event_data, dict):
+                # A misspelled key would otherwise be dropped without a word.
+                unknown = sorted(set(event_data) - {"nodes", "poll_interval"})
+                if unknown:
+                    raise ValueError(f"Event '{event_name}': unknown keys {', '.join(unknown)}")
+                nodes_data = event_data.get("nodes", [])
+                if "poll_interval" in event_data:
+                    interval = event_data["poll_interval"]
+                    if (
+                        isinstance(interval, bool)
+                        or not isinstance(interval, (int, float))
+                        or interval < MIN_POLL_INTERVAL
+                    ):
+                        raise ValueError(
+                            f"Event '{event_name}': poll_interval must be a number of "
+                            f"seconds >= {MIN_POLL_INTERVAL}, got {interval!r}"
+                        )
+                    intervals[event_name] = float(interval)
 
             nodes = []
             seen: set[str] = set()
@@ -251,28 +281,27 @@ class NodeMap:
             events=events,
             name=sanitize_name(data.get("name", "opcua"), kind="source"),
             description=data.get("description", ""),
+            intervals=intervals,
         )
 
     def to_dict(self) -> dict[str, Any]:
         """The map in its JSON file shape; `from_dict` reads it back."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "events": {
-                event: [
-                    {
-                        "name": n.name,
-                        "node_id": n.node_id,
-                        "datatype": n.datatype,
-                        "unit": n.unit,
-                        "description": n.description,
-                        "writable": n.writable,
-                    }
-                    for n in nodes
-                ]
-                for event, nodes in self.events.items()
-            },
-        }
+        events: dict[str, Any] = {}
+        for event, nodes in self.events.items():
+            rows = [
+                {
+                    "name": n.name,
+                    "node_id": n.node_id,
+                    "datatype": n.datatype,
+                    "unit": n.unit,
+                    "description": n.description,
+                    "writable": n.writable,
+                }
+                for n in nodes
+            ]
+            interval = self.intervals.get(event)
+            events[event] = rows if interval is None else {"poll_interval": interval, "nodes": rows}
+        return {"name": self.name, "description": self.description, "events": events}
 
     def to_csv(self) -> str:
         """One row per node: event,name,node_id,datatype,unit,description."""
