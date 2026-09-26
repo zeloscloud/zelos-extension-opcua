@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Demo namespace
 DEMO_NAMESPACE = "urn:zelos:demo:plc"
 
+# Building the address space takes well under a second; this only bounds a hang.
+DEMO_START_TIMEOUT = 15.0
+
 
 class PLCSimulator:
     """Simulates a PLC with various sensors and actuators."""
@@ -257,7 +260,20 @@ async def create_demo_server(
 
     # Register namespace
     idx = await server.register_namespace(DEMO_NAMESPACE)
+    simulator, updater, node_vars = await populate_demo(server, idx)
+    return server, simulator, updater, node_vars
 
+
+async def populate_demo(server: Server, idx: int) -> tuple[PLCSimulator, SimulatorUpdater, dict]:
+    """Build the DemoPLC address space in namespace `idx`.
+
+    Args:
+        server: Initialized server
+        idx: Namespace index for the demo nodes
+
+    Returns:
+        Tuple of (simulator, updater, node_vars)
+    """
     # Get Objects node
     objects = server.nodes.objects
 
@@ -383,13 +399,14 @@ async def create_demo_server(
     simulator = PLCSimulator()
     updater = SimulatorUpdater(simulator, node_vars, node_types, interval=0.1)
 
-    return server, simulator, updater, node_vars
+    return simulator, updater, node_vars
 
 
 async def run_demo_server(
     host: str = "127.0.0.1",
     port: int = 4840,
     running_flag: asyncio.Event | None = None,
+    ready: threading.Event | None = None,
 ) -> None:
     """Run the demo OPC-UA server.
 
@@ -397,12 +414,15 @@ async def run_demo_server(
         host: Server bind address
         port: Server port
         running_flag: Optional event to signal shutdown
+        ready: Set once the server accepts connections
     """
     server, simulator, updater, node_vars = await create_demo_server(host, port)
 
     async with server:
         await updater.start()
         logger.info(f"Demo OPC-UA server started on opc.tcp://{host}:{port}")
+        if ready is not None:
+            ready.set()
 
         try:
             while True:
@@ -414,7 +434,7 @@ async def run_demo_server(
 
 
 def start_demo_server_thread(host: str = "127.0.0.1", port: int = 4840) -> threading.Thread:
-    """Start the demo server in a background thread.
+    """Start the demo server in a background thread; return once it is listening.
 
     Args:
         host: Server bind address
@@ -422,7 +442,12 @@ def start_demo_server_thread(host: str = "127.0.0.1", port: int = 4840) -> threa
 
     Returns:
         The server thread
+
+    Raises:
+        RuntimeError: If the server is not up within DEMO_START_TIMEOUT
     """
+    ready = threading.Event()
+    errors: list[Exception] = []
 
     def run_server() -> None:
         """Run the server in its own event loop."""
@@ -430,17 +455,18 @@ def start_demo_server_thread(host: str = "127.0.0.1", port: int = 4840) -> threa
         asyncio.set_event_loop(loop)
 
         try:
-            loop.run_until_complete(run_demo_server(host, port))
+            loop.run_until_complete(run_demo_server(host, port, ready=ready))
         except Exception as e:
+            errors.append(e)
             logger.error(f"Demo server error: {e}")
         finally:
+            ready.set()  # a failed start must not hold the caller for the timeout
             loop.close()
 
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
-    logger.info(f"Demo server thread started on opc.tcp://{host}:{port}")
-
-    # Give server time to start
-    time.sleep(1.0)
-
+    # The client's first connect would otherwise race the bind and back off 3s.
+    if not ready.wait(DEMO_START_TIMEOUT) or errors:
+        reason = errors[0] if errors else "timed out"
+        raise RuntimeError(f"Demo server did not start on opc.tcp://{host}:{port}: {reason}")
     return thread

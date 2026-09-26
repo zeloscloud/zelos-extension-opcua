@@ -1,0 +1,315 @@
+"""Secure sessions end to end against the in-process simulator."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import shutil
+from pathlib import Path
+
+import pytest
+from asyncua.crypto.cert_gen import (
+    dump_private_key_as_pem,
+    generate_private_key,
+    generate_self_signed_app_certificate,
+)
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.x509.oid import ExtendedKeyUsageOID
+
+from zelos_extension_opcua import client as client_mod
+from zelos_extension_opcua.cli import app
+from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, thumbprint
+from zelos_extension_opcua.demo.sim_server import Simulator
+from zelos_extension_opcua.discovery import HEALTH_EVENT
+from zelos_extension_opcua.node_map import NodeMap
+
+SESSION_SERVICES = {"CreateSession", "ActivateSession"}
+
+
+@pytest.fixture(autouse=True)
+def pki(tmp_path, monkeypatch) -> Path:
+    """Generated client identity lands in tmp_path, never the real home dir."""
+    pki_dir = tmp_path / "pki"
+    monkeypatch.setattr(client_mod, "PKI_DIR", pki_dir)
+    return pki_dir
+
+
+def secure_client(sim: Simulator, mode: str = "SignAndEncrypt", **kwargs) -> OPCUAClient:
+    return OPCUAClient(
+        endpoint=sim.endpoint, security_mode=mode, security_policy="Basic256Sha256", **kwargs
+    )
+
+
+def session_requests(sim: Simulator) -> list[str]:
+    return [svc for _, svc in sim.request_log if svc in SESSION_SERVICES]
+
+
+def user_cert(directory: Path, name: str = "operator") -> dict[str, str]:
+    """An operator-issued user identity: DER cert and PEM key in `directory`."""
+    directory.mkdir(parents=True, exist_ok=True)
+    key = generate_private_key()
+    cert = generate_self_signed_app_certificate(
+        key, name, {}, [x509.UniformResourceIdentifier(f"urn:{name}")],
+        [ExtendedKeyUsageOID.CLIENT_AUTH],
+    )  # fmt: skip
+    cert_path, key_path = directory / f"{name}.der", directory / f"{name}.pem"
+    cert_path.write_bytes(cert.public_bytes(Encoding.DER))
+    key_path.write_bytes(dump_private_key_as_pem(key))
+    return {"user_certificate_file": str(cert_path), "user_private_key_file": str(key_path)}
+
+
+def errors(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+@pytest.mark.parametrize("mode", ["Sign", "SignAndEncrypt"])
+async def test_generated_cert_session_and_reuse(pki, mode):
+    node_map = NodeMap.from_file(app.get_demo_node_map_path())
+    thumbprints = []
+    async with Simulator(port=0, secure=True) as sim:
+        for _ in range(2):
+            client = secure_client(sim, mode, node_map=node_map)
+            assert await client.connect() is True
+            try:
+                results = await client._poll_nodes()
+                assert sum(len(v) for e, v in results.items() if e != HEALTH_EVENT) == len(
+                    node_map.nodes
+                )
+            finally:
+                await client.disconnect()
+            thumbprints.append(thumbprint(client._identity[0]))
+        assert list(sim.sessions.values()) == [(mode, "Basic256Sha256")] * 2
+
+    assert thumbprints[0] == thumbprints[1]
+    assert thumbprints[0] == thumbprint((pki / client_mod.CLIENT_CERT_FILE).read_bytes())
+    assert (pki / client_mod.CLIENT_KEY_FILE).stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.parametrize(
+    ("secure", "policy", "offers"),
+    [
+        (False, "Basic256Sha256", "it offers None/None"),
+        (True, "Aes256Sha256RsaPss", "Sign/Basic256Sha256, SignAndEncrypt/Basic256Sha256"),
+    ],
+)
+async def test_unoffered_security_is_refused_not_downgraded(caplog, secure, policy, offers):
+    async with Simulator(port=0, secure=secure) as sim:
+        client = OPCUAClient(
+            endpoint=sim.endpoint, security_mode="SignAndEncrypt", security_policy=policy
+        )
+        assert await client.connect() is False
+        assert not sim.sessions
+        assert session_requests(sim) == []
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any(f"does not offer SignAndEncrypt/{policy}" in e and offers in e for e in errors)
+
+
+async def test_strict_server_certificate(tmp_path, caplog):
+    async with Simulator(port=0, secure=True) as sim:
+        # Pinned as PEM: the server hands out DER, so this also covers format handling.
+        server_der = (sim._pki / "server_cert.der").read_bytes()
+        pinned = tmp_path / "server.pem"
+        pinned.write_bytes(x509.load_der_x509_certificate(server_der).public_bytes(Encoding.PEM))
+        client = secure_client(
+            sim, server_certificate="strict", server_certificate_file=str(pinned)
+        )
+        assert await client.connect() is True
+        await client.disconnect()
+        assert len(sim.sessions) == 1
+
+        other, _ = client_mod.ensure_client_certificate(tmp_path / "other")
+        before = len(sim.request_log)
+        client = secure_client(sim, server_certificate="strict", server_certificate_file=str(other))
+        assert await client.connect() is False
+        assert [s for _, s in sim.request_log[before:] if s in SESSION_SERVICES] == []
+        assert len(sim.sessions) == 1
+
+    expected, actual = thumbprint(other.read_bytes()), thumbprint(server_der)
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any(actual in e and expected in e for e in errors)
+
+
+async def test_trust_list_rejects_until_cert_is_trusted(tmp_path, pki, caplog):
+    trust = tmp_path / "trusted"
+    trust.mkdir()
+    async with Simulator(port=0, secure=True, trust_dir=trust) as sim:
+        client = secure_client(sim)
+        assert await client.connect() is False
+        assert not sim.sessions
+        rejected = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("rejected client certificate" in e for e in rejected)
+
+        shutil.copy(pki / client_mod.CLIENT_CERT_FILE, trust)
+        assert await client.connect() is True
+        await client.disconnect()
+        assert list(sim.sessions.values()) == [("SignAndEncrypt", "Basic256Sha256")]
+
+
+SECURE = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}
+PLC = {"endpoint": "opc.tcp://plc:4840"}
+
+
+def resolve(config: dict) -> list[OPCUAClient]:
+    return app.build_clients(app.resolve_servers(config, app.resolve_advanced(config)))
+
+
+@pytest.mark.parametrize(
+    ("advanced", "server", "reason"),
+    [
+        ({}, {"security_mode": "Sign", "security_policy": "None"}, "'plc': invalid security"),
+        ({"certificate_file": "c.der"}, {}, "set together"),
+        ({}, {"server_certificate": "strict"}, "'plc': invalid security configuration: server"),
+        (
+            {},
+            {
+                "security_mode": "None",
+                "server_certificate": "strict",
+                "server_certificate_file": "s",
+            },
+            "strict needs security_mode",
+        ),
+        ({"user_private_key_file": "u.pem"}, {}, "user_private_key_file must be set"),
+        ({}, {"endpoint": "opc.tcp://ok:4841"}, "opc.tcp://ok:4840 and opc.tcp://ok:4841 both"),
+        (
+            {},
+            {"name": " ok "},
+            "opc.tcp://ok:4840 and opc.tcp://plc:4840 both resolve to name 'ok'",
+        ),
+    ],
+)
+def test_invalid_server_config_exits(caplog, advanced, server, reason):
+    """Validated per server on its effective settings; an error names the server."""
+    config = {
+        "advanced": {**SECURE, **advanced},
+        "servers": [{"endpoint": "opc.tcp://ok:4840"}, {**PLC, **server}],
+    }
+    with pytest.raises(SystemExit) as exc:
+        resolve(config)
+    assert exc.value.code == 1
+    assert any(reason in e for e in errors(caplog))
+
+
+def test_inherited_user_cert_on_downgraded_server_exits(tmp_path, caplog):
+    config = {
+        "advanced": {**SECURE, **user_cert(tmp_path)},
+        "servers": [{"endpoint": "opc.tcp://ok:4840"}, {**PLC, "security_mode": "None"}],
+    }
+    with pytest.raises(SystemExit):
+        resolve(config)
+    assert errors(caplog) == [
+        "Server 'plc': invalid security configuration: "
+        "a user certificate needs security_mode Sign or SignAndEncrypt"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("config", "reason"),
+    [
+        (
+            {"endpoint": "opc.tcp://plc:4840", "username": "admin", "advanced": {}},
+            "Config format changed: servers are now listed under servers[]",
+        ),
+        ({"servers": []}, "No servers configured"),
+    ],
+)
+def test_config_shape_exits(caplog, config, reason):
+    with pytest.raises(SystemExit) as exc:
+        resolve(config)
+    assert exc.value.code == 1
+    assert len(errors(caplog)) == 1 and reason in errors(caplog)[0]
+
+
+def test_defaults_match_schema():
+    schema = json.loads((Path(__file__).parents[1] / "config.schema.json").read_text())
+    props = schema["properties"]
+    for defaults, obj in (
+        (app.ADVANCED_DEFAULTS, props["advanced"]),
+        (app.SERVER_DEFAULTS, props["servers"]["items"]),
+    ):
+        assert {k: v["default"] for k, v in obj["properties"].items()} == defaults
+
+
+@pytest.mark.parametrize(("days", "warns"), [(10, True), (client_mod.CLIENT_CERT_DAYS, False)])
+def test_cert_expiry_is_announced(monkeypatch, caplog, days, warns):
+    monkeypatch.setattr(client_mod, "CLIENT_CERT_DAYS", days)
+    caplog.set_level(logging.INFO)
+    OPCUAClient(endpoint="opc.tcp://unused:4840")._client_identity()
+    assert any("expires" in r.getMessage() for r in caplog.records if r.levelno == logging.INFO)
+    warned = any(
+        "expires" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    )
+    assert warned is warns
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_user_certificate_identity(tmp_path, caplog, trusted):
+    users = tmp_path / "users"
+    users.mkdir()
+    identity = user_cert(users if trusted else tmp_path / "other")
+    user_der = Path(identity["user_certificate_file"]).read_bytes()
+    node_map = NodeMap.from_file(app.get_demo_node_map_path())
+    async with Simulator(port=0, secure=True, user_cert_dir=users) as sim:
+        client = secure_client(sim, node_map=node_map, **identity)
+        assert await client.connect() is trusted
+        if trusted:
+            try:
+                results = await client._poll_nodes()
+                assert sum(len(v) for e, v in results.items() if e != HEALTH_EVENT) == len(
+                    node_map.nodes
+                )
+            finally:
+                await client.disconnect()
+            assert list(sim.identities.values()) == [f"certificate:{thumbprint(user_der)}"]
+        else:
+            assert sim.identities == {}
+            assert any(
+                f"rejected user certificate SHA-1 {thumbprint(user_der)} (BadUserAccessDenied)" in e
+                for e in errors(caplog)
+            )
+
+
+async def test_user_certificate_refused_without_server_policy(tmp_path, caplog):
+    async with Simulator(port=0, secure=True) as sim:
+        client = secure_client(sim, **user_cert(tmp_path))
+        assert await client.connect() is False
+        assert session_requests(sim) == []
+    assert any(
+        "does not accept user certificates" in e and "it offers Anonymous, UserName" in e
+        for e in errors(caplog)
+    )
+
+
+async def test_per_server_security_inherits_or_overrides(caplog):
+    """Secure default inherited by one server, explicitly downgraded on the other."""
+    demo_map = str(app.get_demo_node_map_path())
+    async with Simulator(port=0, secure=True) as sec, Simulator(port=0) as plain:
+        config = {
+            "advanced": SECURE,
+            "servers": [
+                {"name": "sec", "endpoint": sec.endpoint, "node_map_file": demo_map},
+                {
+                    "name": "plain",
+                    "endpoint": plain.endpoint,
+                    "node_map_file": demo_map,
+                    "security_mode": "None",
+                },
+            ],
+        }
+        runner = OPCUARunner(resolve(config))
+        for client in runner.clients.values():
+            client.start()
+        task = asyncio.create_task(runner._run_async())
+        try:
+            async with asyncio.timeout(15.0):
+                while not all(c._poll_count for c in runner.clients.values()):
+                    await asyncio.sleep(0.05)
+        finally:
+            runner.stop()
+            await asyncio.wait_for(task, 10.0)
+        assert list(sec.sessions.values()) == [("SignAndEncrypt", "Basic256Sha256")]
+        assert list(plain.sessions.values()) == [("None", "None")]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    downgrades = [w for w in warnings if "overrides the advanced default SignAndEncrypt" in w]
+    assert downgrades and all(w.startswith("[plain] ") for w in downgrades)

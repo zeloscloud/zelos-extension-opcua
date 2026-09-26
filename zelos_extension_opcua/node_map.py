@@ -21,13 +21,16 @@ Required fields per node: node_id, name
 Optional fields: datatype (default: float32), unit, scale (default: 1.0),
   writable (default: None = auto-detect)
 
-Map name, event names, and node names are sanitized at load (see `sanitize_name`)
-and must be unique after sanitization - see `NodeMap.from_dict`.
+Map name, event names, and node names are sanitized at load (see `sanitize_name`).
+Event names must be unique, and node names unique within their event - see
+`NodeMap.from_dict`.
 """
 
 from __future__ import annotations
 
 import base64
+import csv
+import io
 import json
 import logging
 import re
@@ -35,6 +38,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import zelos_sdk
 
@@ -56,8 +60,9 @@ DATATYPES = {
     "string": 0,  # Variable length
 }
 
-# OPC-UA node ID pattern: ns=<namespace>;[s=<string>|i=<int>|g=<guid>|b=<opaque>]
-NODE_ID_PATTERN = re.compile(r"^ns=(\d+);([sigb])=(.+)$")
+# ns=<index> or nsu=<percent-encoded uri>, then [s=<string>|i=<int>|g=<guid>|b=<opaque>].
+# A literal ';' in the URI must be %3B-encoded (OPC 10000-6), so the URI ends at the first ';'.
+NODE_ID_PATTERN = re.compile(r"^(?:ns=(\d+)|nsu=([^;]+));([sigb])=(.+)$")
 
 
 def sanitize_name(name: str, kind: str = "field") -> str:
@@ -70,7 +75,7 @@ def sanitize_name(name: str, kind: str = "field") -> str:
     return zelos_sdk.sanitize_name(name, kind=kind)
 
 
-def parse_node_id(node_id: str) -> tuple[int, str, str | int | uuid.UUID | bytes]:
+def parse_node_id(node_id: str) -> tuple[int | str, str, str | int | uuid.UUID | bytes]:
     """Parse an OPC-UA node ID string into its converted identifier.
 
     The identifier is converted here, at map load, not at connect time. An
@@ -78,23 +83,24 @@ def parse_node_id(node_id: str) -> tuple[int, str, str | int | uuid.UUID | bytes
     failed" and sent the operator after the network instead of the map entry.
 
     Args:
-        node_id: Node ID string in format ns=X;Y=Z
+        node_id: Node ID string, ns=X;Y=Z or nsu=<uri>;Y=Z
 
     Returns:
-        Tuple of (namespace_index, identifier_type, identifier), the identifier
-        already typed for asyncua's NodeId (int, uuid.UUID, bytes or str)
+        Tuple of (namespace, identifier_type, identifier). The namespace is the
+        index for ns=, or the percent-decoded URI for nsu=, which the client
+        resolves against the server's NamespaceArray. The identifier is already
+        typed for asyncua's NodeId (int, uuid.UUID, bytes or str).
 
     Raises:
         ValueError: If the format or the identifier itself is invalid
     """
     match = NODE_ID_PATTERN.match(node_id)
     if not match:
-        msg = f"Invalid node ID format: '{node_id}'. Expected ns=X;[s|i|g|b]=Y"
+        msg = f"Invalid node ID format: '{node_id}'. Expected ns=X|nsu=URI;[s|i|g|b]=Y"
         raise ValueError(msg)
 
-    namespace = int(match.group(1))
-    id_type = match.group(2)
-    raw = match.group(3)
+    index, uri, id_type, raw = match.groups()
+    namespace: int | str = int(index) if index is not None else unquote(uri)
 
     if id_type == "i":
         try:
@@ -112,6 +118,14 @@ def parse_node_id(node_id: str) -> tuple[int, str, str | int | uuid.UUID | bytes
         except Exception as e:
             raise ValueError(f"Invalid base64 opaque ID in node ID '{node_id}': {e}") from e
     return namespace, id_type, raw
+
+
+def format_nsu_node_id(uri: str, identifier: str) -> str:
+    """Build `nsu=<uri>;<identifier>`, the inverse of parse_node_id's nsu= branch.
+
+    '%' is encoded too, so a URI that already holds a %XX sequence round-trips.
+    """
+    return f"nsu={uri.replace('%', '%25').replace(';', '%3B')};{identifier}"
 
 
 @dataclass
@@ -136,8 +150,8 @@ class Node:
         parse_node_id(self.node_id)
 
     @property
-    def namespace(self) -> int:
-        """Get namespace index from node ID."""
+    def namespace(self) -> int | str:
+        """Namespace index (ns=) or URI (nsu=) from the node ID."""
         ns, _, _ = parse_node_id(self.node_id)
         return ns
 
@@ -189,6 +203,10 @@ class NodeMap:
         hard error rather than a warning: silently clobbering one node with
         another produces a trace that is missing data while looking healthy.
 
+        A node name may repeat across events, as a field does across trace
+        events: N identical devices under one gateway would otherwise need N
+        renamed copies of every tag. `get_by_name` takes `<event>/<name>` for those.
+
         Args:
             data: Dictionary with event/node definitions
 
@@ -197,10 +215,9 @@ class NodeMap:
 
         Raises:
             ValueError: On a duplicate event name, or a duplicate node name
-                anywhere in the map (get_by_name must stay unambiguous)
+                within one event
         """
         events: dict[str, list[Node]] = {}
-        seen_nodes: dict[str, str] = {}  # sanitized node name -> owning event
 
         for raw_event_name, nodes_data in data.get("events", {}).items():
             event_name = sanitize_name(raw_event_name, kind="event")
@@ -209,17 +226,13 @@ class NodeMap:
                 raise ValueError(msg)
 
             nodes = []
+            seen: set[str] = set()
             for node_data in nodes_data:
                 name = sanitize_name(node_data["name"])
-                prior = seen_nodes.get(name)
-                if prior is not None:
-                    msg = (
-                        f"Duplicate node name '{name}' in event '{event_name}' "
-                        f"(already defined in event '{prior}'). Node names must be "
-                        "unique across the whole map."
-                    )
+                if name in seen:
+                    msg = f"Duplicate node name '{name}' in event '{event_name}'"
                     raise ValueError(msg)
-                seen_nodes[name] = event_name
+                seen.add(name)
 
                 nodes.append(
                     Node(
@@ -239,6 +252,37 @@ class NodeMap:
             name=sanitize_name(data.get("name", "opcua"), kind="source"),
             description=data.get("description", ""),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """The map in its JSON file shape; `from_dict` reads it back."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "events": {
+                event: [
+                    {
+                        "name": n.name,
+                        "node_id": n.node_id,
+                        "datatype": n.datatype,
+                        "unit": n.unit,
+                        "description": n.description,
+                        "writable": n.writable,
+                    }
+                    for n in nodes
+                ]
+                for event, nodes in self.events.items()
+            },
+        }
+
+    def to_csv(self) -> str:
+        """One row per node: event,name,node_id,datatype,unit,description."""
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(("event", "name", "node_id", "datatype", "unit", "description"))
+        for event, nodes in self.events.items():
+            for n in nodes:
+                writer.writerow((event, n.name, n.node_id, n.datatype, n.unit, n.description))
+        return buf.getvalue()
 
     @property
     def nodes(self) -> list[Node]:
@@ -265,20 +309,30 @@ class NodeMap:
         return self.events.get(event_name, [])
 
     def get_by_name(self, name: str) -> Node | None:
-        """Find node by name across all events.
+        """Find a node by name, or by `<event>/<name>`.
 
         Args:
             name: Sanitized node name, i.e. the name that appears in traces and
-                in `list_nodes` output
+                in `list_nodes` output, optionally qualified by its event
 
         Returns:
             Node if found, None otherwise
+
+        Raises:
+            ValueError: If a bare name is in several events
         """
-        for nodes in self.events.values():
-            for node in nodes:
-                if node.name == name:
-                    return node
-        return None
+        event, _, bare = name.rpartition("/")
+        matches = [
+            (event_name, node)
+            for event_name, nodes in self.events.items()
+            if not event or event_name == event
+            for node in nodes
+            if node.name == bare
+        ]
+        if len(matches) > 1:
+            choices = ", ".join(f"{e}/{n.name}" for e, n in matches)
+            raise ValueError(f"Node name '{name}' is in several events; use one of: {choices}")
+        return matches[0][1] if matches else None
 
     def get_by_node_id(self, node_id: str) -> Node | None:
         """Find node by OPC-UA node ID.
