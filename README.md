@@ -1,24 +1,25 @@
 # Zelos OPC-UA Extension
 
-Polls OPC-UA servers into Zelos trace events, and exposes read/write/browse as Zelos actions.
+Traces OPC-UA servers into Zelos trace events, by subscription or polling, and exposes read/write/browse as Zelos actions.
 
 ## Features
 
 | Feature | Detail |
 |---------|--------|
 | Discovery | A server without a node map is browsed on every connect and every scalar variable traced (read-only) |
-| Batch polling | Every node in one read request per min(MaxNodesPerRead, 100) nodes per cycle; a bad node is reported once and skipped |
+| Subscriptions | One per distinct interval; what the server refuses is polled instead, with one WARNING |
+| Batch polling | min(MaxNodesPerRead, 100) nodes per Read, the Reads of one interval spread across it; a bad node is reported once and skipped |
+| Source timestamps | Every sample is logged at its SourceTimestamp, else ServerTimestamp, else receipt |
 | Server health | Event `server` per server: state, clock skew, service level, session and rejected-request counts |
 | Auto-configure | The config form's button finds local and mDNS-announced servers and picks their security |
-| Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed poll |
+| Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request |
 | Node mapping | JSON file groups nodes into trace events and fields |
 | Data types | bool, int8-64, uint8-64, float32/64, string |
 | Security | None / Sign / SignAndEncrypt, with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss |
 | Multiple servers | Any number of servers in one extension; one unreachable server never stalls the others |
-| Actions | Read, write, list and browse, live against the polling connection |
+| Actions | Read, write, list and browse, live against the tracing connection |
 | Demo mode | Built-in PLC simulator, no hardware |
 
-Values are read by polling. OPC-UA subscriptions (server-pushed data changes) are not used.
 
 ## Quick Start
 
@@ -37,7 +38,9 @@ uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json
 | `servers[].name` | string | endpoint host | Trace and action name (`plc01`, `192_168_1_10`); must be unique |
 | `servers[].endpoint` | string | `opc.tcp://localhost:4840` | Server endpoint URL |
 | `servers[].node_map_file` | string | `""` | Path to the JSON node map; empty discovers the address space |
-| `servers[].poll_interval` | number | `1.0` | Seconds between poll cycles |
+| `servers[].poll_interval` | number | `1.0` | Seconds: subscription sampling/publishing interval, poll period, `_server` period |
+| `servers[].transport` | string | `default` | `default` (inherit), `subscription`, `poll` |
+| `servers[].min_update_interval` | number | `0` | Seconds; `0` inherits the advanced value |
 | `servers[].security_mode` | string | `default` | `default` (inherit), None, Sign, SignAndEncrypt |
 | `servers[].security_policy` | string | `default` | `default` (inherit), None, Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss |
 | `servers[].user_certificate_file` | string | `""` | User certificate; empty inherits the advanced pair |
@@ -48,6 +51,8 @@ uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json
 | `advanced.timeout` | number | `5.0` | Request timeout in seconds |
 | `advanced.log_level` | string | `INFO` | Logging verbosity; an unknown value falls back to INFO |
 | `advanced.discovery` | boolean | `true` | Browse servers without a node map; off, such a server polls only its health |
+| `advanced.transport` | string | `subscription` | `subscription`: server-pushed changes, polling what is refused; `poll`: batched Reads only |
+| `advanced.min_update_interval` | number | `60` | Seconds a subscribed node may stay silent before it is re-read |
 | `advanced.certificate_file` | string | `""` | Client certificate (DER/PEM), shared by every server; empty generates one |
 | `advanced.private_key_file` | string | `""` | Unencrypted client key (DER/PEM); set with `certificate_file` |
 | `advanced.security_mode` | string | `None` | Default for servers set to `default` |
@@ -68,15 +73,25 @@ A configured `node_map_file` that is missing or unparseable is a startup error: 
 
 ### Discovery
 
-A server without a `node_map_file` is browsed on every connect (Browse, BrowseNext and Read only; nothing written to disk), so program changes appear after a reconnect. The walk follows forward hierarchical references from `Objects`, skipping the `Server` object, Objects whose BrowseName starts with `_` (Kepware `_System`, `_Statistics`, ...) and properties. Every scalar variable of a supported type is traced, read-only; arrays, structs and other types are skipped and counted in one INFO line per connect.
+A server without a `node_map_file` is browsed on every connect (Browse, BrowseNext and Read only; nothing written to disk), so program changes appear after a reconnect. The walk follows forward hierarchical references from `Objects`, skipping the `Server` object, Objects whose BrowseName starts with `_` (Kepware `_System`, `_Statistics`, ...) and properties. Every scalar variable of a supported type is traced, read-only; arrays, structs and other types are skipped and counted in one INFO line per connect. A node refused BadNoContinuationPoints (a server holding few continuation points) is browsed again on its own; one the server cannot browse at all is skipped with one WARNING per connect naming it.
 
 Names: the event is the parent path below `Objects` (`Line1/Motor`), the field the BrowseName. Vendor string ids name the event instead when their last segment is the BrowseName: Kepware `Channel.Device.Tag` and TwinCAT `MAIN.var` (dots), Siemens `"DB"."tag"`, CODESYS `|var|<device>.Application.PLC_PRG.x`, B&R `::Task:Var`. Two variables with one event and field keep the first by node id; later ones get `_<alias>` (another namespace: the URI's last segment, `http://opcfoundation.org/UA/DI/` -> `DI`, stable across restarts) or `_2`, `_3`, with one WARNING per connect. An event added by a reconnect is traced; a field added to an existing event starts a new segment of the trace source (one INFO line; the app joins sequential segments). A field whose datatype changed is skipped until restart, with one WARNING.
 
 `discovered_map` returns the discovered set as a node map (json, `nsu=` ids, `writable: false`) or csv; save the json as a `node_map_file` to pin or edit it.
 
+### Transport and timestamps
+
+`subscription` (default): per server, one subscription per distinct interval (an event's own `poll_interval`, else the server's), sampling = publishing = interval, queue size 1, reporting a change of value or status (no deadband). Items the server refuses (a per-item Bad status such as BadTooManyMonitoredItems or BadNodeIdUnknown, a refused subscription such as BadTooManySubscriptions, an overload) are polled for the rest of the connection, with one WARNING per connect naming the counts. A Publish response the client cannot decode moves every item to polling for the connection, with one WARNING: polling isolates the undecodable node, a Publish cannot. Subscriptions are rebuilt on every connect, after discovery.
+
+`poll`: every node is read in batched Reads (min(MaxNodesPerRead, 100) nodes each) every interval; the Reads of one interval are spread evenly across it. Server cost follows the request count, so batches are never smaller.
+
+A subscription reports changes only. A subscribed node silent for `min_update_interval` (a static value, or a server that stopped reporting it) is re-read in batched Reads; worst case, every node static, ceil(nodes / 100) Reads per `min_update_interval`. The refresh is logged at the Read's ServerTimestamp: the value is confirmed current then.
+
+Every sample is logged at its SourceTimestamp, else ServerTimestamp, else the time it was received. No clock-skew correction is applied; `_server.clock_skew_ms` shows it. Fields of one event with different timestamps are separate rows, so a subscription's rows hold only the fields that changed at that time.
+
 ### Server health
 
-Every server logs event `_server` at its poll interval, in the same read request as its nodes: `state` / `state_name` (ServerStatus.State), `current_time`, `clock_skew_ms` (server CurrentTime minus host time at the read's midpoint), `start_time`, `service_level`, and from ServerDiagnosticsSummary `current_session_count`, `cumulated_session_count`, `rejected_requests_count`, `security_rejected_requests_count`, `current_subscription_count`. A field the server does not publish (diagnostics off) is dropped for the connection.
+Every server logs event `_server` at its poll interval, from one small Read, at host time: `state` / `state_name` (ServerStatus.State), `current_time`, `clock_skew_ms` (server CurrentTime minus host time at the read's midpoint), `start_time`, `service_level`, and from ServerDiagnosticsSummary `current_session_count`, `cumulated_session_count`, `rejected_requests_count`, `security_rejected_requests_count`, `current_subscription_count`. A field the server does not publish (diagnostics off) is dropped for the connection.
 
 ### Auto-configure
 
@@ -100,14 +115,17 @@ Servers are deduplicated by ApplicationUri and named after their ApplicationName
       {"name": "sensor1", "node_id": "ns=2;s=Temperature.Sensor1", "datatype": "float32", "unit": "°C"},
       {"name": "sensor2", "node_id": "ns=2;i=1001", "datatype": "float32", "unit": "°C"}
     ],
-    "status": [
-      {"name": "running", "node_id": "ns=2;s=Status.Running", "datatype": "bool", "writable": true}
-    ]
+    "status": {
+      "poll_interval": 0.2,
+      "nodes": [
+        {"name": "running", "node_id": "ns=2;s=Status.Running", "datatype": "bool", "writable": true}
+      ]
+    }
   }
 }
 ```
 
-`name` is the trace source, event keys are trace events, and node names are fields within them.
+`name` is the trace source, event keys are trace events, and node names are fields within them. An event is a node list, or an object with `nodes` and an optional `poll_interval` (seconds, at least 0.1) overriding the server's for that event.
 
 ### Node Fields
 
@@ -130,7 +148,7 @@ Registered under the `OPC-UA/` prefix (the extension's name in `extension.toml`)
 
 | Action | Description |
 |--------|-------------|
-| `OPC-UA/get_status` | Connection state, poll and error counts; every server's when `server` is omitted |
+| `OPC-UA/get_status` | Connection state, transport with subscribed / polled counts, poll and error counts; every server's when `server` is omitted |
 | `OPC-UA/read_node` | Read by node ID |
 | `OPC-UA/write_node` | Write by node ID; value is text, coerced to the server's type |
 | `OPC-UA/read_named_node` | Read by node map name |
@@ -149,7 +167,7 @@ zelos actions execute OPC-UA/read_named_node --params '{"name":"temp_sensor1","s
 
 Write values are text: `true`/`false`/`1`/`0` for bools, a number for numeric nodes, anything for strings. Unparseable input is rejected before the write is dispatched.
 
-Actions run against the polling loop's live session, so they cost no extra connection - a call made while the extension is stopped raises rather than opening one of its own. They raise on failure; a returned payload always means success.
+Actions run against the extension's live session, so they cost no extra connection - a call made while the extension is stopped raises rather than opening one of its own. They raise on failure; a returned payload always means success.
 
 ## CLI Usage
 
@@ -180,7 +198,7 @@ just sim          # standalone simulator (see Simulator)
 |---|---|
 | `demo` | The demo-mode PLC (`ns=2;s=Temperature.Sensor1`, ...) |
 | `gateway` | Kepware-shaped `ns=2;s=Channel.Device.Tag` (power meter, genset) with `_System` / `_Statistics` noise |
-| `s7` | S7-1500-shaped `ns=3;s="DB"."tag"`; enforced MaxNodesPerBrowse 10, MaxNodesPerRead 20, 10 references per node (BrowseNext), 4 sessions |
+| `s7` | S7-1500-shaped `ns=3;s="DB"."tag"`; enforced MaxNodesPerBrowse 10, MaxNodesPerRead 20, 10 references per node (BrowseNext), 3 continuation points, 4 sessions, 5 subscriptions and 10 monitored items per session |
 | `device` | DI `DeviceSet` identity, EngineeringUnits + EURange, a Double[4] array, a vendor struct, an abstract Number node, a Bad-status node, a reference cycle, a 14-level branch |
 
 | Flag | Effect |

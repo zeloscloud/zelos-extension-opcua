@@ -782,7 +782,7 @@ class TestDemoServerIntegration:
         assert "pressure_sensor1" in results["pressure"]
 
     async def test_poll_uses_one_request(self, client, monkeypatch):
-        """The cycle is one read request, not one per node."""
+        """Polled nodes are one read request per chunk, not one per node."""
         calls = 0
         original = client._client.uaclient.read
 
@@ -792,7 +792,7 @@ class TestDemoServerIntegration:
             return await original(*args, **kwargs)
 
         monkeypatch.setattr(client._client.uaclient, "read", counting)
-        await client._poll_nodes()
+        await client._read_targets(client._poll_targets)
         assert calls == 1
         assert len(client._poll_targets) == len(client.node_map.nodes)
 
@@ -1010,7 +1010,8 @@ class TestReconnection:
 
         client = OPCUAClient(endpoint="opc.tcp://127.0.0.1:14999", poll_interval=0.01)
         client._ensure_connected = fake_connect
-        client._poll_nodes = failing_poll
+        client._poll_health = failing_poll
+        client._jobs = client._schedule({})
         client.start()
         runner = OPCUARunner([client])
         task = asyncio.create_task(runner._run_async())

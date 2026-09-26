@@ -317,6 +317,9 @@ class RecordingSource:
                 writes.append((name, values))
                 event.log(**values)
 
+            def log_at(self, stamp, **values):  # subscription rows: not recorded
+                event.log_at(stamp, **values)
+
         Event.name = event.name
         return Event()
 
@@ -328,6 +331,8 @@ REAL_SOURCE = zelos_sdk.TraceSource
 METER = "ModbusTCP/PowerMeter"
 
 
+# asyncua's server calls a coroutine unawaited when a monitored node is deleted.
+@pytest.mark.filterwarnings("ignore:coroutine 'MonitoredItemService:RuntimeWarning")
 async def test_added_field_rotates_the_shared_source(monkeypatch, caplog):
     """A PLC program change adds a tag to a live folder: every writer moves to a new segment."""
     monkeypatch.setattr(zelos_sdk, "TraceSource", RecordingSource)
@@ -359,6 +364,8 @@ async def test_added_field_rotates_the_shared_source(monkeypatch, caplog):
         await plc.disconnect()
         with caplog.at_level(logging.INFO, logger="zelos_extension_opcua.client"):
             assert await plc._ensure_connected() is True
+        # Resubscribed after the rotation, the added node included.
+        assert plc.status()["subscribed"] == len(plc._poll_targets) == len(plc.node_map.nodes)
         writes_before = len(old.writes)
         plc._log_values(await plc._poll_nodes())
         peer._log_values(await peer._poll_nodes())
@@ -383,3 +390,17 @@ async def test_added_field_rotates_the_shared_source(monkeypatch, caplog):
         logging.WARNING,
         f"[plc] Discovered fields changed datatype, not traced until restart: {METER}: Relay1",
     ) in messages
+
+
+async def test_browse_survives_a_continuation_point_cap(caplog):
+    """s7 holds 3 continuation points a session; a Browse of 10 large folders needs 5."""
+    async with Simulator("s7", port=0, nodes=500) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, name="plc", transport="poll")
+        client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
+        with caplog.at_level(logging.WARNING, logger="zelos_extension_opcua.client"):
+            assert await client.connect() is True
+        await client.disconnect()
+    groups = [e for e in client.node_map.events if e.startswith("Bulk/")]
+    assert len(groups) == 5 and all(len(client.node_map.events[e]) == 100 for e in groups)
+    assert len(client.node_map.nodes) == 19 + 500
+    assert not [r for r in caplog.records if r.name.startswith("zelos") and r.levelno >= 30]

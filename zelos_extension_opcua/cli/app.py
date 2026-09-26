@@ -47,6 +47,8 @@ ADVANCED_DEFAULTS: dict[str, Any] = {
     "user_certificate_file": "",
     "user_private_key_file": "",
     "discovery": True,
+    "transport": "subscription",
+    "min_update_interval": 60.0,
 }
 
 #: Defaults of one `servers[]` entry. "default" / "" inherit from `advanced`.
@@ -61,6 +63,8 @@ SERVER_DEFAULTS: dict[str, Any] = {
     "user_private_key_file": "",
     "server_certificate": "auto",
     "server_certificate_file": "",
+    "transport": "default",
+    "min_update_interval": 0,
 }
 
 TOP_LEVEL_KEYS = frozenset({"demo", "servers", "advanced"})
@@ -120,6 +124,16 @@ def _inherit(server: dict[str, Any], advanced: dict[str, Any]) -> dict[str, Any]
     return effective
 
 
+def _inherit_transport(server: dict[str, Any], advanced: dict[str, Any]) -> dict[str, Any]:
+    """A server's transport settings: its own, else ("default" / 0) the advanced ones."""
+    return {
+        "transport": advanced["transport"]
+        if server["transport"] in ("", "default")
+        else server["transport"],
+        "min_update_interval": server["min_update_interval"] or advanced["min_update_interval"],
+    }
+
+
 def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[dict[str, Any]]:
     """OPCUAClient arguments per configured server, or exit.
 
@@ -162,6 +176,7 @@ def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[di
                 "server_certificate": server["server_certificate"],
                 "server_certificate_file": server["server_certificate_file"],
                 **effective,
+                **_inherit_transport(server, advanced),
                 **{k: advanced[k] for k in _SHARED},
                 # Explicit per-server None under a secure default: allowed, but loud.
                 "downgrade_from": advanced["security_mode"]
@@ -176,6 +191,8 @@ def demo_server_kwargs(advanced: dict[str, Any]) -> dict[str, Any]:
     """The built-in simulator as the one server `demo`: security None, no inheritance."""
     return {
         **{k: advanced[k] for k in _SHARED},
+        "transport": advanced["transport"],
+        "min_update_interval": advanced["min_update_interval"],
         "name": "demo",
         "endpoint": f"opc.tcp://{DEMO_HOST}:{DEMO_PORT}/freeopcua/server/",
         "node_map_file": str(get_demo_node_map_path()),

@@ -207,6 +207,13 @@ def demo_server(
     help="OPC-UA security policy",
 )
 @click.option("--interval", "-i", type=float, default=1.0, help="Poll interval in seconds")
+@click.option(
+    "--transport",
+    type=click.Choice(["subscription", "poll"]),
+    default="subscription",
+    show_default=True,
+    help="Server-pushed changes, polling what is refused; or poll everything",
+)
 @click.option("--timeout", type=float, default=5.0, help="Request timeout in seconds")
 @click.option(
     "--certificate-file",
@@ -237,6 +244,7 @@ def trace(
     security_mode: str,
     security_policy: str,
     interval: float,
+    transport: str,
     timeout: float,
     certificate_file: str,
     private_key_file: str,
@@ -276,6 +284,7 @@ def trace(
             ],
             "advanced": {
                 "timeout": timeout,
+                "transport": transport,
                 "certificate_file": certificate_file,
                 "private_key_file": private_key_file,
             },

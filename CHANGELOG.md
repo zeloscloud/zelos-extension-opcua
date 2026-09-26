@@ -37,8 +37,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `auto_config` standalone action behind the config form's Auto-configure button:
   localhost well-known ports, the Local Discovery Server and mDNS (`zeroconf`).
 - Simulator `--nodes N` (large address space) and `--secure-only`.
+- Subscriptions by default (`advanced.transport`, per-server override): one per
+  distinct interval, sampling = publishing = interval, queue size 1, change of
+  value or status. Items the server refuses, a refused subscription, or an
+  undecodable Publish fall back to polling for the connection with one WARNING.
+  `poll` spreads each interval's batched Reads evenly across it.
+- Node map events may be `{"poll_interval": s, "nodes": [...]}` to override the
+  server's interval.
+- `advanced.min_update_interval` (default 60s, per-server override): a subscribed
+  node silent that long is re-read and logged at the Read's ServerTimestamp.
+- Samples are logged at SourceTimestamp, else ServerTimestamp, else receipt;
+  fields of one event with different timestamps are separate rows.
+- `get_status` reports the transport and subscribed / polled counts.
+- Simulator `s7` caps 5 subscriptions, 10 monitored items and 3 continuation
+  points per session; every simulator stamps ServerTimestamp on Read.
 
 ### Changed
+- The `_server` health event is its own small Read per poll interval rather
+  than leading the poll request.
 - Browse and poll requests are chunked by the server's MaxNodesPerBrowse /
   MaxNodesPerRead, capped at 100.
 - A node name may repeat across events in a node map (`<event>/<name>` in the
@@ -100,6 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use a user certificate.
 
 ### Fixed
+- Discovery re-browses, one per request, a node refused BadNoContinuationPoints,
+  instead of silently dropping its branch; any other Bad browse status is one
+  WARNING per connect naming the node.
 - Sign / SignAndEncrypt never engaged: the security call was never awaited, so
   every session was plaintext. A secure mode now establishes exactly that mode and
   policy or refuses to connect; it never falls back to None.

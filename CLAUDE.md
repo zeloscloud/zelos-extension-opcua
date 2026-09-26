@@ -20,18 +20,19 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 | `main.py` | Click entry point; re-exports `ACTION_PREFIX`, installs `TraceLoggingHandler("opcua_log")` |
 | `zelos_extension_opcua/__init__.py` | `ACTION_PREFIX = "OPC-UA"` - must match `name` in `extension.toml` |
 | `zelos_extension_opcua/actions.py` | Free-function action surface + `register_actions()` |
-| `zelos_extension_opcua/client.py` | `OPCUAClient` (one server: connection, batch polling, reconnect) and `OPCUARunner` (the loop, signals, shutdown, action dispatch) |
+| `zelos_extension_opcua/client.py` | `OPCUAClient` (one server: connection, subscriptions, batch polling, reconnect) and `OPCUARunner` (the loop, signals, shutdown, action dispatch) |
 | `zelos_extension_opcua/node_map.py` | Node/NodeMap parsing, name sanitization, collision rules, json/csv export |
 | `zelos_extension_opcua/discovery.py` | Live discovery (walk, describe, name), OperationLimits, `HEALTH_EVENT` |
 | `zelos_extension_opcua/autoconfig.py` | `auto_config` sources: localhost ports, LDS, mDNS |
 | `zelos_extension_opcua/cli/app.py` | Config load, `servers[]` / `advanced` resolution, startup validation, `serve()` |
 | `zelos_extension_opcua/demo/simulator.py` | Demo OPC-UA server |
 | `zelos_extension_opcua/demo/plc_device.json` | Demo node map |
-| `zelos_extension_opcua/demo/sim_server.py` | `demo-server` simulator: profiles, security, ns shift, request log, enforced limits |
+| `zelos_extension_opcua/demo/sim_server.py` | `demo-server` simulator: profiles, security, ns shift, request log, enforced limits and caps |
 | `zelos_extension_opcua/demo/profiles.py` | gateway / s7 / device address spaces, `--map` serving |
 | `tests/test_opcua.py` | Extension tests |
 | `tests/test_sim.py` | Simulator profile and flag tests |
 | `tests/test_security.py` | Secure sessions, cert trust and pinning, config errors, per-server security inheritance |
+| `tests/test_transport.py` | Subscriptions and source timestamps, refusal fallback on the `s7` caps, staleness refresh, `poll` transport |
 | `tests/test_servers.py` | Several servers in one runner: layout, isolation, recovery, action selection |
 | `tests/test_discovery.py` | Discovery per profile, limits, health, `discovered_map`, naming, `auto_config` |
 | `tests/test_interop.py` | Microsoft OPC PLC (.NET stack) in Docker: None, SignAndEncrypt, user cert, `auto_config`; `ZELOS_INTEROP=1` only |
@@ -92,16 +93,65 @@ silently lost every later sample - so a call with no loop running raises
 `RuntimeError("extension is not running")`. A dispatch that times out cancels
 the coroutine, so a late write cannot land after the action reported failure.
 
-### Polling
+### Subscriptions
 
-One `read_attributes` request per `_read_chunk` nodes per cycle: the server's
-MaxNodesPerRead (read once per connect with MaxNodesPerBrowse), capped at 100,
-missing or 0 = 100. A server rejects the whole request past its limit (the `s7`
-sim enforces 20). The health nodes (`HEALTH_NODES`, ns=0 `ua.ObjectIds`) lead
-the first request, whose midpoint is the host time for `clock_skew_ms`; one that
-is Bad or empty is dropped for the connection. Node handles are resolved once
-per connection into `_poll_targets` and rebuilt after each reconnect, so the
-poll path never calls `get_node`.
+`_start_transport` runs at the end of every `connect()`, after discovery, any
+rotation and `_resolve_nodes`, so events are declared and handles are fresh.
+Per server: one subscription per distinct interval (a map event's
+`poll_interval`, else the server's), publishing = sampling = interval,
+QueueSize 1, DataChangeFilter StatusValue, no deadband, TimestampsToReturn Both.
+CreateMonitoredItems goes `_monitor_chunk` items per call (MaxMonitoredItemsPerCall,
+capped at 100). A per-item Bad status, a refused CreateSubscription or a
+non-connection service fault moves those items to polling for the connection;
+BadTooManyMonitoredItems / BadTooManySubscriptions (`SERVER_FULL_CODES`)
+short-circuit every later item without asking (an S7-1200 caps ~1000 items, 5
+subscriptions a session). One WARNING per connect names the counts by status.
+A subscription left with no item is deleted: it would hold one of those slots.
+
+asyncua's high-level `Subscription` is bypassed: `uaclient.create_subscription`
+with `_publish_callback`, a closure over that connection's handle map, so a
+late response from an old session cannot resolve a new handle. asyncua awaits it
+before sending the next Publish: backpressure, nothing queued client-side. A Bad
+StatusChangeNotification (lifetime expiry, or asyncua's supervisor reporting a
+lost link as BadShutdown) marks the client disconnected.
+
+asyncua drops a whole PublishResponse over one value it cannot decode, without
+saying which item. `_guard_publish` wraps the session's `publish`: the first
+such failure deletes the connection's subscriptions and polls everything, where
+`read_many` isolates the item. OPC PLC's discover-all (random Variant types)
+trips it within seconds; its typed telemetry nodes never do.
+
+Don't tune against the in-process sim's subscription cost: asyncua's server does
+the monitored-item work inside each write. Measured on OPC PLC (.NET, 10k nodes
+changing each second): server CPU idle 1.8%, one subscription 5.2%, 100-node
+Reads at 86 req/s 7.5%, 25-node Reads at 400 req/s 21.4%.
+
+### Polling and the job loop
+
+Per connection, `_schedule` builds `_Job`s that `_run_async` runs one at a time
+(next due, then sleep to the one after; a late job restarts from now, no burst):
+the `_server` health Read at the server interval, one job per `_read_chunk`
+polled items phased evenly across its interval (the request count of reading
+them back to back, lower peak; never smaller chunks: server cost follows request
+count), and the staleness sweep. `_read_chunk` is MaxNodesPerRead (read once per
+connect with MaxNodesPerBrowse), capped at 100, missing or 0 = 100; a server
+rejects a whole request past its limit (the `s7` sim enforces 20). The health
+Read's midpoint is the host time for `clock_skew_ms`; a health node that is Bad
+or empty is dropped for the connection. Node handles are resolved once per
+connection into `_poll_targets`, so no job calls `get_node`.
+
+Sweep: `_stale` is an OrderedDict of subscribed handles in last-update order; a
+notification moves its handle to the end, so the due items are the front run,
+no scan. Each step reads up to `_read_chunk` items silent for
+`min_update_interval`; a step is `min_update_interval / max(SWEEP_STEPS, chunks)`,
+so staleness is bounded at 1.25x and the worst case (all static) is
+ceil(items / chunk) Reads per interval. Refreshes are logged at ServerTimestamp.
+
+Timestamps: `sample_time_ns` (SourceTimestamp, else ServerTimestamp, else
+receipt) through `TraceSourceEvent.log_at`. `_log_samples` groups one batch (a
+Publish, a Read) by (event, time): fields stamped differently are separate rows.
+No skew correction; `_server.clock_skew_ms` shows it. The sim stamps
+ServerTimestamp on Read, as real servers do; asyncua returns the write time.
 
 asyncua returns per-item `DataValue`s with their own `StatusCode` (verified on
 2.0.1); it raises only for a service-level failure, or when it cannot parse one
@@ -113,22 +163,22 @@ concrete integer field), and `_log_node_failure`
 guarantees **one ERROR per bad node per process** - an unbounded per-cycle warning
 would flood both the log sink and the trace.
 
-There is no per-cycle health-check read. Disconnection is inferred from poll
-errors via `is_connection_error`, which classifies by type: `OSError` /
+There is no separate liveness probe: the health Read is one. Disconnection is
+inferred from request errors via `is_connection_error`, which classifies by type: `OSError` /
 `TimeoutError`, `UaStatusCodeError` in the session / secure-channel / connection
 family, and any other exception whose `__cause__` is a timeout or `OSError`
 (the black-holed socket: asyncua 2.0.1 raises a bare `Exception` from the
-`TimeoutError`). Never by message text. Five consecutive poll failures that
+`TimeoutError`). Never by message text. Five consecutive request failures that
 `is_connection_error` does *not* claim still force a reconnect, so an
 unclassified error cannot wedge the extension on a dead session.
 
-Reconnect backs off 3s, doubling, capped at 60s, reset on a completed poll (a
+Reconnect backs off 3s, doubling, capped at 60s, reset on a completed request (a
 connect that never yields data does not clear it).
 
 asyncua 2.0 starts a connection supervisor on every `connect()`: it reads
 ServerStatus every `watchdog_intervall` with that interval as the timeout, and on
 a miss marks the client disconnected (the next request raises `ConnectionError`,
-which is ours to handle). `watchdog_intervall` is set to the request timeout, as
+which is ours to handle, and informs subscriptions BadShutdown). `watchdog_intervall` is set to the request timeout, as
 the 1s default would drop sessions to any slower server. Its `auto_reconnect`
 is off by default and must stay off: reconnect and re-discovery are ours.
 
@@ -139,7 +189,9 @@ every connect, before `_resolve_nodes`, and `node_map` replaced. Walk: BFS over
 forward HierarchicalReferences from Objects, `_browse_chunk` nodes per Browse
 (View Timestamp null: asyncua defaults it to now, which .NET servers answer with
 BadNodeNotInView),
-BrowseNext to the end, visited set; not followed: Server (i=2253), Objects
+BrowseNext to the end, visited set; a node refused BadNoContinuationPoints (a
+server holding few, the `s7` sim 3) is re-browsed alone after the batch, so one
+point is held at a time, and any other Bad status is one WARNING per connect; not followed: Server (i=2253), Objects
 named `_*`, HasProperty (EngineeringUnits / EURange are recorded). Variables are
 browsed too (struct members, EU properties). Describe: one batched Read of
 DataType, ValueRank, AccessLevel, DisplayName, Description + EU values; Value
@@ -165,8 +217,8 @@ longer written; a field whose datatype changed is left out with one WARNING
 stops being written but is not ended. `opcua_log` is a separate source and never
 rotates.
 
-A node that `read_many` returns as BadDecodingError leaves `_poll_targets` until
-the next reconnect, or its chunk is re-read item by item every cycle.
+A node that `read_many` returns as BadDecodingError leaves its poll job until the
+next reconnect, or its chunk is re-read item by item every cycle.
 
 Measured against `--nodes` (in-process client, subprocess sim, localhost):
 10k variables discover in 1.3s (606 requests), poll 139 ms/cycle (101 reads),
@@ -226,8 +278,9 @@ because asyncua otherwise invents one.
 asyncua has no hook for its per-connection `UaProcessor`, so `_SimServer.start`
 re-implements `Server.start` (asyncua 2.0.1) to install `_SimProcessor`. It
 records every request, and adds what asyncua lacks: enforced OperationLimits,
-a session cap, RequestedMaxReferencesPerNode, BrowseNext, and
-ServerDiagnosticsSummary session counts. On an asyncua bump recheck `start`,
+a session cap, RequestedMaxReferencesPerNode, BrowseNext, per-session caps on
+subscriptions, monitored items and continuation points, ServerTimestamp on
+Read, and ServerDiagnosticsSummary session counts. On an asyncua bump recheck `start`,
 `OPCUAProtocol.connection_made` and what `UaProcessor._process_message` does
 around a request (`_browse` mirrors its session checks and activity stamps).
 Each start gets a unique ApplicationUri (`auto_config` dedupes on it). `--nodes`
