@@ -119,7 +119,9 @@ asyncua drops a whole PublishResponse over one value it cannot decode, without
 saying which item. `_guard_publish` wraps the session's `publish`: the first
 such failure deletes the connection's subscriptions and polls everything, where
 `read_many` isolates the item. OPC PLC's discover-all (random Variant types)
-trips it within seconds; its typed telemetry nodes never do.
+trips it within seconds; its typed telemetry nodes never do. So discovered
+nodes declared BaseDataType (`Discovery.variant`) are polled, never subscribed,
+counted as `polled_variant`; the guard stays as the last resort.
 
 Don't tune against the in-process sim's subscription cost: asyncua's server does
 the monitored-item work inside each write. Measured on OPC PLC (.NET, 10k nodes

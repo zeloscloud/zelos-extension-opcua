@@ -130,9 +130,12 @@ FAST = NodeMap.from_dict(
 
 
 @pytest.mark.parametrize("node_map", [FAST, None], ids=["fast_map", "discovered"])
-async def test_subscriptions_deliver_fast_nodes_at_source_time(opcplc, monkeypatch, node_map):
-    """Mapped fast nodes stay subscribed; discovering everything, a Publish that
-    asyncua cannot decode (OPC PLC's random Variants) moves it all to polling."""
+async def test_subscriptions_deliver_fast_nodes_at_source_time(
+    opcplc, monkeypatch, caplog, node_map
+):
+    """Mapped fast nodes stay subscribed; discovering everything, the BaseDataType
+    nodes (OPC PLC's random Variants) are polled and the rest stay subscribed
+    for 20s, with no whole-connection fallback."""
     stamped: list[tuple[int, int | None]] = []  # FastUInt1: (logged at, SourceTimestamp)
 
     client = OPCUAClient(endpoint=ENDPOINT, name="plc", node_map=node_map)
@@ -151,10 +154,12 @@ async def test_subscriptions_deliver_fast_nodes_at_source_time(opcplc, monkeypat
     runner = OPCUARunner([client])
     task = asyncio.create_task(runner._run_async())
     try:
-        deadline = time.monotonic() + 20
+        started = time.monotonic()
         while len(stamped) < 3:
-            assert time.monotonic() < deadline, stamped
+            assert time.monotonic() < started + 20, stamped
             await asyncio.sleep(0.1)
+        if node_map is None:
+            await asyncio.sleep(max(0.0, started + 20 - time.monotonic()))
         status = client.status()
     finally:
         runner.stop()
@@ -163,6 +168,9 @@ async def test_subscriptions_deliver_fast_nodes_at_source_time(opcplc, monkeypat
     assert status["subscribed"] + status["polled"] == status["nodes"] > 0
     if node_map is FAST:
         assert status["subscribed"] == 5
+    else:
+        assert status["subscribed"] > 0 and status["polled_variant"] > 0, status
+    assert not [r for r in caplog.records if "could not be decoded" in r.getMessage()]
     assert all(source is not None and at == source for at, source in stamped)
     assert len({at for at, _ in stamped}) == len(stamped)
 

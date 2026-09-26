@@ -72,10 +72,14 @@ async def test_device_units_types_and_skip_summary(caplog):
             # A read-time value: asyncua refuses a write whose variant type changes.
             sim.server.set_attribute_value_callback(load, lambda *_, v=sample: ua.DataValue(v))
             samples.append((await client._poll_nodes())["Pump01/ParameterSet"]["Load"])
+        subscribed = {t[1].name for t in client._monitored.values()}
         await client.disconnect()
     assert [(type(v), v) for v in samples] == [(float, 7.0), (float, 2.5)]
     params = {n.name: n for n in client.node_map.events["Pump01/ParameterSet"]}
     assert params["Load"].datatype == "float64"
+    # BaseDataType is polled; concrete and Number stay subscribed.
+    assert {"Voltage", "Load"} <= subscribed and "Mode" not in subscribed
+    assert client.status()["polled_variant"] == 1
     assert (params["Voltage"].unit, params["Temperature"].unit) == ("V", "degC")
     assert "range 0..480" in params["Voltage"].description
     summaries = [r.getMessage() for r in caplog.records if "Discovered" in r.getMessage()]

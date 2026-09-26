@@ -108,6 +108,7 @@ VENDOR_IDS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], list[str]]], 
 _DECODE_ERRORS = (struct.error, ValueError, NotEnoughData)
 _NO_CONTINUATION_POINTS = ua.StatusCodes.BadNoContinuationPoints
 _BAD_DECODING = ua.StatusCodes.BadDecodingError
+_BASE_DATATYPE = NodeId(_IDS.BaseDataType)
 
 
 def to_nsu_string(node_id: NodeId, namespaces: Sequence[str]) -> str | None:
@@ -206,6 +207,8 @@ class Discovery:
     skipped: Counter[str] = field(default_factory=Counter)
     renames: list[str] = field(default_factory=list)
     browse_failed: list[str] = field(default_factory=list)  # `path (status)`
+    # Node ids declared BaseDataType: the value's type may change per sample.
+    variant: set[str] = field(default_factory=set)
     requests: int = 0
     seconds: float = 0.0
 
@@ -364,8 +367,9 @@ def _text(dv: ua.DataValue) -> str:
 
 async def describe(
     rpc: _Counter, found: list[Found], chunk: int
-) -> tuple[list[tuple[Found, str, str, str]], Counter[str]]:
-    """(variable, datatype, unit, description) per traceable Variable, and skip counts.
+) -> tuple[list[tuple[Found, str, str, str]], Counter[str], set[NodeId]]:
+    """(variable, datatype, unit, description) per traceable Variable, skip counts,
+    and the traceable ones declared BaseDataType.
 
     Value is read only where the DataType does not fix the type or the rank may
     be an array: on a gateway a Value read can cost a device read.
@@ -409,6 +413,7 @@ async def describe(
     values = iter(await rpc.read([(nid, None) for nid in unresolved], chunk))
 
     out = []
+    variant: set[NodeId] = set()
     for var, dtype, needs_value, attrs in typed:
         datatype, reason = field_datatype(dtype, next(values) if needs_value else None)
         if datatype is None:
@@ -422,7 +427,9 @@ async def describe(
         if isinstance(rng, ua.Range):
             description = f"{description} (range {rng.Low:g}..{rng.High:g})".lstrip()
         out.append((var, datatype, unit, description))
-    return out, skipped
+        if dtype == _BASE_DATATYPE:
+            variant.add(var.node_id)
+    return out, skipped, variant
 
 
 def declared_datatype(dtype: Any) -> str | None:
@@ -569,13 +576,14 @@ async def discover(
     started = time.monotonic()
     rpc = _Counter(client)
     found, browse_failed = await walk(rpc, browse_chunk)
-    described, skipped = await describe(rpc, found, read_chunk)
+    described, skipped, variant = await describe(rpc, found, read_chunk)
     events, renames = assign_names(described, namespaces, max_event_bytes)
     return Discovery(
         node_map=NodeMap(events=events, name=name, description="discovered"),
         skipped=skipped,
         renames=renames,
         browse_failed=browse_failed,
+        variant={node_id_string(nid, namespaces) for nid in variant},
         requests=rpc.requests,
         seconds=time.monotonic() - started,
     )

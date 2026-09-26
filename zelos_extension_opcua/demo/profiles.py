@@ -361,6 +361,14 @@ async def build_device(server: Server, ns: dict[str, int]) -> Drifter:
         datatype=ua.NodeId(ua.ObjectIds.Number),
     )
 
+    # BaseDataType: the value's type may change per sample, so the client polls it.
+    await params.add_variable(
+        ua.NodeId("Pump01.ParameterSet.Mode", idx),
+        _qn("Mode", idx),
+        ua.Variant(0, VT.Int32),
+        datatype=ua.NodeId(ua.ObjectIds.BaseDataType),
+    )
+
     broken = await params.add_variable(
         ua.NodeId("Pump01.ParameterSet.FlowSensor", idx), _qn("FlowSensor", idx), 0.0, VT.Double
     )
