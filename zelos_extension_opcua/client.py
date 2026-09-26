@@ -662,6 +662,10 @@ class OPCUAClient:
         self._subscription_ids: list[int] = []
         self._polled = 0
         self._jobs: list[_Job] = []
+        # Discovered node ids declared BaseDataType, and how many were polled for
+        # it this connection (see _start_transport).
+        self._variant: set[str] = set()
+        self._polled_variant = 0
         # Nodes per Browse / Read / CreateMonitoredItems request, from OperationLimits.
         self._browse_chunk = self._read_chunk = self._monitor_chunk = MAX_OPERATIONS
         self._ua_nodes: dict[str, UaNode] = {}
@@ -914,6 +918,7 @@ class OPCUAClient:
         )
         added, changed = self._declare_events(result.node_map)
         self.node_map = result.node_map
+        self._variant = result.variant
         skipped = ", ".join(f"{k} {v}" for k, v in sorted(result.skipped.items()))
         self._log.info(
             "Discovered %d variables in %d events (%.1fs, %d requests); skipped: %s",
@@ -1199,6 +1204,10 @@ class OPCUAClient:
         else the server's). What the server refuses - an item's Bad status, a
         refused subscription, an overload - is polled for the rest of the
         connection, with one WARNING.
+
+        A node declared BaseDataType is polled, never subscribed: its value type
+        may change per sample, and asyncua drops a whole Publish over one value
+        it cannot decode (see _guard_publish).
         """
         intervals = self.node_map.intervals if self.node_map else {}
         groups: dict[float, list[tuple[int, Target]]] = {}
@@ -1215,10 +1224,18 @@ class OPCUAClient:
         polled: dict[float, list[Target]] = {}
         refused: Counter[str] = Counter()
         full: str | None = None
+        self._polled_variant = 0
         for interval, items in groups.items():
             if self.transport == "poll":
                 polled[interval] = [t for _, t in items]
                 continue
+            variant = [t for _, t in items if t[1].node_id in self._variant]
+            if variant:
+                polled[interval] = variant
+                self._polled_variant += len(variant)
+                items = [(h, t) for h, t in items if t[1].node_id not in self._variant]
+                if not items:
+                    continue
             rejected, full = await self._subscribe(client, interval, items, on_publish, full)
             for target, reason in rejected:
                 polled.setdefault(interval, []).append(target)
@@ -1229,6 +1246,11 @@ class OPCUAClient:
                 refused.total(),
                 len(self._poll_targets),
                 ", ".join(f"{name} {n}" for name, n in refused.most_common()),
+            )
+        if self._polled_variant:
+            self._log.info(
+                "Polling %d BaseDataType nodes this connection: their value type may change",
+                self._polled_variant,
             )
         self._polled = sum(len(t) for t in polled.values())
         self._jobs = self._schedule(polled)
@@ -1761,6 +1783,7 @@ class OPCUAClient:
             "min_update_interval": self.min_update_interval,
             "subscribed": len(self._monitored),
             "polled": self._polled,
+            "polled_variant": self._polled_variant,
             "nodes": len(self.node_map.nodes) if self.node_map else 0,
             "discovery": self.discovery,
         }

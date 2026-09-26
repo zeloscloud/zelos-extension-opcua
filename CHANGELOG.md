@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinct interval, sampling = publishing = interval, queue size 1, change of
   value or status. Items the server refuses, a refused subscription, or an
   undecodable Publish fall back to polling for the connection with one WARNING.
+- Discovered nodes declared BaseDataType are polled, never subscribed (their value type may change per sample); `get_status` reports `polled_variant`.
   `poll` spreads each interval's batched Reads evenly across it.
 - Node map events may be `{"poll_interval": s, "nodes": [...]}` to override the
   server's interval.
