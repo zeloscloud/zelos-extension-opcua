@@ -10,7 +10,12 @@ import zelos_sdk
 
 from zelos_extension_opcua import actions
 from zelos_extension_opcua.cli import app
-from zelos_extension_opcua.client import SHUTDOWN_TIMEOUT, OPCUAClient, OPCUARunner
+from zelos_extension_opcua.client import (
+    SHUTDOWN_TIMEOUT,
+    OPCUAClient,
+    OPCUARunner,
+    SharedSource,
+)
 from zelos_extension_opcua.demo.sim_server import Simulator
 from zelos_extension_opcua.node_map import NodeMap
 
@@ -40,7 +45,7 @@ def clients_for(sims: dict[str, Simulator], prefix: str) -> list[OPCUAClient]:
         "advanced": {"timeout": 2.0},
     }
     clients = app.build_clients(app.resolve_servers(config, app.resolve_advanced(config)))
-    shared = zelos_sdk.TraceSource(prefix) if prefix else None
+    shared = SharedSource(zelos_sdk.TraceSource(prefix)) if prefix else None
     for client in clients:
         client.start(shared)
     return clients

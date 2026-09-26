@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live discovery: a server without a node map is browsed on every connect and every
   scalar variable traced, read-only; `advanced.discovery` turns it off.
   `discovered_map` returns the discovered set as node map json or csv.
+  A reconnect that finds fields added to an existing event starts a new segment
+  of the trace source (one INFO line) and traces them; a field whose datatype
+  changed is skipped with one WARNING until restart.
 - Server health event `_server` per server (state, clock skew, service level,
   session and rejected-request counts), read in the poll's own request.
 - `auto_config` standalone action behind the config form's Auto-configure button:
@@ -102,7 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery found nothing on .NET-stack servers (BadNodeNotInView): Browse now
   asks for the current view.
 - A value asyncua cannot decode, or an integer outside its field's width, costs
-  only its node instead of failing the whole read or poll cycle.
+  only its node instead of failing the whole read or poll cycle. An undecodable
+  node is left out of polling until the next reconnect rather than forcing an
+  item-by-item re-read of its chunk every cycle.
 
 ---
 

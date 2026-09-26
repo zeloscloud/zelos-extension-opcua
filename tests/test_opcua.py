@@ -23,6 +23,7 @@ from zelos_extension_opcua import actions
 from zelos_extension_opcua.client import (
     OPCUAClient,
     OPCUARunner,
+    SharedSource,
     coerce_text,
     decode_value,
     encode_value,
@@ -1033,7 +1034,8 @@ class TestTraceSourceEvents:
             {"name": "m", "events": {"log": [{"name": "v", "node_id": "ns=2;i=1"}]}}
         )
         client = OPCUAClient(endpoint="opc.tcp://plc01:4840", node_map=node_map)
-        client._init_trace_source(zelos_sdk.TraceSource("OPC-UA") if shared else None)
+        shared_source = SharedSource(zelos_sdk.TraceSource("OPC-UA")) if shared else None
+        client._init_trace_source(shared_source)
         assert client._source.name == source
         assert client._events["log"].name == event
         client._log_values({"log": {"v": 3.5}})

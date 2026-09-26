@@ -16,7 +16,7 @@ from zelos_sdk.extensions.actions import get_standalone_actions
 
 from zelos_extension_opcua import ACTION_PREFIX, actions
 from zelos_extension_opcua.cli import app
-from zelos_extension_opcua.client import OPCUAClient, OPCUARunner
+from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, SharedSource
 from zelos_extension_opcua.demo import profiles
 from zelos_extension_opcua.demo.sim_server import Simulator
 from zelos_extension_opcua.discovery import (
@@ -32,7 +32,7 @@ from zelos_extension_opcua.node_map import NodeMap
 async def discovered(sim: Simulator, caplog=None) -> tuple[OPCUAClient, dict]:
     """A connected no-map client and its first poll."""
     client = OPCUAClient(endpoint=sim.endpoint, name="plc")
-    client.start(zelos_sdk.TraceSource("OPC-UA"))
+    client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
     assert await client.connect() is True
     return client, await client._poll_nodes()
 
@@ -88,7 +88,7 @@ async def test_discovery_off_does_not_browse():
     async with Simulator("gateway", port=0) as sim:
         config = {"servers": [{"endpoint": sim.endpoint}], "advanced": {"discovery": False}}
         [client] = app.build_clients(app.resolve_servers(config, app.resolve_advanced(config)))
-        client.start(zelos_sdk.TraceSource("OPC-UA"))
+        client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
         assert await client.connect() is True
         await client.disconnect()
     assert "Browse" not in {svc for _, svc in sim.request_log}
@@ -98,7 +98,7 @@ async def test_discovery_off_does_not_browse():
 async def test_discovered_map_action_round_trips(tmp_path):
     async with Simulator("gateway", port=0) as sim:
         runner = OPCUARunner([OPCUAClient(endpoint=sim.endpoint, name="gw", poll_interval=0.1)])
-        runner.clients["gw"].start(zelos_sdk.TraceSource("OPC-UA"))
+        runner.clients["gw"].start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
         task = asyncio.create_task(runner._run_async())
         actions.set_runner(runner)
         try:
@@ -146,6 +146,28 @@ async def test_undecodable_value_costs_only_its_item():
     dvs = await read_many(client, items, 100)
     assert [dv.Value.Value for dv in dvs if dv.StatusCode.is_good()] == ["a", "c"]
     assert dvs[1].StatusCode.value == ua.StatusCodes.BadDecodingError
+
+
+async def test_undecodable_node_leaves_polling(monkeypatch):
+    """Not re-read item by item every cycle: dropped until the next reconnect."""
+    reads = []
+
+    async def fake_read_many(client, items, chunk):
+        reads.append(len(items))
+        return [ua.DataValue(StatusCode=ua.StatusCode(ua.StatusCodes.BadDecodingError))] + [
+            ua.DataValue(ua.Variant(1.0)) for _ in items[1:]
+        ]
+
+    node_map = NodeMap.from_dict(
+        {"name": "m", "events": {"e": [{"name": n, "node_id": f"ns=2;s={n}"} for n in "ab"]}}
+    )
+    client = OPCUAClient(node_map=node_map)
+    client._client, client._connected = object(), True
+    client._poll_targets = [("e", n, type("N", (), {"nodeid": n.node_id})) for n in node_map.nodes]
+    monkeypatch.setattr("zelos_extension_opcua.client.read_many", fake_read_many)
+    await client._poll_nodes()
+    await client._poll_nodes()
+    assert reads == [2, 1]
 
 
 def found(identifier: str | int, name: str, ns: int = 2, path: tuple = ("Folder",)) -> tuple:
@@ -240,3 +262,90 @@ async def test_reconnect_rebrowses():
         await sim.stop()
     assert len(values["Bulk/Group0000"]) == 3
     assert client._events["Bulk/Group0000"].name == "plc/Bulk/Group0000"
+
+
+class RecordingSource:
+    """A real TraceSource that records every write per instance."""
+
+    made: list[RecordingSource] = []
+
+    def __init__(self, name: str) -> None:
+        self._source = REAL_SOURCE(name)
+        self.name = name
+        self.writes: list[tuple[str, dict]] = []
+        RecordingSource.made.append(self)
+
+    def add_event(self, name, fields):
+        event, writes = self._source.add_event(name, fields), self.writes
+
+        class Event:
+            def log(self, **values):
+                writes.append((name, values))
+                event.log(**values)
+
+        Event.name = event.name
+        return Event()
+
+    def flush(self) -> None:
+        self._source.flush()
+
+
+REAL_SOURCE = zelos_sdk.TraceSource
+METER = "ModbusTCP/PowerMeter"
+
+
+async def test_added_field_rotates_the_shared_source(monkeypatch, caplog):
+    """A PLC program change adds a tag to a live folder: every writer moves to a new segment."""
+    monkeypatch.setattr(zelos_sdk, "TraceSource", RecordingSource)
+    RecordingSource.made = []
+    shared = SharedSource(zelos_sdk.TraceSource("OPC-UA"))
+    plc, peer = (OPCUAClient(endpoint="", name=n) for n in ("plc", "peer"))
+    async with Simulator("gateway", port=0) as sim:
+        for client in (plc, peer):
+            client.endpoint = sim.endpoint
+            client.start(shared)
+            assert await client.connect() is True
+            client._log_values(await client._poll_nodes())
+        [old] = RecordingSource.made
+
+        server, idx = sim.server, await sim.server.get_namespace_index(profiles.GATEWAY_URI)
+        meter = server.get_node(ua.NodeId("ModbusTCP.PowerMeter", idx))
+        relay = server.get_node(ua.NodeId("ModbusTCP.PowerMeter.Relay1", idx))
+        await server.delete_nodes([relay])
+        await meter.add_variable(
+            relay.nodeid, ua.QualifiedName("Relay1", idx), 1.0, ua.VariantType.Float
+        )
+        await meter.add_variable(
+            ua.NodeId("ModbusTCP.PowerMeter.Added", idx),
+            ua.QualifiedName("Added", idx),
+            2.5,
+            ua.VariantType.Float,
+        )
+
+        await plc.disconnect()
+        with caplog.at_level(logging.INFO, logger="zelos_extension_opcua.client"):
+            assert await plc._ensure_connected() is True
+        writes_before = len(old.writes)
+        plc._log_values(await plc._poll_nodes())
+        peer._log_values(await peer._poll_nodes())
+        await plc.disconnect()
+        await peer.disconnect()
+
+    [_, new] = RecordingSource.made
+    assert new.name == "OPC-UA" and shared.source is new
+    assert len(old.writes) == writes_before
+    assert all(c._source is new for c in (plc, peer))
+    logged = dict(new.writes)
+    assert logged[f"plc/{METER}"]["Added"] == 2.5
+    assert "Relay1" not in logged[f"plc/{METER}"] and "Voltage_L1" in logged[f"plc/{METER}"]
+    assert {f"plc/{HEALTH_EVENT}", f"peer/{HEALTH_EVENT}", f"peer/{METER}"} <= set(logged)
+
+    messages = [(r.levelno, r.getMessage()) for r in caplog.records]
+    assert (
+        logging.INFO,
+        f"[plc] Discovered fields added, trace source 'OPC-UA' rotated: {METER}: Added",
+    ) in messages
+    assert (
+        logging.WARNING,
+        f"[plc] Discovered fields changed datatype, not traced until restart: {METER}: Relay1",
+    ) in messages
