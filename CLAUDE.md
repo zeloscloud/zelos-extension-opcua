@@ -199,8 +199,11 @@ browsed too (struct members, EU properties). Describe: one batched Read of
 DataType, ValueRank, AccessLevel, DisplayName, Description + EU values; Value
 only where the DataType is not builtin or the rank is Any/ScalarOrOneDimension.
 Typing (`field_datatype`): a concrete builtin DataType exactly; Number / Integer /
-UInteger as float64 / int64 / uint64; anything else by the value's kind at its
-widest (bool, float64, string), other kinds skipped; values coerce into the field.
+UInteger as float64 / int64 / uint64; BaseDataType always string, each value
+rendered as text (`render_text`: bool true/false, DateTime ISO 8601 UTC,
+ByteString hex, StatusCode name, a struct its str()), so a type change never
+fails the node; anything else by the value's kind at its widest (bool, float64,
+string), other kinds skipped; values coerce into the field.
 Naming and collisions: `discovery.assign_names`. Unbounded by design: a limit
 needs measured data.
 

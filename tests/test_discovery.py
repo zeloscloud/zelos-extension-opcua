@@ -71,12 +71,15 @@ async def test_device_units_types_and_skip_summary(caplog):
         for sample in (ua.Variant(7, ua.VariantType.Int32), ua.Variant(2.5, ua.VariantType.Double)):
             # A read-time value: asyncua refuses a write whose variant type changes.
             sim.server.set_attribute_value_callback(load, lambda *_, v=sample: ua.DataValue(v))
-            samples.append((await client._poll_nodes())["Pump01/ParameterSet"]["Load"])
+            polled = (await client._poll_nodes())["Pump01/ParameterSet"]
+            samples.append((polled["Load"], polled["Mode"]))
         subscribed = {t[1].name for t in client._monitored.values()}
         await client.disconnect()
-    assert [(type(v), v) for v in samples] == [(float, 7.0), (float, 2.5)]
+    assert [(type(v), v) for v, _ in samples] == [(float, 7.0), (float, 2.5)]
+    # BaseDataType: text, whatever the value's type.
+    assert [mode for _, mode in samples] == ["0", "0"]
     params = {n.name: n for n in client.node_map.events["Pump01/ParameterSet"]}
-    assert params["Load"].datatype == "float64"
+    assert (params["Load"].datatype, params["Mode"].datatype) == ("float64", "string")
     # BaseDataType is polled; concrete and Number stay subscribed.
     assert {"Voltage", "Load"} <= subscribed and "Mode" not in subscribed
     assert client.status()["polled_variant"] == 1
@@ -98,10 +101,10 @@ _VT = ua.VariantType
         (_ID.UInteger, None, "uint64"),
         (_ID.UInt64, None, "uint64"),  # concrete: exact, not widened
         (_ID.UInt64, (2**64 - 1, _VT.UInt64), "uint64"),  # rank -2, scalar value
-        (_ID.BaseDataType, (True, _VT.Boolean), "bool"),
-        (_ID.BaseDataType, (3, _VT.Int32), "float64"),
-        (_ID.BaseDataType, (1.5, _VT.Float), "float64"),
-        (_ID.BaseDataType, ("on", _VT.String), "string"),
+        (_ID.BaseDataType, (True, _VT.Boolean), "string"),  # value type may change
+        (_ID.BaseDataType, (3, _VT.Int32), "string"),
+        (_ID.BaseDataType, (ua.LocalizedText("on"), _VT.LocalizedText), "string"),
+        (_ID.Enumeration, (3, _VT.Int32), "float64"),  # other untyped: by kind
     ],
 )
 def test_field_datatype(dtype, sample, expected):

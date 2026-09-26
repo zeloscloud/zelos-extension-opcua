@@ -64,7 +64,7 @@ SERVER_DEFAULTS: dict[str, Any] = {
     "server_certificate": "auto",
     "server_certificate_file": "",
     "transport": "default",
-    "min_update_interval": 0,
+    "min_update_interval": None,
 }
 
 TOP_LEVEL_KEYS = frozenset({"demo", "servers", "advanced"})
@@ -125,12 +125,14 @@ def _inherit(server: dict[str, Any], advanced: dict[str, Any]) -> dict[str, Any]
 
 
 def _inherit_transport(server: dict[str, Any], advanced: dict[str, Any]) -> dict[str, Any]:
-    """A server's transport settings: its own, else ("default" / 0) the advanced ones."""
+    """A server's transport settings: its own, else ("default" / None) the advanced ones."""
     return {
         "transport": advanced["transport"]
         if server["transport"] in ("", "default")
         else server["transport"],
-        "min_update_interval": server["min_update_interval"] or advanced["min_update_interval"],
+        "min_update_interval": advanced["min_update_interval"]
+        if server["min_update_interval"] is None
+        else server["min_update_interval"],
     }
 
 

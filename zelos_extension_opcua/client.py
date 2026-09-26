@@ -388,6 +388,30 @@ def coerce_text(text: str, datatype: str) -> float | int | bool | str:
     return number if datatype in ("float32", "float64") else int(number)
 
 
+def render_text(value: Any) -> str:
+    """A scalar as text: the field of a node whose value type may change.
+
+    Bool as true/false, numbers as Python writes them, DateTime ISO 8601 UTC,
+    ByteString hex, StatusCode its name; anything else (a struct) its str(),
+    which asyncua prefixes with the type name.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, ua.LocalizedText):
+        return value.Text or ""
+    if isinstance(value, NodeId | ua.QualifiedName):
+        return value.to_string()
+    if isinstance(value, datetime):
+        return (value if value.tzinfo else value.replace(tzinfo=UTC)).astimezone(UTC).isoformat()
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, ua.StatusCode):
+        return value.name
+    return str(value)
+
+
 def decode_value(value: Any, datatype: str, scale: float = 1.0) -> float | int | bool | str | None:
     """Decode an OPC-UA value to a typed, scaled Python value.
 
@@ -405,7 +429,7 @@ def decode_value(value: Any, datatype: str, scale: float = 1.0) -> float | int |
     if datatype == "bool":
         return bool(value)
     if datatype == "string":
-        return str(value)
+        return render_text(value)
     if datatype in ("float32", "float64"):
         return float(value) * scale
     if datatype in INT_DATATYPES:

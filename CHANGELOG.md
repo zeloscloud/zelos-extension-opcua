@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A reconnect that finds fields added to an existing event starts a new segment
   of the trace source (one INFO line) and traces them; a field whose datatype
   changed is skipped with one WARNING until restart.
-- Discovery types a Number / Integer / UInteger node as float64 / int64 / uint64 and a BaseDataType or other untyped node by its value's kind (bool, float64, string); concrete DataTypes are kept exactly.
+- Discovery types a Number / Integer / UInteger node as float64 / int64 / uint64 and a BaseDataType node as string, each value rendered as text (bool true/false, DateTime ISO 8601 UTC, ByteString hex, StatusCode name), so a value type change never drops it; other untyped nodes by their value's kind (bool, float64, string); concrete DataTypes are kept exactly.
 - Server health event `_server` per server (state, clock skew, service level,
   session and rejected-request counts), read in the poll's own request.
 - `auto_config` standalone action behind the config form's Auto-configure button:
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `poll` spreads each interval's batched Reads evenly across it.
 - Node map events may be `{"poll_interval": s, "nodes": [...]}` to override the
   server's interval.
-- `advanced.min_update_interval` (default 60s, per-server override): a subscribed
+- `advanced.min_update_interval` (default 60s; per-server override, empty inherits): a subscribed
   node silent that long is re-read and logged at the Read's ServerTimestamp.
 - Samples are logged at SourceTimestamp, else ServerTimestamp, else receipt;
   fields of one event with different timestamps are separate rows.

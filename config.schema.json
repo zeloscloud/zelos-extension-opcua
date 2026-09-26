@@ -67,11 +67,14 @@
             "default": "default"
           },
           "min_update_interval": {
-            "type": "number",
+            "type": [
+              "number",
+              "null"
+            ],
             "title": "Min Update Interval (seconds)",
-            "description": "0 uses Advanced > Min Update Interval.",
-            "default": 0,
-            "minimum": 0,
+            "description": "Empty uses Advanced > Min Update Interval.",
+            "default": null,
+            "minimum": 1.0,
             "maximum": 3600
           },
           "security_mode": {
