@@ -145,8 +145,25 @@ browsed too (struct members, EU properties). Describe: one batched Read of
 DataType, ValueRank, AccessLevel, DisplayName, Description + EU values; Value
 only where the DataType is not builtin or the rank is Any/ScalarOrOneDimension.
 Naming and collisions: `discovery.assign_names`. Unbounded by design: a limit
-needs measured data. A declared trace event's schema is fixed (the SDK rejects
-a re-add), so a field new to an existing event waits for a restart.
+needs measured data.
+
+A declared trace event's schema is fixed on its `TraceSource` instance (the SDK
+rejects a re-add), but every construction is a new segment, and the app joins
+sequential segments of one path. So a reconnect whose discovery adds fields to a
+declared event rotates the source, at most once per reconnect: `flush()` the
+old, construct one of the same name, replay every client's declared events
+(`_fields`) on it, and switch every writer - all clients of a `SharedSource`
+(the prefix source), else just this server's - with no await in between.
+`SharedSource` holds the only reference to the source, so dropping it lets the
+SDK end the old segment. A new event is just added; a removed field is just no
+longer written; a field whose datatype changed is left out with one WARNING
+(types are not reconciled across segments). The prefix source comes from
+`init_global_source`, which the SDK keeps for the process, so its first segment
+stops being written but is not ended. `opcua_log` is a separate source and never
+rotates.
+
+A node that `read_many` returns as BadDecodingError leaves `_poll_targets` until
+the next reconnect, or its chunk is re-read item by item every cycle.
 
 Measured against `--nodes` (in-process client, subprocess sim, localhost):
 10k variables discover in 1.3s (606 requests), poll 139 ms/cycle (101 reads),

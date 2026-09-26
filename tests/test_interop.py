@@ -21,7 +21,7 @@ from test_security import user_cert
 
 from zelos_extension_opcua import actions
 from zelos_extension_opcua import client as client_mod
-from zelos_extension_opcua.client import OPCUAClient
+from zelos_extension_opcua.client import OPCUAClient, SharedSource
 from zelos_extension_opcua.discovery import HEALTH_EVENT
 
 pytestmark = pytest.mark.skipif(
@@ -74,7 +74,7 @@ async def _answers() -> bool:
 async def polled(**kwargs) -> tuple[bool, list[dict]]:
     """Connect a no-map client, then two polls 1.5s apart."""
     client = OPCUAClient(endpoint=ENDPOINT, name="plc", **kwargs)
-    client.start(zelos_sdk.TraceSource("OPC-UA"))
+    client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
     if not await client.connect():
         return False, []
     try:

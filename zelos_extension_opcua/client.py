@@ -473,6 +473,18 @@ class _ServerLog(logging.LoggerAdapter):
         return f"[{self.extra['server']}] {msg}", kwargs
 
 
+class SharedSource:
+    """A trace source and the clients writing it, rotated as one."""
+
+    def __init__(self, source: zelos_sdk.TraceSource) -> None:
+        self.source = source
+        self.clients: list[OPCUAClient] = []
+
+
+def _field(node: Node) -> tuple[str, zelos_sdk.DataType, str]:
+    return node.name, SDK_DATATYPES.get(node.datatype, zelos_sdk.DataType.Float64), node.unit
+
+
 class OPCUAClient:
     """OPC-UA client that batch-polls one server's node map into a Zelos trace source.
 
@@ -577,11 +589,13 @@ class OPCUAClient:
         # Node IDs that have already reported a read failure - see _log_node_failure.
         self._failed_nodes: set[str] = set()
 
-        self._source: zelos_sdk.TraceSource | None = None
+        self._shared: SharedSource | None = None
         # Map event name -> trace event, captured from add_event. Never getattr on
         # the source: an event named `log` resolves to the source's own method.
         self._events: dict[str, Any] = {}
-        # Declared field name -> datatype per event. A declared schema is fixed.
+        # Event name -> declared fields, replayed on a rotated source.
+        self._fields: dict[str, list[tuple[str, zelos_sdk.DataType, str]]] = {}
+        # Declared field name -> datatype per node map event.
         self._schemas: dict[str, dict[str, str]] = {}
         self._event_prefix = ""
         self._writable_cache: dict[str, bool] = {}
@@ -709,68 +723,102 @@ class OPCUAClient:
             mode=mode,
         )
 
-    def _init_trace_source(self, source: zelos_sdk.TraceSource | None = None) -> None:
+    @property
+    def _source(self) -> zelos_sdk.TraceSource | None:
+        return self._shared.source if self._shared else None
+
+    def _init_trace_source(self, shared: SharedSource | None = None) -> None:
         """Declare the health event and one event per node map event.
 
         Args:
-            source: The prefix's shared source, events nested as `<server>/<event>`;
+            shared: The prefix's shared source, events nested as `<server>/<event>`;
                 None for a source of this server's own with unprefixed events
         """
-        if source is None:
-            self._source, self._event_prefix = zelos_sdk.TraceSource(self.name), ""
+        if shared is None:
+            self._shared, self._event_prefix = SharedSource(zelos_sdk.TraceSource(self.name)), ""
         else:
-            self._source, self._event_prefix = source, f"{self.name}/"
-        self._events = {}
-        self._schemas = {}
-        self._events[HEALTH_EVENT] = self._source.add_event(
-            f"{self._event_prefix}{HEALTH_EVENT}",
-            [zelos_sdk.TraceEventFieldMetadata(*f) for f in HEALTH_FIELDS],
-        )
+            self._shared, self._event_prefix = shared, f"{self.name}/"
+        if self not in self._shared.clients:
+            self._shared.clients.append(self)
+        self._events, self._fields, self._schemas = {}, {}, {}
+        self._declare(HEALTH_EVENT, list(HEALTH_FIELDS))
 
         if self.node_map and self.node_map.events:
             self._declare_events(self.node_map)
         elif not self.discovery:
-            self._events["raw"] = self._source.add_event(
-                f"{self._event_prefix}raw",
+            self._declare(
+                "raw",
                 [
-                    zelos_sdk.TraceEventFieldMetadata("node_id", zelos_sdk.DataType.String),
-                    zelos_sdk.TraceEventFieldMetadata("value", zelos_sdk.DataType.Float64),
+                    ("node_id", zelos_sdk.DataType.String, ""),
+                    ("value", zelos_sdk.DataType.Float64, ""),
                 ],
             )
 
-    def _declare_events(self, node_map: NodeMap) -> dict[str, list[str]]:
-        """Declare the map's events not yet declared.
+    def _declare(self, event_name: str, fields: list[tuple[str, zelos_sdk.DataType, str]]) -> None:
+        assert self._source is not None
+        self._fields[event_name] = fields
+        self._events[event_name] = self._source.add_event(
+            f"{self._event_prefix}{event_name}",
+            [zelos_sdk.TraceEventFieldMetadata(*f) for f in fields],
+        )
 
-        A declared event's schema cannot change, so a field it lacks, or whose
-        datatype changed since, is left out of `node_map` until restart.
+    def _declare_events(
+        self, node_map: NodeMap
+    ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """Declare the map's new events; record fields added to declared ones.
+
+        A declared event's schema is fixed on its source, so an added field is
+        only recorded here and takes a source rotation to trace. A field whose
+        datatype changed is left out of `node_map`: types are not reconciled
+        across segments.
 
         Returns:
-            Event name -> the fields left out
+            (event -> fields added, event -> fields left out for a type change)
         """
-        dropped: dict[str, list[str]] = {}
+        added: dict[str, list[str]] = {}
+        changed: dict[str, list[str]] = {}
         for event_name, nodes in node_map.events.items():
             if not nodes or self._source is None:
                 continue
             schema = self._schemas.get(event_name)
             if schema is None:
                 self._schemas[event_name] = {n.name: n.datatype for n in nodes}
-                self._events[event_name] = self._source.add_event(
-                    f"{self._event_prefix}{event_name}",
-                    [
-                        zelos_sdk.TraceEventFieldMetadata(
-                            n.name,
-                            SDK_DATATYPES.get(n.datatype, zelos_sdk.DataType.Float64),
-                            n.unit,
-                        )
-                        for n in nodes
-                    ],
-                )
+                self._declare(event_name, [_field(n) for n in nodes])
                 continue
-            kept = [n for n in nodes if schema.get(n.name) == n.datatype]
-            if len(kept) != len(nodes):
-                dropped[event_name] = [n.name for n in nodes if n not in kept]
-                node_map.events[event_name] = kept
-        return dropped
+            bad = [n for n in nodes if schema.get(n.name, n.datatype) != n.datatype]
+            if bad:
+                changed[event_name] = [n.name for n in bad]
+                node_map.events[event_name] = [n for n in nodes if n not in bad]
+            new = [n for n in nodes if n.name not in schema]
+            if new:
+                added[event_name] = [n.name for n in new]
+                schema.update((n.name, n.datatype) for n in new)
+                self._fields[event_name] = self._fields[event_name] + [_field(n) for n in new]
+        return added, changed
+
+    def _rotate_source(self) -> None:
+        """Move every client on this source to a new segment of the same name.
+
+        Synchronous: no await between the last write to the old source and the
+        switch. The old source keeps no reference here, so it can end its segment.
+        """
+        shared = self._shared
+        assert shared is not None
+        shared.source.flush()
+        source = zelos_sdk.TraceSource(shared.source.name)
+        events = {
+            client: {
+                name: source.add_event(
+                    f"{client._event_prefix}{name}",
+                    [zelos_sdk.TraceEventFieldMetadata(*f) for f in fields],
+                )
+                for name, fields in client._fields.items()
+            }
+            for client in shared.clients
+        }
+        shared.source = source
+        for client, client_events in events.items():
+            client._events = client_events
 
     async def _discover(self) -> None:
         """Browse the server and replace node_map with what it holds now."""
@@ -782,7 +830,7 @@ class OPCUAClient:
             self.name,
             TRACE_NAME_BYTES - len(self._event_prefix.encode()),
         )
-        dropped = self._declare_events(result.node_map)
+        added, changed = self._declare_events(result.node_map)
         self.node_map = result.node_map
         skipped = ", ".join(f"{k} {v}" for k, v in sorted(result.skipped.items()))
         self._log.info(
@@ -795,11 +843,17 @@ class OPCUAClient:
         )
         if result.renames:
             self._log.warning("Discovered names collided; renamed: %s", "; ".join(result.renames))
-        if dropped:
+        if changed:
             self._log.warning(
-                "Discovered fields not traced until restart (a declared event cannot "
-                "change its fields): %s",
-                "; ".join(f"{e}: {', '.join(f)}" for e, f in dropped.items()),
+                "Discovered fields changed datatype, not traced until restart: %s",
+                "; ".join(f"{e}: {', '.join(f)}" for e, f in changed.items()),
+            )
+        if added:
+            self._rotate_source()
+            self._log.info(
+                "Discovered fields added, trace source '%s' rotated: %s",
+                self._source.name if self._source else "",
+                "; ".join(f"{e}: {', '.join(f)}" for e, f in added.items()),
             )
 
     async def _resolve_nodes(self) -> None:
@@ -1052,7 +1106,8 @@ class OPCUAClient:
         otherwise be 100 serial round trips. Per-item Bad status codes come back
         inside the response (asyncua only raises for a service-level failure), so
         one dead node cannot take the whole cycle down with it; nor can a value
-        asyncua fails to decode (`read_many` isolates it as BadDecodingError).
+        asyncua fails to decode (`read_many` isolates it as BadDecodingError; it is
+        then dropped from polling until the next reconnect).
 
         Returns:
             {event_name: {field_name: value}}
@@ -1074,12 +1129,15 @@ class OPCUAClient:
 
         health = len(self._health_targets)
         results: dict[str, dict[str, Any]] = {}
+        undecodable: set[str] = set()
         if health:
             results[HEALTH_EVENT] = self._health_values(data_values[:health], host_time)
         for (event_name, node, _), dv in zip(self._poll_targets, data_values[health:], strict=True):
             status = dv.StatusCode
             if status is not None and not status.is_good():
                 self._log_node_failure(node, status.name)
+                if status.value == ua.StatusCodes.BadDecodingError:
+                    undecodable.add(node.node_id)
                 continue
             raw = dv.Value.Value if dv.Value else None
             if raw is None:
@@ -1092,6 +1150,9 @@ class OPCUAClient:
                 self._log_node_failure(node, f"decode failed: {describe_error(e)}")
                 continue
             results.setdefault(event_name, {})[node.name] = value
+        if undecodable:
+            # Otherwise its chunk is re-read item by item every cycle.
+            self._poll_targets = [t for t in self._poll_targets if t[1].node_id not in undecodable]
         return results
 
     def _health_values(self, data_values: list[ua.DataValue], host_time: float) -> dict[str, Any]:
@@ -1150,14 +1211,14 @@ class OPCUAClient:
 
     # ─── Lifecycle ──────────────────────────────────────────────────────────
 
-    def start(self, source: zelos_sdk.TraceSource | None = None) -> None:
+    def start(self, shared: SharedSource | None = None) -> None:
         """Declare the trace events and arm the polling loop.
 
         Args:
-            source: Shared prefix source, or None for a source of the server's own
+            shared: Shared prefix source, or None for a source of the server's own
         """
         self._running = True
-        self._init_trace_source(source)
+        self._init_trace_source(shared)
         self._log.info("Client started (%s)", self.endpoint)
 
     async def _run_async(self, stop_event: asyncio.Event) -> None:

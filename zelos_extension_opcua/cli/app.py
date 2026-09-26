@@ -20,7 +20,12 @@ from zelos_sdk.extensions import ConfigValidationError, load_config
 
 from zelos_extension_opcua import ACTION_PREFIX
 from zelos_extension_opcua import actions as opcua_actions
-from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, default_server_name
+from zelos_extension_opcua.client import (
+    OPCUAClient,
+    OPCUARunner,
+    SharedSource,
+    default_server_name,
+)
 from zelos_extension_opcua.node_map import NodeMap
 
 logger = logging.getLogger(__name__)
@@ -262,7 +267,7 @@ def serve(clients: list[OPCUAClient], prefix: str) -> None:
     opcua_actions.register_actions(zelos_sdk.actions_registry)
     if prefix:
         logger.info("Trace prefix: %s", prefix)
-        shared = zelos_sdk.init_global_source(prefix)
+        shared = SharedSource(zelos_sdk.init_global_source(prefix))
     else:
         logger.info("Trace prefix cleared: one trace source per server")
         shared = None
