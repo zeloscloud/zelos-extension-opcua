@@ -6,27 +6,22 @@ Traces OPC-UA servers into Zelos trace events, by subscription or polling, and e
 
 | Feature | Detail |
 |---------|--------|
+| Transport | Subscriptions by default; refused items are polled in batched Reads |
 | Discovery | A server without a node map is browsed on every connect and every scalar variable traced (read-only) |
-| Subscriptions | One per distinct interval; what the server refuses is polled instead, with one WARNING |
-| Batch polling | min(MaxNodesPerRead, 100) nodes per Read, the Reads of one interval spread across it; a bad node is reported once and skipped |
-| Source timestamps | Every sample is logged at its SourceTimestamp, else ServerTimestamp, else receipt |
-| Server health | Event `server` per server: state, clock skew, service level, session and rejected-request counts |
-| Auto-configure | The config form's button finds local and mDNS-announced servers and picks their security |
+| Security | None / Sign / SignAndEncrypt, with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss; X.509 user login |
+| Multiple servers | Any number in one extension; one unreachable server never stalls the others |
 | Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request |
-| Node mapping | JSON file groups nodes into trace events and fields |
 | Data types | bool, int8-64, uint8-64, float32/64, string |
-| Security | None / Sign / SignAndEncrypt, with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss |
-| Multiple servers | Any number of servers in one extension; one unreachable server never stalls the others |
-| Actions | Read, write, list and browse, live against the tracing connection |
 | Demo mode | Built-in PLC simulator, no hardware |
-
 
 ## Quick Start
 
 ```bash
-just install                  # dependencies + pre-commit hooks
-uv run main.py demo           # simulated PLC
-uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json
+uv run main.py                                                   # app mode (Zelos App config)
+uv run main.py demo                                              # built-in simulator
+uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json     # one server: endpoint + map
+uv run main.py trace opc.tcp://server:4840 nodes.json -s SignAndEncrypt -p Basic256Sha256
+uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: discover and trace everything
 ```
 
 ## Configuration
@@ -60,42 +55,46 @@ uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json
 | `advanced.user_certificate_file` | string | `""` | Default X.509 user certificate (DER/PEM); empty for Anonymous; needs Sign or SignAndEncrypt |
 | `advanced.user_private_key_file` | string | `""` | Unencrypted user key (DER/PEM); set with `user_certificate_file` |
 
-Trace layout: one source `OPC-UA` with events `<server>/<event>` (e.g. `OPC-UA/plc01/temperature`); with `advanced.prefix` cleared, each server is its own source with unprefixed events (`plc01/temperature`). Logs stay in `opcua_log`.
-Security is validated per server on its effective settings; a server set to None under a secure default connects, with a WARNING on every connect. A config in the pre-`servers[]` flat format is a startup error.
+Trace layout: `OPC-UA/<server>/<event>` (e.g. `OPC-UA/plc01/temperature`); with `advanced.prefix` cleared, one source per server (`plc01/temperature`). Logs go to `opcua_log`.
+
+Startup errors: the pre-`servers[]` flat config; `username` / `password` (no secret is stored in config, use a user certificate); a missing or unparseable `node_map_file`.
 
 ### Secure connections
 
-With Sign or SignAndEncrypt and no certificate configured, a client certificate is generated in the extension data directory (`$ZELOS_DATA_DIR/pki/`; `~/.zelos/opcua/pki/` for CLI runs) on first connect and reused; its path, SHA-1 thumbprint and expiry are logged. Trust it on the server. It is valid for 2 years; a WARNING starts 30 days before expiry, and an expired one is regenerated and must be trusted again.
-`strict` refuses any server certificate but the pinned one. A server that does not offer the requested mode and policy is refused with its offerings logged; the extension never falls back to None.
-User login is by X.509 certificate issued by the server admin; username/password is not supported, by design: no secret is stored in config. A server without a Certificate user token policy is refused with the token types it offers; the extension never falls back to Anonymous. A config that still sets `username` or `password` is a startup error.
-
-A configured `node_map_file` that is missing or unparseable is a startup error: the extension logs one line and exits, rather than running healthy while recording nothing.
+1. Set `security_mode` / `security_policy` (per server or `advanced`). A server not offering that pair is refused with its offerings logged; never falls back to None. A server set to None under a secure default connects with a WARNING.
+2. On first connect a client certificate is generated in `$ZELOS_DATA_DIR/pki/` (`~/.zelos/opcua/pki/` for CLI runs); path, SHA-1 thumbprint and expiry are logged. **Trust it on the server.** Valid 2 years; WARNING from 30 days before expiry; an expired one is regenerated and must be trusted again.
+3. Optional: `server_certificate: strict` + `server_certificate_file` refuses any server certificate but the pinned one.
+4. Optional: X.509 user login with a certificate issued by the server admin. A server without a Certificate user token policy is refused; never falls back to Anonymous.
 
 ### Discovery
 
-A server without a `node_map_file` is browsed on every connect (Browse, BrowseNext and Read only; nothing written to disk), so program changes appear after a reconnect. The walk follows forward hierarchical references from `Objects`, skipping the `Server` object, Objects whose BrowseName starts with `_` (Kepware `_System`, `_Statistics`, ...) and properties. Every scalar variable of a supported type is traced, read-only; arrays, structs and other types are skipped and counted in one INFO line per connect. A node refused BadNoContinuationPoints (a server holding few continuation points) is browsed again on its own; one the server cannot browse at all is skipped with one WARNING per connect naming it.
+A server without a `node_map_file` is browsed on every connect (read-only, nothing written to disk), so program changes appear after a reconnect.
 
-Names: the event is the parent path below `Objects` (`Line1/Motor`), the field the BrowseName. Vendor string ids name the event instead when their last segment is the BrowseName: Kepware `Channel.Device.Tag` and TwinCAT `MAIN.var` (dots), Siemens `"DB"."tag"`, CODESYS `|var|<device>.Application.PLC_PRG.x`, B&R `::Task:Var`. When two or more variables resolve to one event and field (same BrowseName, names equal after sanitization or 128-byte truncation), every one of them is named `<field>_<hash>`, 6 hex digits of the SHA-1 of its `nsu=` node id (stable across restarts), with one WARNING per connect listing each. A name never moves to another node: a collision appearing later renames the plain field instead. An event added by a reconnect is traced; a field added to an existing event starts a new segment of the trace source (one INFO line; the app joins sequential segments). A field whose datatype changed is skipped until restart, with one WARNING.
+| Aspect | Behavior |
+|---|---|
+| Walk | Forward hierarchical references from `Objects`; skips `Server`, Objects named `_*` (Kepware `_System`, ...), properties |
+| Traced | Every scalar variable of a supported type; arrays, structs, other types skipped (one INFO count per connect) |
+| Event / field | Event = parent path below `Objects` (`Line1/Motor`), field = BrowseName; vendor string ids (Kepware/TwinCAT dots, Siemens `"DB"."tag"`, CODESYS, B&R `::Task:Var`) name the event from the id |
+| Collisions | Every collider is named `<field>_<hash>` (6 hex of SHA-1 of its `nsu=` id, stable); one WARNING per connect; a name never moves to another node |
+| Changes on reconnect | New event: traced. New field: new trace segment (joined by the app). Changed datatype: skipped with one WARNING until restart |
+| Browse errors | BadNoContinuationPoints: re-browsed alone; other Bad: one WARNING per connect |
 
-`discovered_map` returns the discovered set as a node map (json, `nsu=` ids, `writable: false`) or csv; save the json as a `node_map_file` to pin or edit it.
+`discovered_map` returns the discovered set as node map json (save as `node_map_file` to pin or edit) or csv.
 
 ### Transport and timestamps
 
-`subscription` (default): per server, one subscription per distinct interval (an event's own `poll_interval`, else the server's), sampling = publishing = interval, queue size 1, reporting a change of value or status (no deadband). Items the server refuses (a per-item Bad status such as BadTooManyMonitoredItems or BadNodeIdUnknown, a refused subscription such as BadTooManySubscriptions, an overload) are polled for the rest of the connection, with one WARNING per connect naming the counts. A Publish response the client cannot decode moves every item to polling for the connection, with one WARNING: polling isolates the undecodable node, a Publish cannot. Subscriptions are rebuilt on every connect, after discovery.
-
-`poll`: every node is read in batched Reads (min(MaxNodesPerRead, 100) nodes each) every interval; the Reads of one interval are spread evenly across it. Server cost follows the request count, so batches are never smaller.
-
-A subscription reports changes only. A subscribed node silent for `min_update_interval` (a static value, or a server that stopped reporting it) is re-read in batched Reads; worst case, every node static, ceil(nodes / 100) Reads per `min_update_interval`. The refresh is logged at the Read's ServerTimestamp: the value is confirmed current then.
-
-Every sample is logged at its SourceTimestamp, else ServerTimestamp, else the time it was received. No clock-skew correction is applied; `_server.clock_skew_ms` shows it. Fields of one event with different timestamps are separate rows, so a subscription's rows hold only the fields that changed at that time.
+- `subscription`: one subscription per distinct interval (event `poll_interval`, else server's), queue size 1, change of value or status, no deadband. Refused items (e.g. BadTooManyMonitoredItems) and an undecodable Publish fall back to polling for the connection, one WARNING per connect.
+- `poll`: batched Reads of min(MaxNodesPerRead, 100) nodes, spread evenly across the interval.
+- A subscribed node silent for `min_update_interval` is re-read (worst case ceil(nodes / 100) Reads per interval) and logged at the Read's ServerTimestamp.
+- Samples are logged at SourceTimestamp, else ServerTimestamp, else receipt. No clock-skew correction (see `_server.clock_skew_ms`). Fields with different timestamps are separate rows.
 
 ### Server health
 
-Every server logs event `_server` at its poll interval, from one small Read, at host time: `state` / `state_name` (ServerStatus.State), `current_time`, `clock_skew_ms` (server CurrentTime minus host time at the read's midpoint), `start_time`, `service_level`, and from ServerDiagnosticsSummary `current_session_count`, `cumulated_session_count`, `rejected_requests_count`, `security_rejected_requests_count`, `current_subscription_count`. A field the server does not publish (diagnostics off) is dropped for the connection.
+Event `_server`, every poll interval, at host time: `state`, `state_name`, `current_time`, `clock_skew_ms` (server minus host), `start_time`, `service_level`, `current_session_count`, `cumulated_session_count`, `rejected_requests_count`, `security_rejected_requests_count`, `current_subscription_count`. Fields the server does not publish are dropped for the connection.
 
 ### Auto-configure
 
-The config form's Auto-configure button runs `auto_config` with the extension stopped. It replaces `servers` only, so Advanced survives.
+The config form's button runs `auto_config` (extension stopped); it replaces `servers` only.
 
 | Source | What |
 |---|---|
@@ -103,7 +102,7 @@ The config form's Auto-configure button runs `auto_config` with the extension st
 | Local Discovery Server | FindServers on `opc.tcp://localhost:4840` |
 | mDNS | 2s passive browse for `_opcua-tcp._tcp.local.` |
 
-Servers are deduplicated by ApplicationUri and named after their ApplicationName. Security is `default` when the server accepts None (so a secure Advanced default is never downgraded), else the strongest supported policy with SignAndEncrypt (then Sign); the generated client certificate must then be trusted on the server. No subnet sweep, no other ports.
+Deduplicated by ApplicationUri, named by ApplicationName. Security: `default` if the server accepts None, else its strongest policy with SignAndEncrypt (then Sign); trust the client certificate on the server.
 
 ## Node Map Format
 
@@ -125,7 +124,7 @@ Servers are deduplicated by ApplicationUri and named after their ApplicationName
 }
 ```
 
-`name` is the trace source, event keys are trace events, and node names are fields within them. An event is a node list, or an object with `nodes` and an optional `poll_interval` (seconds, at least 0.1) overriding the server's for that event.
+Event keys are trace events, node names their fields; the map `name` is optional and not part of trace paths. An event is a node list or `{"poll_interval": s, "nodes": [...]}` (seconds, >= 0.1).
 
 ### Node Fields
 
@@ -140,11 +139,9 @@ Servers are deduplicated by ApplicationUri and named after their ApplicationName
 
 ### Naming Rules
 
-Map, event and node names are sanitized at load: `. @ : ; =` and whitespace become `_` (and `/` in node names), because those characters are path separators in Zelos trace names. After sanitization, a duplicate event name, or a duplicate node name within one event, is a hard error. A node name in several events is addressed as `<event>/<name>` in `read_named_node` / `write_named_node`.
+Names are sanitized at load (`. @ : ; =` and whitespace, and `/` in node names, become `_`). A duplicate event name, or node name within one event, is a load error; a node name in several events is addressed as `<event>/<name>`.
 
 ## Actions
-
-Registered under the `OPC-UA/` prefix (the extension's name in `extension.toml`).
 
 | Action | Description |
 |--------|-------------|
@@ -159,24 +156,10 @@ Registered under the `OPC-UA/` prefix (the extension's name in `extension.toml`)
 | `OPC-UA/discovered_map` | The discovered nodes as node map json or csv text (`format`) |
 | `OPC-UA/auto_config` | Standalone: find servers for the config form (see Auto-configure) |
 
-Every action takes an optional `server` (a server name). It may be omitted with one server; with several, the other actions reject an omitted `server` and list the names.
+Every action takes an optional `server`, required when several servers are configured. Write values are text: `true`/`false`/`1`/`0` for bools, a number for numeric nodes; unparseable input is rejected before sending. Actions use the live session (none while stopped) and raise on failure.
 
 ```bash
 zelos actions execute OPC-UA/read_named_node --params '{"name":"temp_sensor1","server":"plc01"}'
-```
-
-Write values are text: `true`/`false`/`1`/`0` for bools, a number for numeric nodes, anything for strings. Unparseable input is rejected before the write is dispatched.
-
-Actions run against the extension's live session, so they cost no extra connection - a call made while the extension is stopped raises rather than opening one of its own. They raise on failure; a returned payload always means success.
-
-## CLI Usage
-
-```bash
-uv run main.py                                                   # app mode (Zelos App config)
-uv run main.py demo                                              # built-in simulator
-uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json     # one server: endpoint + map
-uv run main.py trace opc.tcp://server:4840 nodes.json -s SignAndEncrypt -p Basic256Sha256
-uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: discover and trace everything
 ```
 
 ## Development
@@ -192,7 +175,7 @@ just sim          # standalone simulator (see Simulator)
 
 ## Simulator
 
-`just sim [ARGS]` runs a standalone server on `opc.tcp://127.0.0.1:4840/freeopcua/server/` until Ctrl-C.
+`just sim [ARGS]`: standalone server on `opc.tcp://127.0.0.1:4840/freeopcua/server/` until Ctrl-C.
 
 | Profile | Exercises |
 |---|---|
@@ -212,11 +195,7 @@ just sim          # standalone simulator (see Simulator)
 | `--nodes N` | Adds N Float variables `Bulk.GroupNNNN.ValueNNN` (100 per folder), computed on read |
 | `--log-requests` | Logs request counts by service at shutdown |
 
-```bash
-just sim --profile s7 --log-requests
-just sim --secure --trust-dir ./trusted
-just sim --map my_nodes.json
-```
+Example: `just sim --profile s7 --secure --trust-dir ./trusted --log-requests`.
 
 ## Links
 

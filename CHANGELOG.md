@@ -8,129 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial implementation
-- Reconnect with capped exponential backoff (3s doubling to 60s, reset on a
-  completed poll) and typed connection-loss detection from asyncua status codes
-  instead of exception-string matching.
-- Node names, event names, and the source name are sanitized (`. @ : ; = /` and
-  whitespace become `_`) before reaching the trace catalog; duplicate names
-  after sanitization are a hard error at node map load.
-- `demo-server` / `just sim`: standalone simulator with `gateway`, `s7` and `device`
-  profiles, `--secure` with an optional trust list, `--shuffle-namespaces`, `--map`,
-  and a per-session request log.
-- Client certificate handling: a self-signed client certificate generated in
-  the extension data directory and reused, or `advanced.certificate_file` /
-  `private_key_file`; `advanced.server_certificate` `auto` or `strict` pinning.
-- X.509 user identity: `advanced.user_certificate_file` / `user_private_key_file`
-  (operator-issued) log in with a user certificate on a Sign or SignAndEncrypt
-  channel; a server without a Certificate user token policy is refused.
-- `nsu=<uri>;...` node IDs in maps and actions, resolved against the server's NamespaceArray on each connect; `browse_nodes` returns an `nsu_node_id` per result.
-- Live discovery: a server without a node map is browsed on every connect and every
-  scalar variable traced, read-only; `advanced.discovery` turns it off.
-  `discovered_map` returns the discovered set as node map json or csv.
-  Colliding discovered names (same BrowseName, sanitization, truncation) all get
-  `_<hash>` of their `nsu=` node id, so a trace name never re-points to another node.
-  A reconnect that finds fields added to an existing event starts a new segment
-  of the trace source (one INFO line) and traces them; a field whose datatype
-  changed is skipped with one WARNING until restart.
-- Discovery types a Number / Integer / UInteger node as float64 / int64 / uint64 and a BaseDataType node as string, each value rendered as text (bool true/false, DateTime ISO 8601 UTC, ByteString hex, StatusCode name), so a value type change never drops it; other untyped nodes by their value's kind (bool, float64, string); concrete DataTypes are kept exactly.
-- Server health event `_server` per server (state, clock skew, service level,
-  session and rejected-request counts), read in the poll's own request.
-- `auto_config` standalone action behind the config form's Auto-configure button:
-  localhost well-known ports, the Local Discovery Server and mDNS (`zeroconf`).
-- Simulator `--nodes N` (large address space) and `--secure-only`.
-- Subscriptions by default (`advanced.transport`, per-server override): one per
-  distinct interval, sampling = publishing = interval, queue size 1, change of
-  value or status. Items the server refuses, a refused subscription, or an
-  undecodable Publish fall back to polling for the connection with one WARNING.
-- Discovered nodes declared BaseDataType are polled, never subscribed (their value type may change per sample); `get_status` reports `polled_variant`.
-  `poll` spreads each interval's batched Reads evenly across it.
-- Node map events may be `{"poll_interval": s, "nodes": [...]}` to override the
-  server's interval.
-- `advanced.min_update_interval` (default 60s; per-server override, empty inherits): a subscribed
-  node silent that long is re-read and logged at the Read's ServerTimestamp.
-- Samples are logged at SourceTimestamp, else ServerTimestamp, else receipt;
-  fields of one event with different timestamps are separate rows.
-- `get_status` reports the transport and subscribed / polled counts.
-- Simulator `s7` caps 5 subscriptions, 10 monitored items and 3 continuation
-  points per session; every simulator stamps ServerTimestamp on Read.
+- Initial implementation.
+- Multiple servers in one extension (`servers[]`); one unreachable server never stalls the others.
+- Subscriptions by default (`advanced.transport`, per-server override): one per distinct interval, sampling = publishing = interval, queue size 1, change of value or status. Refused items or subscriptions, and an undecodable Publish, fall back to polling for the connection with one WARNING.
+- `advanced.min_update_interval` (default 60s, per-server override, empty inherits): a subscribed node silent that long is re-read and logged at the Read's ServerTimestamp.
+- Node map events may be `{"poll_interval": s, "nodes": [...]}` to override the server's interval.
+- Samples are logged at SourceTimestamp, else ServerTimestamp, else receipt; fields of one event with different timestamps are separate rows.
+- Live discovery: a server without a node map is browsed on every connect and every scalar variable traced, read-only (`advanced.discovery` turns it off). Colliding names all get `_<hash>` of their `nsu=` id, so a name never re-points; fields added on reconnect start a new trace source segment; a field whose datatype changed is skipped with one WARNING until restart.
+- Discovery types Number / Integer / UInteger as float64 / int64 / uint64 and BaseDataType as string (rendered as text: bool, ISO 8601 UTC, hex, StatusCode name); BaseDataType nodes are always polled (`get_status` `polled_variant`).
+- `discovered_map` action: discovered nodes as node map json or csv.
+- `nsu=<uri>;...` node IDs in maps and actions, resolved against the NamespaceArray on each connect; `browse_nodes` returns `nsu_node_id`.
+- `_server` health event per server (state, clock skew, service level, session and rejected-request counts) from its own small Read per interval.
+- `auto_config` standalone action (config form's Auto-configure button): localhost well-known ports, Local Discovery Server, mDNS (`zeroconf`).
+- Client certificate generated in the extension data directory and reused, or `advanced.certificate_file` / `private_key_file`; `server_certificate` `auto` or `strict` pinning.
+- X.509 user identity (`user_certificate_file` / `user_private_key_file`) on Sign / SignAndEncrypt; a server without a Certificate user token policy is refused.
+- Reconnect with capped exponential backoff (3s doubling to 60s, reset on a completed request); connection loss detected from asyncua status codes, not message text.
+- Names are sanitized (`. @ : ; = /` and whitespace become `_`); duplicates after sanitization are a load error.
+- `get_status` reports transport and subscribed / polled counts.
+- `demo-server` / `just sim`: simulator with `gateway`, `s7` (enforced limits and session caps) and `device` profiles, `--secure`, `--secure-only`, trust lists, `--shuffle-namespaces`, `--map`, `--nodes N`, request log.
 
 ### Changed
-- The `_server` health event is its own small Read per poll interval rather
-  than leading the poll request.
-- Browse and poll requests are chunked by the server's MaxNodesPerBrowse /
-  MaxNodesPerRead, capped at 100.
-- A node name may repeat across events in a node map (`<event>/<name>` in the
-  named actions); only a duplicate within one event is an error.
-- zelos-sdk floor 0.0.12a1.
-- asyncua 2.0.1 (was 1.1.8): fixes BadServerUriInvalid on CreateSession against
-  .NET-stack (Microsoft OPC PLC) and Unified Automation SDK servers.
-- Config format: servers are listed under `servers[]` (name, endpoint, node map,
-  poll interval, per-server security and certificate pin) with shared settings and
-  security defaults under `advanced` (`prefix`, `timeout`, `log_level`, client
-  certificate, default security mode/policy and user certificate). A server's
-  `default` / empty security settings inherit the advanced default. The old flat
-  config is a startup error.
-- Trace paths are now `OPC-UA/<server>/<event>` (source `advanced.prefix`, default
-  `OPC-UA`); clearing the prefix gives each server its own source. The node map
-  `name` no longer names the source.
-- Every action takes an optional `server`; `get_status` and `list_nodes` /
-  `list_writable_nodes` cover every server when it is omitted.
-- Actions moved from client methods to a free-function surface registered under
-  the `OPC-UA/` prefix (was `zelos_extension_opcua/`). Actions now reuse the
-  live server connection instead of opening a new one per invocation, and
-  failures raise instead of returning `success: false` payloads.
-- Polling issues one batched read per cycle with per-node status handling; a
-  failing node no longer aborts the cycle and logs at most one error per
-  process lifetime.
-- Shutdown is loop-native and bounded: SIGTERM/SIGINT close the OPC UA session
-  cleanly with a 3s cap instead of exiting from the signal handler, and a
-  shutdown during a connect attempt cancels it instead of waiting the connect
-  out (an unreachable endpoint used to hold the process well past the grace
-  period).
-- Write actions take text instead of a number, coerced to the node's datatype
-  (`true`/`false`/`1`/`0` for bools), so bool and string nodes are writable.
-- Polling chunks its batched read at 100 nodes per request, so a large node map
-  cannot exceed a server's `MaxNodesPerRead`.
-- `zelos` app compatibility floor raised to `>=26.0.4`, the first release that
-  parses the `[host]` / `[package]` manifest syntax.
-- A configured node map file that is missing or unparseable is now a startup
-  error instead of a warning that silently records nothing.
-- Demo node map: `sensor1`/`sensor2` renamed to `temp_sensor1`/`temp_sensor2`
-  and `pressure_sensor1`/`pressure_sensor2` (name uniqueness rule).
-- `asyncua` floor raised to `>=1.1.8` (batch-read status handling verified
-  against 1.1.8).
-- Manifest migrated from the legacy `[runtime]` section to `[host] type = "agent"`
-  plus `[host.agent]`, with an explicit `[package]` section defining the archive
-  contents. Manifest `name` is now `OPC-UA`, so the archive slug is `opc-ua`.
-- Packaging runs `zelos extensions package`, which builds the archive from the
-  manifest instead of a hand-rolled script.
-- `zelos-sdk` floor raised to `>=0.0.11a1`: name sanitization delegates to the
-  SDK's `sanitize_name` (the catalog name grammar), and packaging can inventory
-  standalone actions.
-- CI verifies `uv.lock` is in sync with `pyproject.toml` (`uv lock --locked`), and
-  `just check` now enforces `ruff format --check` alongside `ruff check`.
-- Log lines use UTC ISO 8601 timestamps with milliseconds, matching the SDK's Rust tracing format.
+- **Breaking** config: servers under `servers[]` (name, endpoint, node map, poll interval, transport, security, certificate pin), shared settings and security defaults under `advanced`; `default` / empty per-server security inherits. The old flat config is a startup error.
+- **Breaking** trace paths: `OPC-UA/<server>/<event>` (source `advanced.prefix`, default `OPC-UA`; cleared, one source per server). The node map `name` no longer names the source.
+- **Breaking** actions: registered under `OPC-UA/` (was `zelos_extension_opcua/`), reuse the live connection, and raise on failure instead of returning `success: false`. Every action takes an optional `server`; `get_status` / `list_*` cover all servers when omitted.
+- Write actions take text coerced to the node's datatype (`true`/`false`/`1`/`0` for bools), so bool and string nodes are writable.
+- A node name may repeat across events (addressed as `<event>/<name>`); only a duplicate within one event is an error.
+- Reads are batched (min(MaxNodesPerRead, 100) per request, spread across the interval) with per-node status; a bad or undecodable node costs only itself, logs one error per process, and an undecodable one is dropped from polling until reconnect. Browse is chunked by MaxNodesPerBrowse, capped at 100.
+- Shutdown is bounded (~3s): SIGTERM/SIGINT close sessions cleanly and cancel an in-flight connect.
+- A missing or unparseable `node_map_file` is a startup error.
+- Demo node map: `sensor1`/`sensor2` renamed to `temp_sensor*` / `pressure_sensor*`.
+- asyncua 2.0.1 (was 1.1.8): fixes BadServerUriInvalid against .NET-stack (Microsoft OPC PLC) and Unified Automation servers.
+- zelos-sdk floor 0.0.12a1; `zelos` app floor `>=26.0.4`.
+- Manifest uses `[host] type = "agent"` + `[host.agent]` and `[package]`; `name` is `OPC-UA` (archive slug `opc-ua`); packaging runs `zelos extensions package`.
+- CI checks `uv lock --locked`; `just check` enforces `ruff format --check`.
+- Log lines use UTC ISO 8601 timestamps with milliseconds.
 
 ### Removed
-- `scripts/package_extension.py`, superseded by `zelos extensions package`.
-- Username/password login (`username`, `password`, `trace -u/--password`): no
-  secret is stored in config. A config still setting either is a startup error;
-  use a user certificate.
+- `scripts/package_extension.py`.
+- **Breaking** username/password login (`username`, `password`, `trace -u/--password`): setting either is a startup error; use a user certificate.
 
 ### Fixed
-- Discovery re-browses, one per request, a node refused BadNoContinuationPoints,
-  instead of silently dropping its branch; any other Bad browse status is one
-  WARNING per connect naming the node.
-- Sign / SignAndEncrypt never engaged: the security call was never awaited, so
-  every session was plaintext. A secure mode now establishes exactly that mode and
-  policy or refuses to connect; it never falls back to None.
-- Discovery found nothing on .NET-stack servers (BadNodeNotInView): Browse now
-  asks for the current view.
-- A value asyncua cannot decode, or an integer outside its field's width, costs
-  only its node instead of failing the whole read or poll cycle. An undecodable
-  node is left out of polling until the next reconnect rather than forcing an
-  item-by-item re-read of its chunk every cycle.
+- Sign / SignAndEncrypt never engaged (security call not awaited, every session plaintext). A secure mode now gets exactly that mode and policy or refuses; never falls back to None.
+- Discovery found nothing on .NET-stack servers (BadNodeNotInView): Browse asks for the current view.
+- Discovery re-browses a node refused BadNoContinuationPoints instead of dropping its branch; other Bad browse statuses are one WARNING per connect.
 
 ---
 

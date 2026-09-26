@@ -44,22 +44,20 @@ from zelos_extension_opcua.discovery import (
     operation_limits,
     read_many,
     to_nsu_string,
+    value_of,
 )
 from zelos_extension_opcua.node_map import Node, NodeMap, parse_node_id
 
 logger = logging.getLogger(__name__)
 
-# Reconnect backoff: retry fast at first, then back off so a server that is down
-# for hours costs one attempt a minute instead of one every three seconds.
+# Reconnect backoff: a server down for hours costs one attempt a minute.
 RECONNECT_INITIAL = 3.0
 RECONNECT_MAX = 60.0
 
-# Ceiling on the disconnect at shutdown. A wedged session must not make the
-# process unkillable; past this we give up and let the socket die with us.
+# Ceiling on the disconnect at shutdown: a wedged session must not make the process unkillable.
 SHUTDOWN_TIMEOUT = 3.0
 
-# Consecutive whole-poll failures that force a reconnect. An error we do not
-# classify as connection loss would otherwise repeat forever on a dead session.
+# Unclassified request failures in a row that force a reconnect: never wedge on a dead session.
 POLL_FAILURES_BEFORE_RECONNECT = 5
 
 TRANSPORTS = ("subscription", "poll")
@@ -69,8 +67,8 @@ TRANSPORTS = ("subscription", "poll")
 KEEPALIVE_SECONDS = 10.0
 LIFETIME_KEEPALIVES = 10
 
-# The server will take no more: every later item is refused without asking,
-# which on an S7 would otherwise be one rejected request per 100 items.
+# The server takes no more: later items are refused without asking (an S7 would
+# otherwise cost one rejected request per 100 items).
 SERVER_FULL_CODES = frozenset(
     (ua.StatusCodes.BadTooManyMonitoredItems, ua.StatusCodes.BadTooManySubscriptions)
 )
@@ -85,8 +83,7 @@ _UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _NULL_TIME = datetime(1601, 1, 2, tzinfo=UTC)
 _MAX_TIME = datetime(2262, 4, 11, tzinfo=UTC)
 
-# Status codes that mean the session or transport is gone, not that one node is
-# bad. A poll that comes back with any of these triggers a reconnect.
+# The session or transport is gone, not one node: reconnect.
 CONNECTION_STATUS_CODES = frozenset(
     getattr(ua.StatusCodes, name)
     for name in (
@@ -175,10 +172,8 @@ SECURITY_POLICIES = {
 }
 SERVER_CERTIFICATE_POLICIES = ("auto", "strict")
 
-# Generated client identity. Reused across runs: servers trust a client by
-# certificate thumbprint, so regenerating would silently revoke that trust.
-# ZELOS_DATA_DIR is the agent's per-extension store and survives updates; a
-# CLI run outside the agent falls back to the user's home.
+# Generated client identity, reused: servers trust by thumbprint, so regenerating
+# revokes that trust. ZELOS_DATA_DIR survives updates; outside the agent, home.
 PKI_DIR = (
     Path(os.environ["ZELOS_DATA_DIR"]) / "pki"
     if os.environ.get("ZELOS_DATA_DIR")
@@ -188,8 +183,7 @@ CLIENT_CERT_FILE = "client_cert.der"
 CLIENT_KEY_FILE = "client_key.pem"
 # Must equal the URI in the certificate's SubjectAltName; servers reject a mismatch.
 APPLICATION_URI = "urn:zelos:opcua:client"
-# Expiry forces a new thumbprint and a re-trust on every server, so it is
-# announced ahead of time rather than discovered as a failed connect.
+# Expiry forces a re-trust on every server, so it is announced ahead of time.
 CLIENT_CERT_DAYS = 730
 CERT_EXPIRY_WARNING_DAYS = 30
 
@@ -318,8 +312,7 @@ def validate_security(
         raise ValueError("certificate_file and private_key_file must be set together")
     if bool(user_certificate_file) != bool(user_private_key_file):
         raise ValueError("user_certificate_file and user_private_key_file must be set together")
-    # The user token signature covers the server nonce, which only a secure
-    # channel protects.
+    # The user token signature covers the server nonce, which only a secure channel protects.
     if user_certificate_file and not secure:
         raise ValueError("a user certificate needs security_mode Sign or SignAndEncrypt")
     if server_certificate not in SERVER_CERTIFICATE_POLICIES:
@@ -345,28 +338,15 @@ def validate_security(
 
 
 def describe_error(error: BaseException) -> str:
-    """Message, or the class name when there is no message.
-
-    asyncio.TimeoutError and friends stringify to nothing, which logs as a line
-    that names no failure at all.
-    """
+    """Message, or the class name: TimeoutError and friends stringify to nothing."""
     return str(error) or type(error).__name__
 
 
 def coerce_text(text: str, datatype: str) -> float | int | bool | str:
-    """Parse an action's text input into a node's datatype.
+    """Parse a write action's text into a node's datatype.
 
-    Write actions take text, not a number, so bool and string nodes are
-    writable at all. Integer text stays exact (int64/uint64 exceed a float's 53
-    bits); other numeric text is parsed as a float and truncated for integer
-    types, matching what `encode_value` does with a scale.
-
-    Args:
-        text: Raw text from the action parameter
-        datatype: Node map data type string
-
-    Returns:
-        The parsed value
+    Integer text stays exact (int64/uint64 exceed a float's 53 bits); other
+    numeric text is parsed as a float and truncated for integer types.
 
     Raises:
         ValueError: If the text does not parse as the datatype
@@ -395,12 +375,7 @@ def coerce_text(text: str, datatype: str) -> float | int | bool | str:
 
 
 def render_text(value: Any) -> str:
-    """A scalar as text: the field of a node whose value type may change.
-
-    Bool as true/false, numbers as Python writes them, DateTime ISO 8601 UTC,
-    ByteString hex, StatusCode its name; anything else (a struct) its str(),
-    which asyncua prefixes with the type name.
-    """
+    """A scalar as text, for a node whose value type may change; a struct is its str()."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
@@ -419,15 +394,10 @@ def render_text(value: Any) -> str:
 
 
 def decode_value(value: Any, datatype: str, scale: float = 1.0) -> float | int | bool | str | None:
-    """Decode an OPC-UA value to a typed, scaled Python value.
+    """An OPC-UA value as the node's datatype, scaled; None stays None.
 
-    Args:
-        value: Raw OPC-UA value
-        datatype: Node map data type string
-        scale: Scale factor to apply
-
-    Returns:
-        Decoded and scaled value, or None if the input was None
+    Raises:
+        ValueError: An integer out of the datatype's range
     """
     if value is None:
         return None
@@ -439,8 +409,8 @@ def decode_value(value: Any, datatype: str, scale: float = 1.0) -> float | int |
     if datatype in ("float32", "float64"):
         return float(value) * scale
     if datatype in INT_DATATYPES:
-        # The trace field has the declared width; one out-of-range value would
-        # fail the whole event at emit. Unscaled ints stay exact: a float has 53 bits.
+        # One out-of-range value would fail the whole event at emit. Unscaled
+        # ints stay exact: a float has 53 bits.
         exact = scale == 1 and isinstance(value, int)
         out, (low, high) = int(value if exact else value * scale), INT_RANGES[datatype]
         if not low <= out <= high:
@@ -450,16 +420,7 @@ def decode_value(value: Any, datatype: str, scale: float = 1.0) -> float | int |
 
 
 def encode_value(value: float | int | bool | str, datatype: str, scale: float = 1.0) -> Any:
-    """Encode a Python value for an OPC-UA write.
-
-    Args:
-        value: Value to write
-        datatype: Node map data type string
-        scale: Scale factor (the value is divided by it)
-
-    Returns:
-        Encoded value
-    """
+    """A Python value for an OPC-UA write, divided by `scale`."""
     if datatype == "bool":
         return bool(value)
     if datatype == "string":
@@ -473,23 +434,12 @@ def encode_value(value: float | int | bool | str, datatype: str, scale: float = 
 
 
 def parse_node_id_to_ua(node_id_str: str, namespaces: Sequence[str] = ()) -> NodeId:
-    """Convert a node ID string to an asyncua NodeId.
-
-    Args:
-        node_id_str: Node ID in the form ns=X;[s|i|g|b]=Y or nsu=URI;[s|i|g|b]=Y
-        namespaces: The server's NamespaceArray; only consulted for nsu=
-
-    Returns:
-        asyncua NodeId
+    """A node ID string as an asyncua NodeId; nsu= resolves against `namespaces`.
 
     Raises:
-        ValueError: If the node ID is malformed, or its nsu= URI is not in
-            `namespaces`
+        ValueError: If the node ID is malformed, or its nsu= URI is not in `namespaces`
     """
-    # node_map.parse_node_id is the one implementation: it already returns the
-    # identifier as the Python type NodeId infers its NodeIdType from (a str for
-    # g= or b= would send a String identifier that no server matches), so map
-    # validation and this conversion cannot drift apart.
+    # parse_node_id types the identifier (a str g= or b= would never match).
     namespace, _, identifier = parse_node_id(node_id_str)
     if isinstance(namespace, str):
         if namespace not in namespaces:
@@ -525,14 +475,9 @@ def sample_time_ns(dv: ua.DataValue, received_ns: int, refresh: bool = False) ->
 
 
 def is_connection_error(error: BaseException) -> bool:
-    """Whether an exception means the transport or session is gone.
+    """Whether an exception means the transport or session is gone. Typed, never message text.
 
-    Typed, never message text. Verified against a real server: both a killed and
-    a gracefully stopped server make the next read raise builtins.ConnectionError,
-    and a reconnect against the dead port raises ConnectionRefusedError - both
-    OSError subclasses. The one case that needs a fallback is a black-holed
-    socket (packets dropped, connection still nominally open), where asyncua
-    wraps the timeout in a bare Exception; its __cause__ is the TimeoutError.
+    A black-holed socket surfaces as a bare Exception whose __cause__ is the TimeoutError.
     """
     if isinstance(error, (OSError, TimeoutError)):  # ConnectionError is an OSError
         return True
@@ -580,11 +525,7 @@ class _Job:
 
 
 class OPCUAClient:
-    """OPC-UA client that subscribes to or batch-polls one server's nodes into a trace source.
-
-    The event loop, stop event and signal handling belong to `OPCUARunner`; a
-    client only runs inside one.
-    """
+    """Subscribes to or polls one server's nodes into a trace source; runs in an OPCUARunner."""
 
     def __init__(
         self,
@@ -606,8 +547,7 @@ class OPCUAClient:
         transport: str = "subscription",
         min_update_interval: float = 60.0,
     ) -> None:
-        """Initialize the client.
-
+        """
         Args:
             endpoint: OPC-UA server endpoint URL
             name: Server name in the trace and the actions; default the endpoint host
@@ -725,23 +665,20 @@ class OPCUAClient:
     # ─── Setup ──────────────────────────────────────────────────────────────
 
     async def _create_client(self) -> Client:
-        """Create the asyncua client with configured security.
+        """The asyncua client with configured security.
 
         Raises:
             ConnectionSecurityError: If the requested security cannot be established
         """
-        # asyncua's liveness probe times out at the watchdog interval (1s default),
-        # which would drop sessions to any server slower than that; give it the
-        # request timeout. Its auto_reconnect stays off: reconnect is ours.
+        # The supervisor's 1s default watchdog drops sessions to slower servers.
+        # Its auto_reconnect stays off: reconnect is ours.
         client = Client(url=self.endpoint, timeout=self.timeout, watchdog_intervall=self.timeout)
-        # A secure mode either configures that exact channel or raises: there is
-        # no path from here to a None channel.
         if self.security_mode != "None":
             await self._apply_security(client)
 
         if self.user_certificate_file:
-            # asyncua names the user identity cert `load_client_certificate`; the
-            # app cert went to set_security. Both set = X509IdentityToken.
+            # asyncua's `load_client_certificate` is the USER identity; the app cert
+            # went to set_security.
             key = _load_private_key(self.user_private_key_file)
             await client.load_client_certificate(
                 load_cert_der(self.user_certificate_file), extension="der"
@@ -779,13 +716,11 @@ class OPCUAClient:
         return self._identity
 
     async def _apply_security(self, client: Client) -> None:
-        """Configure `client` for exactly the configured mode and policy.
+        """Configure `client` for exactly the configured mode and policy, or raise.
 
-        The server certificate comes from GetEndpoints. That exchange is itself
-        unauthenticated, so the pin compare below is only the early, readable
-        refusal: asyncua binds the channel to the certificate passed to
-        set_security (OPN is encrypted to it and its reply verified against it),
-        and CreateSession rejects any other certificate.
+        GetEndpoints is unauthenticated, so the pin compare is only the readable
+        refusal; the real check is OPN encrypted to the certificate passed to
+        set_security. With server_certificate=None asyncua would downgrade to None.
         """
         mode = SECURITY_MODES[self.security_mode]
         policy = SECURITY_POLICIES[self.security_policy]
@@ -814,8 +749,7 @@ class OPCUAClient:
                 f"it offers {', '.join(offered) or 'no endpoints'}"
             )
 
-        # asyncua falls back to a made-up policy when the server has none for the
-        # token type; refuse here instead of sending a token it will reject.
+        # asyncua invents a policy when the server has none for the token type.
         if self.user_certificate_file and not any(
             t.TokenType == ua.UserTokenType.Certificate for t in endpoint.UserIdentityTokens
         ):
@@ -889,10 +823,8 @@ class OPCUAClient:
     ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
         """Declare the map's new events; record fields added to declared ones.
 
-        A declared event's schema is fixed on its source, so an added field is
-        only recorded here and takes a source rotation to trace. A field whose
-        datatype changed is left out of `node_map`: types are not reconciled
-        across segments.
+        A declared schema is fixed on its source: an added field takes a rotation.
+        A field whose datatype changed is left out of `node_map`.
 
         Returns:
             (event -> fields added, event -> fields left out for a type change)
@@ -921,8 +853,7 @@ class OPCUAClient:
     def _rotate_source(self) -> None:
         """Move every client on this source to a new segment of the same name.
 
-        Synchronous: no await between the last write to the old source and the
-        switch. The old source keeps no reference here, so it can end its segment.
+        Synchronous: no await between the last write to the old source and the switch.
         """
         shared = self._shared
         assert shared is not None
@@ -984,16 +915,9 @@ class OPCUAClient:
             )
 
     async def _resolve_nodes(self) -> None:
-        """Resolve every mapped node ID to an asyncua node handle.
-
-        Handles are bound to the client that produced them, and nsu= indexes to
-        the server's current NamespaceArray, so this runs on every (re)connect
-        rather than once at startup, and the poll path never calls get_node again.
-
-        A node whose URI the server does not publish is skipped with one ERROR
-        per URI; the rest still poll. Reading it under a guessed index would log
-        some other node's data under this name.
-        """
+        """Resolve every mapped node ID to a handle, on every connect: handles and
+        nsu= indexes are per session. An unpublished URI skips its nodes (one ERROR);
+        a guessed index would log another node's data under this name."""
         self._poll_targets = []
         self._ua_nodes = {}
         if not self.node_map or not self._client:
@@ -1024,11 +948,7 @@ class OPCUAClient:
     # ─── Connection ─────────────────────────────────────────────────────────
 
     async def connect(self) -> bool:
-        """Connect to the server and resolve the node map.
-
-        Returns:
-            True if connected
-        """
+        """Connect, discover, resolve and subscribe; False on failure (logged)."""
         if self.downgrade_from:
             self._log.warning(
                 "security_mode None overrides the advanced default %s: this session is "
@@ -1094,12 +1014,7 @@ class OPCUAClient:
             self._log.info("Disconnected from OPC-UA server")
 
     async def _ensure_connected(self) -> bool:
-        """Connect if not connected.
-
-        There is deliberately no separate liveness probe: the health read at the
-        server's poll interval is one, and asyncua's supervisor ends the
-        subscriptions (a Bad status change, see _publish_callback) on a loss it sees.
-        """
+        """Connect if not connected. No separate liveness probe: the health Read is one."""
         if self._connected and self._client:
             return True
         if self._client:
@@ -1136,20 +1051,16 @@ class OPCUAClient:
         return await (await self._ua_node(node_id)).read_value()
 
     async def write_node(self, node_id: str, value: Any, sent: list[float] | None = None) -> None:
-        """Write a value by node ID. Raises on protocol error.
+        """Write a value by node ID: two round trips, each bounded by `self.timeout`.
 
-        Two round trips, each bounded by `self.timeout` - callers dispatching
-        this must budget for both. `sent` gets the monotonic time the Write
-        request goes out: past that, a timeout cannot say whether it applied.
+        `sent` gets the monotonic time the Write goes out: past it, a timeout
+        cannot say whether it applied.
         """
         node = await self._ua_node(node_id)
-        # Match the server's variant type. A bare Python value lets asyncua guess
-        # (int -> Int64), which a Float or UInt32 node rejects as BadTypeMismatch.
+        # A bare Python value lets asyncua guess (int -> Int64): BadTypeMismatch.
         dv = await node.read_data_value()
         variant_type = dv.Value.VariantType if dv.Value else None
         if isinstance(value, str) and variant_type in VARIANT_DATATYPES:
-            # Text from the write action: the server's type is the only datatype
-            # an unmapped node has.
             value = coerce_text(value, VARIANT_DATATYPES[variant_type])
         variant = ua.Variant(value, variant_type) if variant_type else ua.Variant(value)
         if sent is not None:
@@ -1180,8 +1091,7 @@ class OPCUAClient:
         await self.write_node(node.node_id, encode_value(value, node.datatype, node.scale), sent)
 
     async def _check_writable(self, node_id: str) -> bool:
-        """Read the AccessLevel bit. Assumes writable when it cannot be read, so
-        that a server which hides AccessLevel does not block every write."""
+        """The CurrentWrite bit; True when unreadable, or a server hiding it blocks every write."""
         try:
             ua_node = await self._ua_node(node_id)
             access_level = await ua_node.read_attribute(ua.AttributeIds.AccessLevel)
@@ -1213,7 +1123,6 @@ class OPCUAClient:
                 browse_name = await child.read_browse_name()
                 node_class = await child.read_node_class()
             except Exception as e:
-                # A child we cannot describe is not a reason to abandon the walk.
                 self._log.debug("Skipping child of %s: %s", node.nodeid.to_string(), e)
                 continue
 
@@ -1240,14 +1149,9 @@ class OPCUAClient:
     async def _start_transport(self) -> None:
         """Subscribe or poll every resolved node, and schedule this connection's jobs.
 
-        One subscription per distinct interval (an event's own poll_interval,
-        else the server's). What the server refuses - an item's Bad status, a
-        refused subscription, an overload - is polled for the rest of the
-        connection, with one WARNING.
-
-        A node declared BaseDataType is polled, never subscribed: its value type
-        may change per sample, and asyncua drops a whole Publish over one value
-        it cannot decode (see _guard_publish).
+        One subscription per distinct interval; what the server refuses is polled
+        for the connection (one WARNING). BaseDataType nodes are polled: asyncua
+        drops a whole Publish over one value it cannot decode.
         """
         intervals = self.node_map.intervals if self.node_map else {}
         groups: dict[float, list[tuple[int, Target]]] = {}
@@ -1307,7 +1211,7 @@ class OPCUAClient:
         on_publish: Callable[[ua.PublishResult], None],
         full: str | None,
     ) -> tuple[list[tuple[Target, str]], str | None]:
-        """One subscription publishing and sampling at `interval` for `items`.
+        """One subscription publishing and sampling at `interval`.
 
         Args:
             full: A status from an earlier refusal meaning the server takes no more
@@ -1336,8 +1240,6 @@ class OPCUAClient:
             return [(t, name) for _, t in items], name if e.code in SERVER_FULL_CODES else None
         self._subscription_ids.append(subscription.SubscriptionId)
 
-        # Every item reports a change of value or status only (no deadband),
-        # sampled at the interval, the latest value only.
         change = ua.DataChangeFilter(Trigger=ua.DataChangeTrigger.StatusValue)
         refused: list[tuple[Target, str]] = []
         for start in range(0, len(items), self._monitor_chunk):
@@ -1393,12 +1295,9 @@ class OPCUAClient:
         return refused, full
 
     def _guard_publish(self, client: Client) -> None:
-        """Poll everything, for this connection, once a Publish response fails to decode.
+        """Poll everything for the connection once a Publish fails to decode.
 
-        asyncua drops the whole response over one value it cannot decode (a
-        misparsed ExtensionObject, a 2-D array) and does not say which item it
-        was, so it would be lost from every Publish. Polling isolates it (see
-        `_read_targets`) while the rest keep flowing.
+        asyncua drops the whole response without naming the item; polling isolates it.
         """
         session = client.uaclient.session
         publish = session.publish
@@ -1417,9 +1316,8 @@ class OPCUAClient:
     async def _poll_everything(self, client: Client) -> None:
         """Delete this connection's subscriptions and poll every target.
 
-        Deferred while `_start_transport` is subscribing: it would replace these
-        jobs with its own, leaving the chunks already subscribed neither
-        subscribed nor polled. It calls this again once its jobs are in place.
+        Deferred while `_start_transport` subscribes: its jobs would replace these,
+        leaving chunks already subscribed neither subscribed nor polled.
         """
         if self._subscribing or not self._monitored:
             return
@@ -1440,12 +1338,8 @@ class OPCUAClient:
     def _publish_callback(
         self, client: Client, monitored: dict[int, Target], stale: OrderedDict[int, float]
     ) -> Callable[[ua.PublishResult], None]:
-        """This connection's Publish handler, bound to its own handles.
-
-        asyncua awaits it before sending the next Publish, so a slow trace write
-        holds notifications on the server rather than queueing them here. A late
-        response from a previous session cannot resolve a handle of this one.
-        """
+        """This connection's Publish handler: a late response from an old session
+        cannot resolve a new handle. asyncua awaits it before the next Publish."""
 
         def on_publish(result: ua.PublishResult) -> None:
             received = time.time_ns()
@@ -1479,9 +1373,8 @@ class OPCUAClient:
     def _schedule(self, polled: dict[float, list[Target]]) -> list[_Job]:
         """This connection's periodic requests.
 
-        Polled items go `_read_chunk` per Read, the chunks of one interval spread
-        evenly across it: the same request count as reading them back to back,
-        without the burst. Never smaller chunks: server cost follows request count.
+        An interval's chunks are spread evenly across it; never smaller chunks:
+        server cost follows request count.
         """
         now = time.monotonic()
         jobs = [_Job(now, self.poll_interval, self._poll_health)]
@@ -1510,12 +1403,7 @@ class OPCUAClient:
     async def _sweep(self) -> None:
         """Re-read up to one Read of subscribed items silent for min_update_interval.
 
-        This catches a static value and an item the server silently stopped
-        reporting. `_stale` is kept in last-update order - a notification moves
-        its handle to the end in O(1) - so the due items are exactly the front
-        run: no scan, no heap to re-key on every notification. Worst case (every
-        item static) is ceil(items / _read_chunk) Reads per min_update_interval,
-        spread over the sweep steps; items that change cost nothing.
+        `_stale` is in last-update order, so the due items are the front run: no scan.
         """
         now = time.monotonic()
         due = [
@@ -1547,16 +1435,10 @@ class OPCUAClient:
         return self._health_values(data_values, (sent + time.time()) / 2)
 
     async def _read_targets(self, targets: list[Target]) -> list[tuple[str, Node, ua.DataValue]]:
-        """Read `targets`, `_read_chunk` per request.
+        """(event name, node, DataValue) per target, `_read_chunk` per request.
 
-        Per-item Bad status codes come back inside the response (asyncua only
-        raises for a service-level failure), so one dead node cannot take the
-        rest down; nor can a value asyncua fails to decode (`read_many` isolates
-        it as BadDecodingError; it is then removed from `targets`, or its chunk
-        would be re-read item by item every cycle).
-
-        Returns:
-            (event name, node, DataValue) per target read
+        A BadDecodingError item is removed from `targets`, or its chunk would be
+        re-read item by item every cycle.
         """
         data_values = await read_many(
             self._require_client(), [(t[2].nodeid, None) for t in targets], self._read_chunk
@@ -1587,11 +1469,7 @@ class OPCUAClient:
         return results
 
     def _decode(self, node: Node, dv: ua.DataValue) -> Any:
-        """A sample's value in its node's datatype; None if Bad, empty or undecodable.
-
-        A value that contradicts its declared datatype (a string on a float32
-        node) is one bad node, reported once, not a failed cycle.
-        """
+        """A sample's value in its node's datatype; None if Bad, empty or undecodable."""
         status = dv.StatusCode
         if status is not None and not status.is_good():
             self._log_node_failure(node, status.name)
@@ -1611,11 +1489,8 @@ class OPCUAClient:
         received_ns: int,
         refresh: bool = False,
     ) -> None:
-        """Log samples at their own time (`sample_time_ns`), one row per event and time.
-
-        Fields of one event stamped differently are separate rows: merged under
-        one time, all but one would be logged at a time they were not sampled.
-        """
+        """Log samples at `sample_time_ns`, one row per event and time: merged, all
+        but one field would be logged at a time it was not sampled."""
         rows: dict[tuple[str, int], dict[str, Any]] = {}
         for event_name, node, dv in samples:
             value = self._decode(node, dv)
@@ -1628,16 +1503,11 @@ class OPCUAClient:
                 event.log_at(stamp, **fields)
 
     def _health_values(self, data_values: list[ua.DataValue], host_time: float) -> dict[str, Any]:
-        """Health fields from their DataValues.
-
-        A node the server does not publish or leaves empty (diagnostics off) is
-        dropped for the rest of the connection with one DEBUG line.
-        """
+        """Health fields; a node Bad or empty is dropped for the connection (one DEBUG)."""
         values: dict[str, Any] = {}
         missing = []
         for (name, _), dv in zip(self._health_targets, data_values, strict=True):
-            bad = dv.StatusCode is not None and not dv.StatusCode.is_good()
-            raw = None if bad or not dv.Value else dv.Value.Value
+            raw = value_of(dv)
             if raw is None:
                 missing.append(name)
                 continue
@@ -1658,12 +1528,7 @@ class OPCUAClient:
         return values
 
     def _log_node_failure(self, node: Node, reason: str) -> None:
-        """One ERROR per bad node for the life of the process.
-
-        A node that is misspelled in the map fails every cycle forever; logging
-        each failure would flood the log sink - and the trace, via
-        TraceLoggingHandler - at the poll rate.
-        """
+        """One ERROR per bad node per process: per cycle would flood the log and the trace."""
         if node.node_id in self._failed_nodes:
             return
         self._failed_nodes.add(node.node_id)
@@ -1684,22 +1549,15 @@ class OPCUAClient:
     # ─── Lifecycle ──────────────────────────────────────────────────────────
 
     def start(self, shared: SharedSource | None = None) -> None:
-        """Declare the trace events and arm the polling loop.
-
-        Args:
-            shared: Shared prefix source, or None for a source of the server's own
-        """
+        """Declare the trace events; `shared` is the prefix source, None for the server's own."""
         self._running = True
         self._init_trace_source(shared)
         self._log.info("Client started (%s)", self.endpoint)
 
     async def _run_async(self, stop_event: asyncio.Event) -> None:
-        """Run this connection's jobs until `stop_event`, reconnecting with capped
-        exponential backoff.
+        """Run this connection's jobs, one request at a time, until `stop_event`.
 
-        One request at a time: the next due job runs, then the loop sleeps to the
-        one after. Subscription data arrives in asyncua's publish task meanwhile.
-        State is per client, so one dead server never stalls another in the loop.
+        State is per client: one dead server never stalls another in the loop.
         """
         self._stop_event = stop_event
         backoff = RECONNECT_INITIAL
@@ -1708,7 +1566,9 @@ class OPCUAClient:
 
         try:
             while self._running and not stop_event.is_set():
-                if not await self._connect_or_stop():
+                # Raced: a black-holed connect sits far past the manifest's grace.
+                _, connected = await self._or_stop(self._ensure_connected())
+                if not connected:
                     if stop_event.is_set():
                         break
                     self._log.warning("Retrying %s in %.0fs", self.endpoint, backoff)
@@ -1717,7 +1577,7 @@ class OPCUAClient:
                     backoff = min(backoff * 2, RECONNECT_MAX)
                     continue
 
-                # A handful of jobs (one per 100 polled items): min() over a heap.
+                # A handful of jobs (one per 100 polled items): min(), no heap.
                 job = min(self._jobs, key=lambda j: j.due)
                 if await self._wait_or_stop(max(0.0, job.due - time.monotonic())):
                     break
@@ -1726,8 +1586,7 @@ class OPCUAClient:
                 # Behind schedule, the next run starts from now rather than bursting.
                 job.due = max(job.due + job.period, time.monotonic())
                 try:
-                    # Raced like connect: a hung server holds a request for up to
-                    # the timeout, past the shutdown budget.
+                    # Raced like connect: a hung request would outlast the shutdown bound.
                     if (await self._or_stop(job.run()))[0]:
                         break
                     # Only a completed request proves the link; a connect that
@@ -1743,9 +1602,8 @@ class OPCUAClient:
                         )
                         self._connected = False
                         losses += 1
-                        # The first loss reconnects at once - the data is already
-                        # stale. From the second on, back off: a server that accepts
-                        # a session and drops it immediately would otherwise spin.
+                        # The first loss reconnects at once; from the second, back off,
+                        # or a server that drops every new session would spin.
                         if losses > 1:
                             if await self._wait_or_stop(backoff):
                                 break
@@ -1753,9 +1611,6 @@ class OPCUAClient:
                         continue
                     self._log.error("Poll failed: %s", describe_error(e))
                     failures += 1
-                    # An error we cannot classify still wedges the extension if the
-                    # session is the thing that is broken. Reconnect rather than
-                    # poll a dead session forever.
                     if failures >= POLL_FAILURES_BEFORE_RECONNECT:
                         self._log.warning("%d poll failures in a row, reconnecting", failures)
                         self._connected = False
@@ -1767,29 +1622,9 @@ class OPCUAClient:
             except TimeoutError:
                 self._log.warning("Disconnect exceeded %.0fs, abandoning session", SHUTDOWN_TIMEOUT)
 
-    async def _connect_or_stop(self) -> bool:
-        """Connect, unless shutdown is requested first.
-
-        A connect to a black-holed endpoint sits for as long as the OS lets it -
-        measured well past the manifest's 10s grace - so it is raced against the
-        stop event rather than awaited. The caller distinguishes the two False
-        cases by checking the stop event.
-
-        Returns:
-            True if connected, False on failure or on shutdown
-        """
-        stopped, connected = await self._or_stop(self._ensure_connected())
-        return not stopped and connected
-
     async def _or_stop(self, coro: Awaitable[Any]) -> tuple[bool, Any]:
-        """Await `coro` unless shutdown is requested first, then cancel it.
-
-        Returns:
-            (True, None) on shutdown, else (False, the result); `coro`'s exception
-            propagates
-        """
-        if self._stop_event is None:
-            return False, await coro
+        """(True, None) if shutdown wins, `coro` cancelled; else (False, its result)."""
+        assert self._stop_event is not None
         work = asyncio.ensure_future(coro)
         stop = asyncio.ensure_future(self._stop_event.wait())
         try:
@@ -1805,14 +1640,8 @@ class OPCUAClient:
                     await work
 
     async def _wait_or_stop(self, seconds: float) -> bool:
-        """Wait up to `seconds`.
-
-        Returns:
-            True if shutdown was requested during the wait
-        """
-        if self._stop_event is None:
-            await asyncio.sleep(seconds)
-            return False
+        """Wait up to `seconds`; True if shutdown was requested meanwhile."""
+        assert self._stop_event is not None
         try:
             await asyncio.wait_for(self._stop_event.wait(), seconds)
         except TimeoutError:
@@ -1822,8 +1651,7 @@ class OPCUAClient:
     # ─── Action support ─────────────────────────────────────────────────────
 
     def known_writable_nodes(self) -> list[Node]:
-        """Nodes declared writable in the map, plus any auto-detection has proven
-        writable so far (an unprobed `writable: null` node is not yet known)."""
+        """Nodes declared writable, plus those auto-detection has proven writable so far."""
         if not self.node_map:
             return []
         return [
@@ -1857,17 +1685,11 @@ class OPCUAClient:
 class OPCUARunner:
     """The one event loop every client polls in: signals, stop, action dispatch.
 
-    Clients run as concurrent tasks sharing one stop event. Their bounded
-    disconnects run concurrently too, so shutdown costs SHUTDOWN_TIMEOUT in
-    total, not per server.
+    Disconnects run concurrently: shutdown costs SHUTDOWN_TIMEOUT in total, not per server.
     """
 
     def __init__(self, clients: Sequence[OPCUAClient]) -> None:
-        """Bind the clients.
-
-        Args:
-            clients: One per server; names must be unique (checked at config load)
-        """
+        """`clients`: one per server, names unique (checked at config load)."""
         self.clients = {c.name: c for c in clients}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
@@ -1887,8 +1709,7 @@ class OPCUARunner:
         try:
             await asyncio.gather(*tasks)
         finally:
-            # A client that raised is a bug; stop the rest cleanly rather than
-            # leave their sessions to asyncio.run's cancellation.
+            # A client that raised is a bug; stop the rest cleanly.
             self._stop_event.set()
             await asyncio.gather(*tasks, return_exceptions=True)
             remove_signal_handlers()
@@ -1903,14 +1724,9 @@ class OPCUARunner:
         logger.info("OPC-UA extension stopping")
 
     def _install_signal_handlers(self) -> Callable[[], None]:
-        """Wake every client on SIGTERM/SIGINT from inside the loop.
+        """Set the stop event on SIGTERM/SIGINT; returns the uninstaller.
 
-        A signal.signal handler that calls sys.exit unwinds through the running
-        loop and drops the OPC-UA sessions without a clean close, so the handler
-        only sets the event and each client's own finally does the disconnect.
-
-        Returns:
-            A callable that removes whatever was installed
+        sys.exit from a signal.signal handler would drop the sessions uncleanly.
         """
         loop, event = self._loop, self._stop_event
         if loop is None:
@@ -1927,9 +1743,8 @@ class OPCUARunner:
                 loop.add_signal_handler(sig, request_stop)
                 installed.append(sig)
             except (NotImplementedError, RuntimeError, ValueError):
-                # Windows has no add_signal_handler and neither API works off the
-                # main thread. Where signal.signal is available, hop back onto the
-                # loop; otherwise the owner is expected to call stop().
+                # Windows, or off the main thread: signal.signal where it works,
+                # else the owner calls stop().
                 with contextlib.suppress(ValueError, OSError):
                     replaced[sig] = signal.signal(
                         sig, lambda *_: loop.call_soon_threadsafe(request_stop)
@@ -1939,8 +1754,8 @@ class OPCUARunner:
             for sig in installed:
                 with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
                     loop.remove_signal_handler(sig)
-            # Both branches must uninstall, or a stopped runner keeps handling
-            # signals into a dead loop. A displaced None was not set from Python.
+            # A stopped runner must not handle signals into a dead loop. A
+            # displaced None was not set from Python.
             for sig, prior in replaced.items():
                 with contextlib.suppress(ValueError, OSError, TypeError):
                     signal.signal(sig, prior if prior is not None else signal.SIG_DFL)
@@ -1948,12 +1763,10 @@ class OPCUARunner:
         return remove
 
     def _run_coro(self, coro: Coroutine[Any, Any, Any], timeout: float) -> Any:
-        """Run an action's coroutine in the live polling loop.
+        """Run an action's coroutine in the live polling loop, on its session.
 
-        Dispatched into that loop, so the action reuses the established session
-        instead of paying a handshake - and a session slot - per call. There is
-        deliberately no ad-hoc `asyncio.run` fallback: it mutated client state
-        from a foreign loop, which silently lost every subsequent sample.
+        No ad-hoc `asyncio.run` fallback: mutating client state from a foreign loop
+        silently lost every later sample.
 
         Raises:
             RuntimeError: If the polling loop is not running

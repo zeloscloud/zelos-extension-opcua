@@ -74,21 +74,13 @@ NODE_ID_PATTERN = re.compile(r"^(?:ns=(\d+)|nsu=([^;]+));([sigb])=(.+)$")
 
 
 def sanitize_name(name: str, kind: str = "field") -> str:
-    """Make a name addressable in the Zelos trace catalog.
-
-    Delegates to the SDK: the name grammar lives in zelos-trace-types and a
-    hand-rolled character list drifts from it. OPC-UA identifiers routinely
-    carry `. : ; =`, which are separators or syntax in catalog paths.
-    """
+    """A name addressable in the trace catalog; the SDK owns the grammar."""
     return zelos_sdk.sanitize_name(name, kind=kind)
 
 
 def parse_node_id(node_id: str) -> tuple[int | str, str, str | int | uuid.UUID | bytes]:
-    """Parse an OPC-UA node ID string into its converted identifier.
-
-    The identifier is converted here, at map load, not at connect time. An
-    unparseable int/GUID/base64 caught inside connect() surfaced as "Connection
-    failed" and sent the operator after the network instead of the map entry.
+    """Parse and convert a node ID at map load: a bad one inside connect() read as
+    "Connection failed".
 
     Args:
         node_id: Node ID string, ns=X;Y=Z or nsu=<uri>;Y=Z
@@ -209,19 +201,9 @@ class NodeMap:
     def from_dict(cls, data: dict[str, Any]) -> NodeMap:
         """Load node map from dictionary.
 
-        Names are sanitized first, then checked for collisions. A collision is a
-        hard error rather than a warning: silently clobbering one node with
-        another produces a trace that is missing data while looking healthy.
-
-        A node name may repeat across events, as a field does across trace
-        events: N identical devices under one gateway would otherwise need N
-        renamed copies of every tag. `get_by_name` takes `<event>/<name>` for those.
-
-        Args:
-            data: Dictionary with event/node definitions
-
-        Returns:
-            NodeMap instance
+        Names are sanitized, then collisions are a hard error: clobbering drops
+        data silently. A node name may repeat across events (identical gateway
+        devices); `get_by_name` takes `<event>/<name>` for those.
 
         Raises:
             ValueError: On a duplicate event name, a duplicate node name within
