@@ -39,275 +39,84 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 ## Architecture
 
-### Startup order
+### Startup
 
-`cli/app.serve()` is the only place that starts clients, and the order is load
-config -> resolve servers -> build one client per server -> `set_runner` ->
-`register_actions` -> `init_global_source(prefix)` -> `zelos_sdk.init(name=ACTION_PREFIX)`
--> `client.start(shared source)` -> `runner.run()`. Registration must precede
-`init()`; actions registered after the service is published may never be
-advertised. The prefix source must exist before `init()`, which then reuses it
-as the global source instead of adding an empty second one of the same name.
-
-Startup problems (bad config, missing or unparseable node map) are one
-`logger.error` line plus `sys.exit(1)`. Tracebacks are for bugs.
+- `cli/app.serve()` is the only place that starts clients: config -> clients -> `set_runner` -> `register_actions` -> `init_global_source(prefix)` -> `zelos_sdk.init(name=ACTION_PREFIX)` -> `client.start` -> `runner.run()`.
+- Registration must precede `init()` (later actions may never be advertised); the prefix source must exist before `init()` so it is reused, not duplicated.
+- Startup problems (bad config, missing/unparseable node map) are one `logger.error` + `sys.exit(1)`; tracebacks are for bugs.
 
 ### Config
 
-`servers[]` plus `advanced`. `run_app_mode` checks the raw file for the old flat
-shape before `load_config`: the new schema would reject it with a message that
-does not say the format changed. Per server, `default` / empty security settings
-inherit `advanced` (the user cert and key as a pair) and `validate_security`
-runs on the effective values, errors naming the server. An explicit None under a
-secure default sets `downgrade_from`, a WARNING on every connect. `demo` replaces
-`servers` with the one server `demo`, security None, no inheritance. `trace`
-builds a one-entry config through the same path.
-
-Names: `advanced.prefix` and server names go through `zelos_sdk.sanitize_name`
-(kind `source`); a server name defaults to the endpoint host. Two servers with
-one name are a hard error. Prefix set: one source, events `<server>/<event>`;
-cleared: a source per server, events unprefixed.
+- `run_app_mode` checks the raw file for the old flat shape before `load_config`: the schema error would not say the format changed.
+- Per server, `default` / empty security inherits `advanced` (user cert + key as a pair); `validate_security` runs on effective values. Explicit None under a secure default sets `downgrade_from` (WARNING per connect).
+- `demo` replaces `servers` with one server `demo`, security None, no inheritance; `trace` builds a one-entry config through the same path.
+- Prefix and server names go through `sanitize_name(kind="source")`; duplicate server names are a hard error.
 
 ### Actions
 
-Free functions in `actions.py`, not client methods, bound to the runner via
-`set_runner`. Every action that targets a server takes an optional `server`
-(sanitized like the configured names): omitted is fine with one server and a
-`ValueError` listing the names with several. `get_status` / `list_*` cover every
-server when it is omitted.
+- Free functions in `actions.py`, bound via `set_runner`. Optional `server`: `ValueError` listing names when omitted with several; `get_status` / `list_*` cover all.
+- Failure convention: **raise**. The protocol reads the verdict from the exception, so `{"success": False}` reports success. Input errors `ValueError`; unknown errors become `RuntimeError` after `logger.exception`.
+- `auto_config` is the one standalone action (own `asyncio.run`, safe off the loop thread); the schema's `ui:options.autoconfig` names it, keep in step.
+- Everything else dispatches via `OPCUARunner._run_coro` into the polling loop. No connect-per-action, no ad-hoc `asyncio.run` fallback (mutating client state from a foreign loop silently lost every later sample); no loop = `RuntimeError("extension is not running")`.
+- A dispatch timeout cancels the coroutine, stopping an unsent write. After a Write is `sent` it cannot be recalled: raise a TimeoutError saying the server may have applied it.
 
-Failure convention: **raise**. The actions protocol reads its verdict from a
-raised exception, so `{"success": False}` would report a successful run. Input
-errors are `ValueError`, self-describing exceptions propagate verbatim, and
-anything else becomes a `RuntimeError` after `logger.exception`.
+### Transport
 
-`auto_config` is the one standalone action (`standalone=True`, listed in the
-packaged `actions.json`): it needs no client, so it runs its own `asyncio.run`,
-which is safe because actions are called off the polling loop's thread. The
-schema's root `ui:options.autoconfig` names it; keep the two in step.
+- `_start_transport` runs at the end of every `connect()`, after discovery, rotation and `_resolve_nodes`.
+- Subscriptions: QueueSize 1, DataChangeFilter StatusValue, TimestampsToReturn Both; CreateMonitoredItems chunked by MaxMonitoredItemsPerCall (cap 100). Refusals move items to polling; `SERVER_FULL_CODES` short-circuit later items (S7-1200 caps ~1000 items, 5 subscriptions). An empty subscription is deleted (it holds a slot).
+- asyncua's high-level `Subscription` is bypassed: `_publish_callback` closes over the connection's handle map, so a late response from an old session cannot resolve a new handle. asyncua awaits it before the next Publish (backpressure).
+- asyncua drops a whole PublishResponse over one undecodable value without naming the item: `_guard_publish` deletes subscriptions and polls everything, where `read_many` isolates it. BaseDataType discovered nodes (`Discovery.variant`) are polled, never subscribed (OPC PLC random Variants trip the guard within seconds).
+- Polling: `_schedule` builds `_Job`s run one at a time (late job restarts from now, no burst): health Read, one job per `_read_chunk` phased across the interval, staleness sweep. Never smaller chunks: server cost follows request count. `_read_chunk` = MaxNodesPerRead capped at 100 (missing/0 = 100); servers reject a whole over-limit request.
+- Sweep: `_stale` OrderedDict in last-update order (due items are the front, no scan); step = `min_update_interval / max(SWEEP_STEPS, chunks)`, staleness bounded at 1.25x.
+- Timestamps: `sample_time_ns` via `log_at`; `_log_samples` groups by (event, time). No skew correction.
+- A value that fails decoding (asyncua raises for the whole response) makes `read_many` re-read the chunk item by item, returning BadDecodingError; that node leaves polling until reconnect. `_log_node_failure`: **one ERROR per bad node per process**.
+- Measured on OPC PLC (10k nodes/s): server CPU idle 1.8%, one subscription 5.2%, 100-node Reads 7.5%, 25-node Reads 21.4%. Don't tune against the in-process sim (it does monitored-item work inside each write).
 
-Async work is dispatched with `OPCUARunner._run_coro`: `run_coroutine_threadsafe`
-into the one polling loop, reusing its session. There is no connect-per-action
-and no ad-hoc `asyncio.run` fallback - mutating client state from a foreign loop
-silently lost every later sample - so a call with no loop running raises
-`RuntimeError("extension is not running")`. A dispatch that times out cancels
-the coroutine, which stops a write not yet sent. A Write request already sent
-cannot be recalled: a timeout after it (`sent`) raises a TimeoutError saying the
-server may have applied it, never a plain failure.
+### Connection
 
-### Subscriptions
-
-`_start_transport` runs at the end of every `connect()`, after discovery, any
-rotation and `_resolve_nodes`, so events are declared and handles are fresh.
-Per server: one subscription per distinct interval (a map event's
-`poll_interval`, else the server's), publishing = sampling = interval,
-QueueSize 1, DataChangeFilter StatusValue, no deadband, TimestampsToReturn Both.
-CreateMonitoredItems goes `_monitor_chunk` items per call (MaxMonitoredItemsPerCall,
-capped at 100). A per-item Bad status, a refused CreateSubscription or a
-non-connection service fault moves those items to polling for the connection;
-BadTooManyMonitoredItems / BadTooManySubscriptions (`SERVER_FULL_CODES`)
-short-circuit every later item without asking (an S7-1200 caps ~1000 items, 5
-subscriptions a session). One WARNING per connect names the counts by status.
-A subscription left with no item is deleted: it would hold one of those slots.
-
-asyncua's high-level `Subscription` is bypassed: `uaclient.create_subscription`
-with `_publish_callback`, a closure over that connection's handle map, so a
-late response from an old session cannot resolve a new handle. asyncua awaits it
-before sending the next Publish: backpressure, nothing queued client-side. A Bad
-StatusChangeNotification (lifetime expiry, or asyncua's supervisor reporting a
-lost link as BadShutdown) marks the client disconnected.
-
-asyncua drops a whole PublishResponse over one value it cannot decode, without
-saying which item. `_guard_publish` wraps the session's `publish`: the first
-such failure deletes the connection's subscriptions and polls everything, where
-`read_many` isolates the item. OPC PLC's discover-all (random Variant types)
-trips it within seconds; its typed telemetry nodes never do. So discovered
-nodes declared BaseDataType (`Discovery.variant`) are polled, never subscribed,
-counted as `polled_variant`; the guard stays as the last resort.
-
-Don't tune against the in-process sim's subscription cost: asyncua's server does
-the monitored-item work inside each write. Measured on OPC PLC (.NET, 10k nodes
-changing each second): server CPU idle 1.8%, one subscription 5.2%, 100-node
-Reads at 86 req/s 7.5%, 25-node Reads at 400 req/s 21.4%.
-
-### Polling and the job loop
-
-Per connection, `_schedule` builds `_Job`s that `_run_async` runs one at a time
-(next due, then sleep to the one after; a late job restarts from now, no burst):
-the `_server` health Read at the server interval, one job per `_read_chunk`
-polled items phased evenly across its interval (the request count of reading
-them back to back, lower peak; never smaller chunks: server cost follows request
-count), and the staleness sweep. `_read_chunk` is MaxNodesPerRead (read once per
-connect with MaxNodesPerBrowse), capped at 100, missing or 0 = 100; a server
-rejects a whole request past its limit (the `s7` sim enforces 20). The health
-Read's midpoint is the host time for `clock_skew_ms`; a health node that is Bad
-or empty is dropped for the connection. Node handles are resolved once per
-connection into `_poll_targets`, so no job calls `get_node`.
-
-Sweep: `_stale` is an OrderedDict of subscribed handles in last-update order; a
-notification moves its handle to the end, so the due items are the front run,
-no scan. Each step reads up to `_read_chunk` items silent for
-`min_update_interval`; a step is `min_update_interval / max(SWEEP_STEPS, chunks)`,
-so staleness is bounded at 1.25x and the worst case (all static) is
-ceil(items / chunk) Reads per interval. Refreshes are logged at ServerTimestamp.
-
-Timestamps: `sample_time_ns` (SourceTimestamp, else ServerTimestamp, else
-receipt) through `TraceSourceEvent.log_at`. `_log_samples` groups one batch (a
-Publish, a Read) by (event, time): fields stamped differently are separate rows.
-No skew correction; `_server.clock_skew_ms` shows it. The sim stamps
-ServerTimestamp on Read, as real servers do; asyncua returns the write time.
-
-asyncua returns per-item `DataValue`s with their own `StatusCode` (verified on
-2.0.1); it raises only for a service-level failure, or when it cannot parse one
-item's value (a 2-D Variant array, some nested Variants), which fails the whole
-response - `read_many` then re-reads that chunk item by item and returns the
-culprit as BadDecodingError. A Bad item is skipped, as is one whose value fails
-`decode_value` (a string arriving on a float32 node, an integer wider than its
-concrete integer field), and `_log_node_failure`
-guarantees **one ERROR per bad node per process** - an unbounded per-cycle warning
-would flood both the log sink and the trace.
-
-There is no separate liveness probe: the health Read is one. Disconnection is
-inferred from request errors via `is_connection_error`, which classifies by type: `OSError` /
-`TimeoutError`, `UaStatusCodeError` in the session / secure-channel / connection
-family, and any other exception whose `__cause__` is a timeout or `OSError`
-(the black-holed socket: asyncua 2.0.1 raises a bare `Exception` from the
-`TimeoutError`). Never by message text. Five consecutive request failures that
-`is_connection_error` does *not* claim still force a reconnect, so an
-unclassified error cannot wedge the extension on a dead session.
-
-Reconnect backs off 3s, doubling, capped at 60s, reset on a completed request (a
-connect that never yields data does not clear it).
-
-asyncua 2.0 starts a connection supervisor on every `connect()`: it reads
-ServerStatus every `watchdog_intervall` with that interval as the timeout, and on
-a miss marks the client disconnected (the next request raises `ConnectionError`,
-which is ours to handle, and informs subscriptions BadShutdown). `watchdog_intervall` is set to the request timeout, as
-the 1s default would drop sessions to any slower server. Its `auto_reconnect`
-is off by default and must stay off: reconnect and re-discovery are ours.
+- No separate liveness probe: the health Read is one (midpoint = host time for `clock_skew_ms`; a Bad/empty health node is dropped for the connection).
+- `is_connection_error` classifies by type, never message text: `OSError` / `TimeoutError`, session/channel/connection `UaStatusCodeError`, or `__cause__` timeout/`OSError` (asyncua 2.0.1 raises bare `Exception` on a black-holed socket). Five unclassified consecutive failures still force a reconnect.
+- Backoff 3s doubling to 60s, reset on a completed request (not on connect).
+- asyncua 2.0 supervisor: `watchdog_intervall` = request timeout (the 1s default drops slow servers); `auto_reconnect` must stay off, reconnect and re-discovery are ours. A Bad StatusChangeNotification (incl. supervisor BadShutdown) marks disconnected.
 
 ### Discovery
 
-A server with no `node_map_file` (and `advanced.discovery` on) is browsed on
-every connect, before `_resolve_nodes`, and `node_map` replaced. Walk: BFS over
-forward HierarchicalReferences from Objects, `_browse_chunk` nodes per Browse
-(View Timestamp null: asyncua defaults it to now, which .NET servers answer with
-BadNodeNotInView),
-BrowseNext to the end, visited set; a node refused BadNoContinuationPoints (a
-server holding few, the `s7` sim 3) is re-browsed alone after the batch, so one
-point is held at a time, and any other Bad status is one WARNING per connect; not followed: Server (i=2253), Objects
-named `_*`, HasProperty (EngineeringUnits / EURange are recorded). Variables are
-browsed too (struct members, EU properties). Describe: one batched Read of
-DataType, ValueRank, AccessLevel, DisplayName, Description + EU values; Value
-only where the DataType is not builtin or the rank is Any/ScalarOrOneDimension.
-Typing (`field_datatype`): a concrete builtin DataType exactly; Number / Integer /
-UInteger as float64 / int64 / uint64; BaseDataType always string, each value
-rendered as text (`render_text`: bool true/false, DateTime ISO 8601 UTC,
-ByteString hex, StatusCode name, a struct its str()), so a type change never
-fails the node; anything else by the value's kind at its widest (bool, float64,
-string), other kinds skipped; values coerce into the field.
-Naming and collisions: `discovery.assign_names`; every collider gets `_<hash>` of its nsu= id, never an ordinal, so a name never re-points. Unbounded by design: a limit
-needs measured data.
-
-A declared trace event's schema is fixed on its `TraceSource` instance (the SDK
-rejects a re-add), but every construction is a new segment, and the app joins
-sequential segments of one path. So a reconnect whose discovery adds fields to a
-declared event rotates the source, at most once per reconnect: `flush()` the
-old, construct one of the same name, replay every client's declared events
-(`_fields`) on it, and switch every writer - all clients of a `SharedSource`
-(the prefix source), else just this server's - with no await in between.
-`SharedSource` holds the only reference to the source, so dropping it lets the
-SDK end the old segment. A new event is just added; a removed field is just no
-longer written; a field whose datatype changed is left out with one WARNING
-(types are not reconciled across segments). The prefix source comes from
-`init_global_source`, which the SDK keeps for the process, so its first segment
-stops being written but is not ended. `opcua_log` is a separate source and never
-rotates.
-
-A node that `read_many` returns as BadDecodingError leaves its poll job until the
-next reconnect, or its chunk is re-read item by item every cycle.
-
-Measured against `--nodes` (in-process client, subprocess sim, localhost):
-10k variables discover in 1.3s (606 requests), poll 139 ms/cycle (101 reads),
-177 MB RSS; 50k in 6.8s (3010 requests), 734 ms/cycle (501 reads), 323 MB RSS
-(baseline 122 MB). The asyncua sim dominates the poll time.
+- Browse View Timestamp must be null: asyncua defaults it to now, which .NET servers answer with BadNodeNotInView.
+- BadNoContinuationPoints nodes are re-browsed alone after the batch (one point held at a time; `s7` sim holds 3).
+- Typing (`field_datatype`): concrete builtin exactly; Number/Integer/UInteger widest; BaseDataType always string via `render_text`, so a type change never fails the node.
+- Collisions (`assign_names`): every collider gets `_<hash>` of its nsu= id, never an ordinal, so a name never re-points. Unbounded by design: a limit needs measured data.
+- Source rotation: a declared event's schema is fixed per `TraceSource` instance, each construction is a new segment, the app joins them. Added fields rotate at most once per reconnect: `flush()`, construct same name, replay every client's `_fields`, switch every `SharedSource` writer, no await in between. `SharedSource` holds the only reference. A changed datatype is skipped (types not reconciled across segments). The `init_global_source` prefix source is kept by the SDK, so its first segment is never ended. `opcua_log` never rotates.
+- Measured (`--nodes`, localhost): 10k vars discover 1.3s, poll 139 ms/cycle, 177 MB; 50k 6.8s, 734 ms/cycle, 323 MB (baseline 122 MB).
 
 ### Shutdown
 
-`OPCUARunner` owns the one asyncio loop: every client polls in it as a task with
-its own connect/backoff state, and all share one stop event. `_run_async`
-installs SIGTERM/SIGINT through `loop.add_signal_handler`, which only sets that
-event; each poll loop waits on it with its poll cadence. `signal.signal` +
-`sys.exit` is deliberately avoided - it unwinds through the running loop and
-drops the OPC-UA sessions without a clean close.
-
-Connect is raced against the stop event in `_connect_or_stop` and cancelled when
-stop wins: a black-holed endpoint parks `connect()` for minutes, far past the
-manifest's 10s grace.
-
-Each client's `finally` disconnect is wrapped in `asyncio.wait_for(..., 3.0)`;
-they run concurrently, so shutdown is bounded at ~3s in total, not per server.
-A client task that raises (a bug) sets the stop event so the rest close
-cleanly. `runner.stop()` is thread-safe via `call_soon_threadsafe`.
+- `OPCUARunner` owns the one loop; each client is a task, all share one stop event. Signals via `loop.add_signal_handler` only set it; never `signal.signal` + `sys.exit` (drops sessions uncleanly).
+- `_run_async` races connect against stop: a black-holed `connect()` parks for minutes, past the manifest's 10s grace.
+- Disconnects run concurrently under `wait_for(..., 3.0)`: ~3s total. A crashing client task sets stop. `runner.stop()` is thread-safe.
 
 ### Node map
 
-Map name, event names and node names are sanitized at load by
-`zelos_sdk.sanitize_name` (event names keep `/`). Trace names are capped at 128
-bytes including `<server>/`; discovery keeps an event's trailing segments.
-
-Collisions after sanitization are hard `ValueError`s at load - duplicate event
-name, or duplicate node name within one event; warn-and-clobber would silently
-drop data. A name may repeat across events (a gateway's identical devices):
-`get_by_name` takes `<event>/<name>` and raises on an ambiguous bare name.
-The health event is `_server`: sanitized names never start with `_`.
+- Names via `sanitize_name` (event names keep `/`); trace names capped at 128 bytes including `<server>/` (discovery keeps trailing segments).
+- Duplicates after sanitization are hard `ValueError`s (warn-and-clobber drops data). Repeats across events are allowed; `get_by_name` takes `<event>/<name>` and raises on an ambiguous bare name.
+- Health event `_server` cannot collide: sanitized names never start with `_`.
 
 ### Security
 
-A secure mode connects with exactly that mode and policy or not at all.
-`_apply_security` reads GetEndpoints, refuses (listing the offerings) when the
-pair is absent, then passes the endpoint's server certificate to `set_security`
-explicitly - with `server_certificate=None` asyncua switches the client to a
-None channel to fetch it. `strict` compares against the pin first for a readable
-error; the real check is asyncua encrypting OPN to that certificate.
-
-The generated client cert in `PKI_DIR` is reused, never rotated early: servers
-trust by thumbprint. `application_uri` is read from the cert's SAN URI.
-
-No secret values in config: user identity is Anonymous or an operator-issued
-X.509 user cert (asyncua's `load_client_certificate` / `load_private_key` set the
-USER identity; the app cert goes to `set_security`). A user cert needs a secure
-mode and a Certificate token policy on the endpoint, checked before connect
-because asyncua otherwise invents one.
+- `_apply_security` reads GetEndpoints, refuses a missing mode/policy pair, then passes the server certificate explicitly: with `server_certificate=None` asyncua silently switches to a None channel. `strict` compares the pin first for a readable error; the real check is OPN encryption.
+- Generated client cert in `PKI_DIR` is never rotated early (servers trust by thumbprint); `application_uri` comes from its SAN.
+- No secrets in config. User cert: `load_client_certificate` / `load_private_key` set the USER identity (app cert goes to `set_security`). Needs a secure mode and a Certificate token policy, checked before connect because asyncua otherwise invents one.
 
 ### Simulator
 
-asyncua has no hook for its per-connection `UaProcessor`, so `_SimServer.start`
-re-implements `Server.start` (asyncua 2.0.1) to install `_SimProcessor`. It
-records every request, and adds what asyncua lacks: enforced OperationLimits,
-a session cap, RequestedMaxReferencesPerNode, BrowseNext, per-session caps on
-subscriptions, monitored items and continuation points, ServerTimestamp on
-Read, and ServerDiagnosticsSummary session counts. On an asyncua bump recheck `start`,
-`OPCUAProtocol.connection_made` and what `UaProcessor._process_message` does
-around a request (`_browse` mirrors its session checks and activity stamps).
-Each start gets a unique ApplicationUri (`auto_config` dedupes on it). `--nodes`
-adds variables through one AddNodes call per folder with read-time value
-callbacks: node-by-node creation cost ~1.3 ms each.
+- asyncua has no `UaProcessor` hook, so `_SimServer.start` re-implements `Server.start` (asyncua 2.0.1) to install `_SimProcessor`, which adds enforced limits, session/subscription/item/continuation caps, BrowseNext, ServerTimestamp on Read, diagnostics counts.
+- On an asyncua bump recheck `Server.start`, `OPCUAProtocol.connection_made`, and `UaProcessor._process_message` around a request (`_browse` mirrors its session checks and activity stamps).
+- Unique ApplicationUri per start (`auto_config` dedupes on it). `--nodes` uses one AddNodes per folder with read-time callbacks (node-by-node costs ~1.3 ms each).
 
 ## Node ID Format
 
-`ns=<namespace>;[s|i|g|b]=<identifier>`
+`ns=<n>;[s|i|g|b]=<id>` (string, numeric, GUID as `uuid.UUID`, base64 opaque as `bytes`), or `nsu=<uri>;...` (`%3B`/`%25` escaped) resolved against the NamespaceArray on each connect (unknown URI = one ERROR, node skipped).
 
-- `ns=2;s=Temperature.Sensor1` string
-- `ns=2;i=1001` numeric
-- `ns=1;g=12345678-1234-5678-1234-567812345678` GUID (built as `uuid.UUID`)
-- `ns=1;b=AQID` opaque, base64 (built as `bytes`)
-- `nsu=urn:zelos:demo:plc;s=Motor.Speed` URI-qualified (`%3B`/`%25` escaped); resolved against the server NamespaceArray on each connect, unknown URI = one ERROR + node skipped
-
-`node_map.parse_node_id` both parses and converts the identifier (int, `uuid.UUID`,
-`bytes`), so a bad one is a `ValueError` at map load rather than a "Connection
-failed" line from inside `connect()`. `client.parse_node_id_to_ua` only wraps its
-result in a `NodeId` - one implementation, no drift.
+`node_map.parse_node_id` parses and converts, so a bad id fails at map load, not inside `connect()`; `client.parse_node_id_to_ua` only wraps it.
 
 ## Code Style
 

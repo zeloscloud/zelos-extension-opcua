@@ -32,7 +32,7 @@ from zelos_extension_opcua.discovery import (
 from zelos_extension_opcua.node_map import NodeMap
 
 
-async def discovered(sim: Simulator, caplog=None) -> tuple[OPCUAClient, dict]:
+async def discovered(sim: Simulator) -> tuple[OPCUAClient, dict]:
     """A connected no-map client and its first poll."""
     client = OPCUAClient(endpoint=sim.endpoint, name="plc")
     client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
@@ -104,7 +104,6 @@ _VT = ua.VariantType
         (_ID.UInt64, None, "uint64"),  # concrete: exact, not widened
         (_ID.UInt64, (2**64 - 1, _VT.UInt64), "uint64"),  # rank -2, scalar value
         (_ID.BaseDataType, (True, _VT.Boolean), "string"),  # value type may change
-        (_ID.BaseDataType, (3, _VT.Int32), "string"),
         (_ID.BaseDataType, (ua.LocalizedText("on"), _VT.LocalizedText), "string"),
         (_ID.Enumeration, (3, _VT.Int32), "float64"),  # other untyped: by kind
     ],

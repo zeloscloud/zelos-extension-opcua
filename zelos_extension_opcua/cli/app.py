@@ -1,8 +1,6 @@
-"""App mode runner for the Zelos OPC-UA extension.
+"""App mode: run from the Zelos App's saved config, or demo mode.
 
-Runs the extension from the Zelos App's saved configuration, including demo mode.
-Startup problems here are reported as a single logger.error line plus exit 1;
-tracebacks are for bugs, and this layer's failures are configuration.
+Startup problems are one logger.error line plus exit 1; tracebacks are for bugs.
 """
 
 from __future__ import annotations
@@ -33,11 +31,9 @@ logger = logging.getLogger(__name__)
 DEMO_HOST = "127.0.0.1"
 DEMO_PORT = 4840
 
-DEFAULT_PREFIX = "OPC-UA"
-
 #: Defaults of the schema's `advanced` object: settings shared by every server.
 ADVANCED_DEFAULTS: dict[str, Any] = {
-    "prefix": DEFAULT_PREFIX,
+    "prefix": "OPC-UA",
     "timeout": 5.0,
     "log_level": "INFO",
     "certificate_file": "",
@@ -74,19 +70,12 @@ _SHARED = ("timeout", "certificate_file", "private_key_file", "discovery")
 
 
 def resolve_advanced(config: dict[str, Any]) -> dict[str, Any]:
-    """Merge the `advanced` object over its defaults.
-
-    An absent `prefix` takes the default; a present-but-empty one clears it.
-    """
+    """`advanced` over its defaults; an absent `prefix` is the default, an empty one clears it."""
     return {**ADVANCED_DEFAULTS, **(config.get("advanced") or {})}
 
 
 def read_raw_config() -> dict[str, Any]:
-    """config.json as saved, before schema defaults and validation.
-
-    The shape check must see the file first: an old config fails the new
-    schema with a message that does not say the format changed.
-    """
+    """config.json as saved: an old config fails the schema without saying the format changed."""
     path = Path(os.environ.get("ZELOS_CONFIG_PATH") or "config.json")
     return json.loads(path.read_text()) if path.is_file() else {}
 
@@ -110,38 +99,22 @@ def trace_name(value: str) -> str:
 
 
 def _inherit(server: dict[str, Any], advanced: dict[str, Any]) -> dict[str, Any]:
-    """A server's effective security: its own value, else the advanced default.
+    """A server's effective settings: its own, else ("default" / "" / None) the advanced one.
 
-    The user certificate and key inherit as a pair: mixing the server's cert with
-    the default's key would fail as a key mismatch rather than as a config error.
+    The user cert and key inherit as a pair: a mix would fail as a key mismatch.
     """
-    effective = {}
-    for key in ("security_mode", "security_policy"):
-        effective[key] = advanced[key] if server[key] in ("", "default") else server[key]
+    effective = {
+        k: advanced[k] if server[k] in ("", "default", None) else server[k]
+        for k in ("security_mode", "security_policy", "transport", "min_update_interval")
+    }
     user = ("user_certificate_file", "user_private_key_file")
     source = advanced if not any(server[k] for k in user) else server
     effective.update({k: source[k] for k in user})
     return effective
 
 
-def _inherit_transport(server: dict[str, Any], advanced: dict[str, Any]) -> dict[str, Any]:
-    """A server's transport settings: its own, else ("default" / None) the advanced ones."""
-    return {
-        "transport": advanced["transport"]
-        if server["transport"] in ("", "default")
-        else server["transport"],
-        "min_update_interval": advanced["min_update_interval"]
-        if server["min_update_interval"] is None
-        else server["min_update_interval"],
-    }
-
-
 def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[dict[str, Any]]:
-    """OPCUAClient arguments per configured server, or exit.
-
-    Security is resolved and validated per server on its effective settings, so
-    an error names the server whose settings are wrong.
-    """
+    """OPCUAClient arguments per configured server, or exit."""
     reject_legacy_shape(config)
     servers = config.get("servers") or []
     if not servers:
@@ -178,7 +151,6 @@ def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[di
                 "server_certificate": server["server_certificate"],
                 "server_certificate_file": server["server_certificate_file"],
                 **effective,
-                **_inherit_transport(server, advanced),
                 **{k: advanced[k] for k in _SHARED},
                 # Explicit per-server None under a secure default: allowed, but loud.
                 "downgrade_from": advanced["security_mode"]
@@ -243,19 +215,14 @@ def apply_log_level(level_name: str) -> None:
         logger.warning("Invalid log level '%s', using INFO", level_name)
         level = logging.INFO
     logging.getLogger().setLevel(level)
-    # asyncua emits a record per request; follow the root level only into DEBUG,
-    # where the user has explicitly asked for the firehose.
+    # asyncua logs a record per request: only DEBUG opens it.
     logging.getLogger("asyncua").setLevel(
         logging.DEBUG if level <= logging.DEBUG else logging.WARNING
     )
 
 
 def load_node_map(map_file: str | None, server: str = "", discovery: bool = True) -> NodeMap | None:
-    """Load the configured node map, or exit.
-
-    A configured map that is missing or unparseable is fatal: continuing with an
-    empty map records nothing while the extension reports itself healthy.
-    """
+    """Load the configured node map, or exit: an empty map records nothing while looking healthy."""
     if not map_file:
         if discovery:
             logger.info("[%s] No node_map_file: tracing every variable discovered", server)
@@ -276,10 +243,8 @@ def load_node_map(map_file: str | None, server: str = "", discovery: bool = True
 def serve(clients: list[OPCUAClient], prefix: str) -> None:
     """Publish the action surface, then poll every server until shutdown.
 
-    Actions are registered before `init()`: the registry is what init publishes,
-    so anything registered afterwards may never be advertised. The prefix source
-    is created before `init()` too, which then reuses it as the global source
-    instead of adding an empty second one of the same name.
+    Before `init()`: actions (registered later may never be advertised) and the
+    prefix source (else init adds an empty second one of the same name).
     """
     runner = OPCUARunner(clients)
     opcua_actions.set_runner(runner)
@@ -299,7 +264,6 @@ def serve(clients: list[OPCUAClient], prefix: str) -> None:
 
 def run_config(config: dict[str, Any], demo: bool = False) -> None:
     """Resolve an app-shaped config (demo, servers[], advanced) and serve it."""
-    reject_legacy_shape(config)
     advanced = resolve_advanced(config)
     apply_log_level(advanced["log_level"])
     prefix = trace_name(str(advanced["prefix"]))

@@ -1,16 +1,8 @@
-"""Free-floating OPC-UA action functions registered under `<ACTION_PREFIX>/<name>`.
+"""OPC-UA actions, free functions registered under `<ACTION_PREFIX>/<name>`.
 
-Free functions, not client methods, so the action surface has one shape whether
-or not a client happens to be running, and so field decorators can reference
-module-level callables (a bound `self` does not exist at decoration time).
-
-Every action that targets a server takes an optional `server` (its name). With
-one server it may be omitted; with several, omitting it is an error that lists
-the names. `cli/app.py` calls `set_runner` at startup.
-
-Failure convention: raise. The actions protocol derives its verdict from a
-raised exception, so a returned {"success": False} reads as a successful run on
-the wire and any caller chaining on exit status proceeds on bad data.
+Free functions, not client methods: one surface whether or not a client runs.
+`server` may be omitted with one server. Failures raise: the protocol reads its
+verdict from an exception, so {"success": False} would report a successful run.
 """
 
 from __future__ import annotations
@@ -34,7 +26,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Populated by cli/app.py (and any other entrypoint that brings up clients).
 _runner: OPCUARunner | None = None
 
 
@@ -81,13 +72,10 @@ def _run(
     timeout: float | None = None,
     sent: list[float] | None = None,
 ) -> Any:
-    """Dispatch an action coroutine, normalizing anything unexpected.
+    """Dispatch an action coroutine; anything not self-describing becomes a RuntimeError.
 
-    Self-describing errors (bad input, a UA status code naming the node) are
-    re-raised verbatim; everything else becomes a RuntimeError after a logged
-    traceback, so the caller sees a sentence rather than an opaque type name.
-    A timeout after a write's request went out (`sent`) cannot be recalled: its
-    outcome is unknown, and the message says so.
+    A timeout after a write went out (`sent`) cannot be recalled: the message
+    says its outcome is unknown.
     """
     try:
         return _get_runner()._run_coro(coro, timeout or client.timeout)
@@ -109,12 +97,7 @@ def _timed_out(error: BaseException) -> bool:
 
 
 def _write_timeout(client: OPCUAClient) -> float:
-    """Dispatch deadline for a write.
-
-    A write is read_data_value then write_value, and the named path may add an
-    AccessLevel probe - each bounded by `client.timeout` on its own, so the
-    per-request timeout is far too short a ceiling for the whole action.
-    """
+    """Read, write and maybe an AccessLevel probe, each bounded by `client.timeout`."""
     return 3 * client.timeout + 1.0
 
 
@@ -215,8 +198,7 @@ def discovered_map(format: str = "json", server: str = "") -> dict[str, Any]:
 @zelos_sdk.action.number("max_depth", minimum=1, maximum=5, default=1, title="Max Depth")
 def browse_nodes(start_node_id: str, max_depth: int, server: str = "") -> dict[str, Any]:
     client = _get_client(server)
-    # A deep browse is many round trips; the per-request timeout is the wrong
-    # ceiling for the whole walk.
+    # Many round trips: the per-request timeout is the wrong ceiling.
     nodes = _run(
         client,
         client.browse_children(start_node_id, int(max_depth)),
@@ -245,8 +227,7 @@ def read_node(node_id: str, server: str = "") -> dict[str, Any]:
     "value", title="Value", description="Coerced to the node's type; true/false for bools"
 )
 def write_node(node_id: str, value: str, server: str = "") -> dict[str, Any]:
-    # Text, not number: a number field cannot write a bool or a string node at
-    # all. The client coerces using the variant type it reads back.
+    # Text: a number field cannot write a bool or string node. Coerced to the variant type.
     client = _get_client(server)
     sent: list[float] = []
     _run(
@@ -285,8 +266,6 @@ def read_named_node(name: str, server: str = "") -> dict[str, Any]:
     "value", title="Value", description="Coerced to the node's datatype; true/false for bools"
 )
 def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
-    # Text, not number: a number field cannot write a bool or a string node at
-    # all. The map's datatype decides how it is parsed.
     client = _get_client(server)
     node = _get_node(client, name)
     if client.discovery:
@@ -294,9 +273,7 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
             f"Node '{name}' was discovered, and discovered nodes are read-only by name; "
             f"use write_node with node_id {node.node_id}"
         )
-    # Answered from the map, before dispatching: a declared read-only node needs
-    # no connection to reject, and a connect failure here would report the wrong
-    # reason. The client repeats the check for the auto-detect path.
+    # Before dispatch: a connect failure would report the wrong reason.
     if node.writable is False:
         raise ValueError(f"Node '{name}' is not writable")
     typed = coerce_text(str(value), node.datatype)
@@ -329,11 +306,9 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
     standalone=True,
 )
 def auto_config() -> dict[str, Any]:
-    """The app's auto-configure contract: the keys of `config` replace the form's.
+    """`config` keys replace the form's: only `servers`, so Advanced survives.
 
-    Only `servers` is returned, so whatever is set under Advanced survives. Runs
-    its own short loop: standalone there is no live client, and live it is
-    dispatched from the actions thread, never the polling loop.
+    Its own asyncio.run: called from the actions thread, never the polling loop.
     """
     from .autoconfig import find_servers
 
@@ -359,14 +334,8 @@ def auto_config() -> dict[str, Any]:
 
 
 def register_actions(registry: ActionsRegistry) -> list[str]:
-    """Register every @action-decorated free function in this module by its bare
-    function name. The leading `OPC-UA/` segment consumers see comes from
-    `zelos_sdk.init(name=ACTION_PREFIX, actions=True)`, which concatenates the
-    service name at serve time.
-
-    Returns:
-        The registered names, without the service prefix
-    """
+    """Register every @action function here by bare name; `init(name=ACTION_PREFIX)`
+    adds the `OPC-UA/` prefix. Returns the registered names."""
     module = sys.modules[__name__]
     registered: list[str] = []
     for name, obj in inspect.getmembers(module):

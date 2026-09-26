@@ -66,8 +66,11 @@ def opcplc(tmp_path_factory):
 
 
 async def _answers() -> bool:
+    # A full session, not just GetEndpoints: right after start OPC PLC answers
+    # GetEndpoints before it can serve a session.
     try:
-        return bool(await Client(ENDPOINT, timeout=2).connect_and_get_server_endpoints())
+        async with Client(ENDPOINT, timeout=2):
+            return True
     except Exception:
         return False
 

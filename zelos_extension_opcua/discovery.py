@@ -123,10 +123,8 @@ def to_nsu_string(node_id: NodeId, namespaces: Sequence[str]) -> str | None:
 
 def node_id_string(node_id: NodeId, namespaces: Sequence[str]) -> str:
     """nsu= for a server namespace (stable across restarts), ns=0 otherwise."""
-    if node_id.NamespaceIndex:
-        nsu = to_nsu_string(node_id, namespaces)
-        if nsu is not None:
-            return nsu
+    if node_id.NamespaceIndex and (nsu := to_nsu_string(node_id, namespaces)):
+        return nsu
     bare = NodeId(node_id.Identifier, 0, node_id.NodeIdType).to_string()
     return f"ns={node_id.NamespaceIndex};{bare}"
 
@@ -144,15 +142,19 @@ async def operation_limits(client: Client) -> tuple[int, int, int]:
         ],
         MAX_OPERATIONS,
     )
-    limits = []
-    for dv in dvs:
-        value = dv.Value.Value if dv.Value and _good(dv) else None
-        limits.append(min(int(value), MAX_OPERATIONS) if value else MAX_OPERATIONS)
-    return limits[0], limits[1], limits[2]
+    browse, read, monitor = (
+        min(int(v), MAX_OPERATIONS) if (v := value_of(dv)) else MAX_OPERATIONS for dv in dvs
+    )
+    return browse, read, monitor
 
 
 def _good(dv: ua.DataValue) -> bool:
     return dv.StatusCode is None or dv.StatusCode.is_good()
+
+
+def value_of(dv: ua.DataValue) -> Any:
+    """A Good DataValue's value, else None."""
+    return dv.Value.Value if dv.Value and _good(dv) else None
 
 
 async def read_many(
@@ -239,10 +241,8 @@ async def _browse_batch(
 ) -> tuple[list[list[Any]], dict[int, str]]:
     """Forward hierarchical references of each node, following BrowseNext to the end.
 
-    One request needs a continuation point per large node, and a small server
-    holds few (5-10): past its cap a node gets BadNoContinuationPoints and no
-    references. Those are browsed again one per request once the batch's own
-    points are released, so at most one is held.
+    A small server holds few continuation points: a node refused
+    BadNoContinuationPoints is re-browsed alone after the batch releases its own.
 
     Returns:
         (references per node, index -> status name of each node that failed)
@@ -304,13 +304,9 @@ async def _browse_batch(
 async def walk(rpc: _Counter, chunk: int) -> tuple[list[Found], list[str]]:
     """Breadth-first from Objects over forward hierarchical references.
 
-    Not followed: the Server object (i=2253, the server's own diagnostics), any
-    Object whose BrowseName starts with `_` (Kepware's _System, _Statistics,
-    _CommunicationSerialization, _Hints branches; `_` Variables are kept), and
-    HasProperty targets, which are metadata - EngineeringUnits / EURange of a
-    Variable are recorded for describe. Variables are browsed too: struct
-    members hang off their parent Variable. A node reached twice is visited
-    once, which also breaks reference cycles.
+    Not followed: Server (i=2253), Objects named `_*` (Kepware's _System etc.),
+    HasProperty (EngineeringUnits / EURange are recorded). Variables are browsed
+    too: struct members hang off them.
 
     Returns:
         (Variables found, `path (status)` of each node whose browse failed)
@@ -362,7 +358,7 @@ def _local(node_id: Any) -> NodeId:
 
 
 def _text(dv: ua.DataValue) -> str:
-    value = dv.Value.Value if dv.Value and _good(dv) else None
+    value = value_of(dv)
     return (value.Text or "") if isinstance(value, ua.LocalizedText) else ""
 
 
@@ -372,8 +368,8 @@ async def describe(
     """(variable, datatype, unit, description) per traceable Variable, skip counts,
     and the traceable ones declared BaseDataType.
 
-    Value is read only where the DataType does not fix the type or the rank may
-    be an array: on a gateway a Value read can cost a device read.
+    Value is read only where the DataType or rank leaves the type open: on a
+    gateway a Value read can cost a device read.
     """
     n = len(_DESCRIBE_ATTRIBUTES)
     items: list[tuple[NodeId, int | None]] = [
@@ -388,26 +384,21 @@ async def describe(
     items.extend((ref, None) for _, _, ref in props)
     dvs = await rpc.read(items, chunk)
     prop_values: dict[tuple[int, str], Any] = {
-        (id(var), key): dv.Value.Value
+        (id(var), key): value_of(dv)
         for (var, key, _), dv in zip(props, dvs[len(found) * n :], strict=True)
-        if dv.Value and _good(dv)
     }
 
     skipped: Counter[str] = Counter()
     typed: list[tuple[Found, Any, bool, list[ua.DataValue]]] = []
     for i, var in enumerate(found):
         attrs = dvs[i * n : (i + 1) * n]
-        dtype, rank, access = (
-            dv.Value.Value if dv.Value and _good(dv) else None for dv in attrs[:3]
-        )
+        dtype, rank, access = (value_of(dv) for dv in attrs[:3])
         if access is not None and not access & _CURRENT_READ:
             skipped["not readable"] += 1
             continue
         if rank is not None and rank not in (_SCALAR, *_MAYBE_SCALAR):
             skipped["array"] += 1
             continue
-        # The value is needed where the declaration does not fix the type, or
-        # the rank leaves scalar vs array to it.
         typed.append((var, dtype, declared_datatype(dtype) is None or rank in _MAYBE_SCALAR, attrs))
 
     unresolved = [var.node_id for var, _, needs_value, _ in typed if needs_value]
@@ -441,12 +432,10 @@ def declared_datatype(dtype: Any) -> str | None:
 
 
 def field_datatype(dtype: Any, dv: ua.DataValue | None) -> tuple[str | None, str]:
-    """A Variable's field datatype, or (None, skip reason).
+    """A Variable's field datatype, or (None, skip reason); `dv` None when not read.
 
-    The declaration wins where it fixes one. BaseDataType is string: its value
-    type may change per sample, and each value is rendered as text. Otherwise
-    (other abstract or vendor types) the value's kind at its widest: bool,
-    float64 for any number, string. `dv` is the current value, None when not read.
+    The declaration wins where it fixes one; BaseDataType is string (its value
+    type may change); otherwise the value's kind at its widest.
     """
     declared = declared_datatype(dtype)
     if dv is None:
@@ -510,16 +499,11 @@ def assign_names(
 ) -> tuple[dict[str, list[Node]], list[str]]:
     """Events and fields for the described Variables, and the renames made.
 
-    Event = the recognized vendor id's leading segments, else the parent path
-    below Objects; field = BrowseName. Both sanitized, segments joined by `/`.
-    An event over `max_event_bytes` keeps its trailing segments.
+    Event = the vendor id's leading segments, else the parent path; field =
+    BrowseName. An event over `max_event_bytes` keeps its trailing segments.
 
-    Every node whose (event, field) another node also resolves to (same
-    BrowseName, sanitization, truncation) is named `<field>_<hash>`, the hash of
-    its nsu= id (URI, not the shifting index), 10 digits where 6 still collide.
-    None keeps the plain name: a trace name never refers to a different node
-    than it did before; a collision appearing later ends the plain series
-    (rename) rather than re-pointing it.
+    Every collider is `<field>_<hash>` of its nsu= id (10 digits where 6 still
+    collide), none keeps the plain name: a trace name never re-points to another node.
     """
     rows = []
     for var, datatype, unit, desc in described:
@@ -561,16 +545,7 @@ async def discover(
     name: str,
     max_event_bytes: int = TRACE_NAME_BYTES,
 ) -> Discovery:
-    """Walk, describe and name the server's Variables.
-
-    Args:
-        client: A connected session
-        namespaces: The server's NamespaceArray, for nsu= ids
-        browse_chunk: Nodes per Browse request
-        read_chunk: Nodes per Read request
-        name: The discovered map's name
-        max_event_bytes: Longest event name the trace takes after its prefix
-    """
+    """Walk, describe and name the server's Variables; `name` names the map."""
     started = time.monotonic()
     rpc = _Counter(client)
     found, browse_failed = await walk(rpc, browse_chunk)
