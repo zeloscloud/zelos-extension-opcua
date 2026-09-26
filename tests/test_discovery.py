@@ -23,6 +23,7 @@ from zelos_extension_opcua.discovery import (
     HEALTH_EVENT,
     Found,
     assign_names,
+    field_datatype,
     read_many,
     vendor_segments,
 )
@@ -59,16 +60,49 @@ async def test_gateway_discovery_and_health():
             await client.disconnect()
 
 
-async def test_device_units_and_skip_summary(caplog):
+async def test_device_units_types_and_skip_summary(caplog):
     async with Simulator("device", port=0) as sim:
         with caplog.at_level(logging.INFO, logger="zelos_extension_opcua.client"):
             client, _ = await discovered(sim)
+        # Abstract Number: an Int32 then a Double sample both land as float64.
+        idx = await sim.server.get_namespace_index(profiles.DEVICE_URI)
+        load = ua.NodeId("Pump01.ParameterSet.Load", idx)
+        samples = []
+        for sample in (ua.Variant(7, ua.VariantType.Int32), ua.Variant(2.5, ua.VariantType.Double)):
+            # A read-time value: asyncua refuses a write whose variant type changes.
+            sim.server.set_attribute_value_callback(load, lambda *_, v=sample: ua.DataValue(v))
+            samples.append((await client._poll_nodes())["Pump01/ParameterSet"]["Load"])
         await client.disconnect()
+    assert [(type(v), v) for v in samples] == [(float, 7.0), (float, 2.5)]
     params = {n.name: n for n in client.node_map.events["Pump01/ParameterSet"]}
+    assert params["Load"].datatype == "float64"
     assert (params["Voltage"].unit, params["Temperature"].unit) == ("V", "degC")
     assert "range 0..480" in params["Voltage"].description
     summaries = [r.getMessage() for r in caplog.records if "Discovered" in r.getMessage()]
     assert len(summaries) == 1 and summaries[0].endswith("skipped: array 1, struct 1")
+
+
+_ID = ua.ObjectIds
+_VT = ua.VariantType
+
+
+@pytest.mark.parametrize(
+    ("dtype", "sample", "expected"),
+    [
+        (_ID.Number, None, "float64"),
+        (_ID.Integer, None, "int64"),
+        (_ID.UInteger, None, "uint64"),
+        (_ID.UInt64, None, "uint64"),  # concrete: exact, not widened
+        (_ID.UInt64, (2**64 - 1, _VT.UInt64), "uint64"),  # rank -2, scalar value
+        (_ID.BaseDataType, (True, _VT.Boolean), "bool"),
+        (_ID.BaseDataType, (3, _VT.Int32), "float64"),
+        (_ID.BaseDataType, (1.5, _VT.Float), "float64"),
+        (_ID.BaseDataType, ("on", _VT.String), "string"),
+    ],
+)
+def test_field_datatype(dtype, sample, expected):
+    dv = ua.DataValue(ua.Variant(*sample)) if sample else None
+    assert field_datatype(ua.NodeId(dtype), dv) == (expected, "")
 
 
 async def test_s7_honors_operation_limits():

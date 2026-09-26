@@ -181,7 +181,7 @@ just sim          # standalone simulator (see Simulator)
 | `demo` | The demo-mode PLC (`ns=2;s=Temperature.Sensor1`, ...) |
 | `gateway` | Kepware-shaped `ns=2;s=Channel.Device.Tag` (power meter, genset) with `_System` / `_Statistics` noise |
 | `s7` | S7-1500-shaped `ns=3;s="DB"."tag"`; enforced MaxNodesPerBrowse 10, MaxNodesPerRead 20, 10 references per node (BrowseNext), 4 sessions |
-| `device` | DI `DeviceSet` identity, EngineeringUnits + EURange, a Double[4] array, a vendor struct, a Bad-status node, a reference cycle, a 14-level branch |
+| `device` | DI `DeviceSet` identity, EngineeringUnits + EURange, a Double[4] array, a vendor struct, an abstract Number node, a Bad-status node, a reference cycle, a 14-level branch |
 
 | Flag | Effect |
 |---|---|

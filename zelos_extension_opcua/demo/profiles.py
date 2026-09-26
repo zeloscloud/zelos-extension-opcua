@@ -269,7 +269,8 @@ DEEP_LEVELS = 14
 
 
 async def build_device(server: Server, ns: dict[str, int]) -> Drifter:
-    """DI-like device: DeviceSet identity, EU/EURange, array, struct, Bad node, cycle, depth."""
+    """DI-like device: DeviceSet identity, EU/EURange, array, struct, Number, Bad node, cycle,
+    depth."""
     di, idx = ns[DI_URI], ns[DEVICE_URI]
     points: list[tuple[UaNode, VT, Drift]] = []
 
@@ -350,6 +351,14 @@ async def build_device(server: Server, ns: dict[str, int]) -> Drifter:
             VT.ExtensionObject,
             lambda t: pump_status(Running=True, Speed=1450.0 + random.gauss(0, 5), FaultCode=0),
         )
+    )
+
+    # Abstract Number DataType: an Int32 value now, any numeric subtype later.
+    await params.add_variable(
+        ua.NodeId("Pump01.ParameterSet.Load", idx),
+        _qn("Load", idx),
+        ua.Variant(0, VT.Int32),
+        datatype=ua.NodeId(ua.ObjectIds.Number),
     )
 
     broken = await params.add_variable(

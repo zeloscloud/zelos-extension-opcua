@@ -34,8 +34,7 @@ TRACE_NAME_BYTES = 128
 
 _IDS = ua.ObjectIds
 
-# Builtin DataType -> node map datatype. Any other DataType (subtypes, enums,
-# vendor types) is resolved from the variant type of its current value.
+# Concrete builtin DataType -> node map datatype, kept exactly.
 BUILTIN_DATATYPES = {
     _IDS.Boolean: "bool",
     _IDS.SByte: "int8",
@@ -51,8 +50,16 @@ BUILTIN_DATATYPES = {
     _IDS.String: "string",
 }
 
-# Variant type -> node map datatype: a value's type when its DataType is not
-# builtin, and the coercion for text written to an unmapped node (write_node).
+# Abstract numeric DataType -> the widest exact type of its family: any subtype
+# may arrive, and values coerce into it.
+ABSTRACT_DATATYPES = {
+    _IDS.Number: "float64",
+    _IDS.Integer: "int64",
+    _IDS.UInteger: "uint64",
+}
+
+# Variant type -> node map datatype: the coercion for text written to an
+# unmapped node (write_node), and the value kind of an untyped node.
 VARIANT_DATATYPES = {
     ua.VariantType.Boolean: "bool",
     ua.VariantType.SByte: "int8",
@@ -319,8 +326,8 @@ async def describe(
 ) -> tuple[list[tuple[Found, str, str, str]], Counter[str]]:
     """(variable, datatype, unit, description) per traceable Variable, and skip counts.
 
-    Value is read only where the DataType is not builtin or the rank may be an
-    array: on a gateway a Value read can cost a device read.
+    Value is read only where the DataType does not fix the type or the rank may
+    be an array: on a gateway a Value read can cost a device read.
     """
     n = len(_DESCRIBE_ATTRIBUTES)
     items: list[tuple[NodeId, int | None]] = [
@@ -341,7 +348,7 @@ async def describe(
     }
 
     skipped: Counter[str] = Counter()
-    typed: list[tuple[Found, str | None, list[ua.DataValue]]] = []
+    typed: list[tuple[Found, Any, bool, list[ua.DataValue]]] = []
     for i, var in enumerate(found):
         attrs = dvs[i * n : (i + 1) * n]
         dtype, rank, access = (
@@ -353,21 +360,19 @@ async def describe(
         if rank is not None and rank not in (_SCALAR, *_MAYBE_SCALAR):
             skipped["array"] += 1
             continue
-        datatype = None
-        if isinstance(dtype, NodeId) and dtype.NamespaceIndex == 0 and rank not in _MAYBE_SCALAR:
-            datatype = BUILTIN_DATATYPES.get(dtype.Identifier)
-        typed.append((var, datatype, attrs))
+        # The value is needed where the declaration does not fix the type, or
+        # the rank leaves scalar vs array to it.
+        typed.append((var, dtype, declared_datatype(dtype) is None or rank in _MAYBE_SCALAR, attrs))
 
-    unresolved = [var.node_id for var, datatype, _ in typed if datatype is None]
+    unresolved = [var.node_id for var, _, needs_value, _ in typed if needs_value]
     values = iter(await rpc.read([(nid, None) for nid in unresolved], chunk))
 
     out = []
-    for var, datatype, attrs in typed:
+    for var, dtype, needs_value, attrs in typed:
+        datatype, reason = field_datatype(dtype, next(values) if needs_value else None)
         if datatype is None:
-            datatype, reason = _from_value(next(values))
-            if datatype is None:
-                skipped[reason] += 1
-                continue
+            skipped[reason] += 1
+            continue
         eu = prop_values.get((id(var), "eu"))
         unit = (eu.DisplayName.Text or "") if isinstance(eu, ua.EUInformation) else ""
         display = _text(attrs[3])
@@ -379,8 +384,23 @@ async def describe(
     return out, skipped
 
 
-def _from_value(dv: ua.DataValue) -> tuple[str | None, str]:
-    """Datatype from the current value's variant, or (None, skip reason)."""
+def declared_datatype(dtype: Any) -> str | None:
+    """Datatype a DataType declaration fixes: concrete builtin or abstract numeric."""
+    if not isinstance(dtype, NodeId) or dtype.NamespaceIndex != 0:
+        return None
+    return BUILTIN_DATATYPES.get(dtype.Identifier) or ABSTRACT_DATATYPES.get(dtype.Identifier)
+
+
+def field_datatype(dtype: Any, dv: ua.DataValue | None) -> tuple[str | None, str]:
+    """A Variable's field datatype, or (None, skip reason).
+
+    The declaration wins where it fixes one. Otherwise (BaseDataType, other
+    abstract or vendor types) the value's kind at its widest: bool, float64 for
+    any number, string. `dv` is the current value, None when not read.
+    """
+    declared = declared_datatype(dtype)
+    if dv is None:
+        return declared, ""
     if dv.StatusCode is not None and dv.StatusCode.value == _BAD_DECODING:
         return None, "undecodable"
     variant = dv.Value if _good(dv) else None
@@ -388,10 +408,14 @@ def _from_value(dv: ua.DataValue) -> tuple[str | None, str]:
         return None, "no value"
     if isinstance(variant.Value, list):
         return None, "array"
+    if declared:
+        return declared, ""
     if variant.VariantType == ua.VariantType.ExtensionObject:
         return None, "struct"
-    datatype = VARIANT_DATATYPES.get(variant.VariantType)
-    return (datatype, "") if datatype else (None, "unsupported type")
+    kind = VARIANT_DATATYPES.get(variant.VariantType)
+    if kind is None:
+        return None, "unsupported type"
+    return (kind if kind in ("bool", "string") else "float64"), ""
 
 
 def vendor_segments(node_id: NodeId, browse_name: str) -> list[str] | None:
