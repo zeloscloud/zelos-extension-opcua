@@ -106,7 +106,8 @@ VENDOR_IDS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], list[str]]], 
 
 
 # Raised client-side while parsing a complete response: the channel is intact.
-_DECODE_ERRORS = (struct.error, ValueError, NotEnoughData)
+# asyncua raises TypeError on some malformed Variant contents (seen on OPC PLC).
+_DECODE_ERRORS = (struct.error, ValueError, TypeError, NotEnoughData)
 _NO_CONTINUATION_POINTS = ua.StatusCodes.BadNoContinuationPoints
 _BAD_DECODING = ua.StatusCodes.BadDecodingError
 _BASE_DATATYPE = NodeId(_IDS.BaseDataType)
