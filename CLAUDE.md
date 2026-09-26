@@ -109,7 +109,7 @@ item's value (a 2-D Variant array, some nested Variants), which fails the whole
 response - `read_many` then re-reads that chunk item by item and returns the
 culprit as BadDecodingError. A Bad item is skipped, as is one whose value fails
 `decode_value` (a string arriving on a float32 node, an integer wider than its
-field: abstract-typed nodes are typed by one sample), and `_log_node_failure`
+concrete integer field), and `_log_node_failure`
 guarantees **one ERROR per bad node per process** - an unbounded per-cycle warning
 would flood both the log sink and the trace.
 
@@ -144,6 +144,9 @@ named `_*`, HasProperty (EngineeringUnits / EURange are recorded). Variables are
 browsed too (struct members, EU properties). Describe: one batched Read of
 DataType, ValueRank, AccessLevel, DisplayName, Description + EU values; Value
 only where the DataType is not builtin or the rank is Any/ScalarOrOneDimension.
+Typing (`field_datatype`): a concrete builtin DataType exactly; Number / Integer /
+UInteger as float64 / int64 / uint64; anything else by the value's kind at its
+widest (bool, float64, string), other kinds skipped; values coerce into the field.
 Naming and collisions: `discovery.assign_names`. Unbounded by design: a limit
 needs measured data.
 

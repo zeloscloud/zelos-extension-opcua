@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A reconnect that finds fields added to an existing event starts a new segment
   of the trace source (one INFO line) and traces them; a field whose datatype
   changed is skipped with one WARNING until restart.
+- Discovery types a Number / Integer / UInteger node as float64 / int64 / uint64 and a BaseDataType or other untyped node by its value's kind (bool, float64, string); concrete DataTypes are kept exactly.
 - Server health event `_server` per server (state, clock skew, service level,
   session and rejected-request counts), read in the poll's own request.
 - `auto_config` standalone action behind the config form's Auto-configure button:
