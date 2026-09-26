@@ -40,7 +40,7 @@ uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json
 | `servers[].node_map_file` | string | `""` | Path to the JSON node map; empty discovers the address space |
 | `servers[].poll_interval` | number | `1.0` | Seconds: subscription sampling/publishing interval, poll period, `_server` period |
 | `servers[].transport` | string | `default` | `default` (inherit), `subscription`, `poll` |
-| `servers[].min_update_interval` | number | `0` | Seconds; `0` inherits the advanced value |
+| `servers[].min_update_interval` | number \| null | `null` | Seconds; empty inherits the advanced value |
 | `servers[].security_mode` | string | `default` | `default` (inherit), None, Sign, SignAndEncrypt |
 | `servers[].security_policy` | string | `default` | `default` (inherit), None, Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss |
 | `servers[].user_certificate_file` | string | `""` | User certificate; empty inherits the advanced pair |

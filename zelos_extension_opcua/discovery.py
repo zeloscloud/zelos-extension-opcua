@@ -442,9 +442,10 @@ def declared_datatype(dtype: Any) -> str | None:
 def field_datatype(dtype: Any, dv: ua.DataValue | None) -> tuple[str | None, str]:
     """A Variable's field datatype, or (None, skip reason).
 
-    The declaration wins where it fixes one. Otherwise (BaseDataType, other
-    abstract or vendor types) the value's kind at its widest: bool, float64 for
-    any number, string. `dv` is the current value, None when not read.
+    The declaration wins where it fixes one. BaseDataType is string: its value
+    type may change per sample, and each value is rendered as text. Otherwise
+    (other abstract or vendor types) the value's kind at its widest: bool,
+    float64 for any number, string. `dv` is the current value, None when not read.
     """
     declared = declared_datatype(dtype)
     if dv is None:
@@ -458,6 +459,8 @@ def field_datatype(dtype: Any, dv: ua.DataValue | None) -> tuple[str | None, str
         return None, "array"
     if declared:
         return declared, ""
+    if dtype == _BASE_DATATYPE:
+        return "string", ""
     if variant.VariantType == ua.VariantType.ExtensionObject:
         return None, "struct"
     kind = VARIANT_DATATYPES.get(variant.VariantType)

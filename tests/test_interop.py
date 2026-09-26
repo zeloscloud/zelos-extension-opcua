@@ -170,6 +170,14 @@ async def test_subscriptions_deliver_fast_nodes_at_source_time(
         assert status["subscribed"] == 5
     else:
         assert status["subscribed"] > 0 and status["polled_variant"] > 0, status
+        # BaseDataType is traced as text: a value type change never fails a node.
+        variant_errors = [
+            m
+            for r in caplog.records
+            if "decode failed" in (m := r.getMessage())
+            and any(f"({nid})" in m for nid in client._variant)
+        ]
+        assert not variant_errors, variant_errors[:5]
     assert not [r for r in caplog.records if "could not be decoded" in r.getMessage()]
     assert all(source is not None and at == source for at, source in stamped)
     assert len({at for at, _ in stamped}) == len(stamped)

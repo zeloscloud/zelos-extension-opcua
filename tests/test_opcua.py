@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,7 @@ from zelos_extension_opcua.client import (
     encode_value,
     is_connection_error,
     parse_node_id_to_ua,
+    render_text,
 )
 from zelos_extension_opcua.node_map import (
     Node,
@@ -361,6 +363,27 @@ class TestValueCodec:
             assert abs(result - expected) < 0.0001
         else:
             assert result == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (True, "true"),
+            (3, "3"),
+            (1.5, "1.5"),
+            (ua.LocalizedText("on", "en"), "on"),
+            (ua.NodeId(5, 2), "ns=2;i=5"),
+            (ua.QualifiedName("x", 2), "2:x"),
+            (uuid.UUID(int=1), "00000000-0000-0000-0000-000000000001"),
+            (datetime(2026, 1, 2, 3, 4, 5), "2026-01-02T03:04:05+00:00"),
+            (b"\x01\xff", "01ff"),
+            (ua.StatusCode(ua.StatusCodes.BadSensorFailure), "BadSensorFailure"),
+            (ua.ExtensionObject(), "ExtensionObject(TypeId="),
+        ],
+    )
+    def test_render_text(self, raw, expected):
+        """A BaseDataType node's value, whatever its type, lands as text."""
+        assert render_text(raw).startswith(expected)
+        assert decode_value(raw, "string") == render_text(raw)
 
     def test_decode_with_scale(self):
         """Scale factor is applied after decoding."""
