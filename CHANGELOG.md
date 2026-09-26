@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live discovery: a server without a node map is browsed on every connect and every
   scalar variable traced, read-only; `advanced.discovery` turns it off.
   `discovered_map` returns the discovered set as node map json or csv.
-- Server health event `server` per server (state, clock skew, service level,
+- Server health event `_server` per server (state, clock skew, service level,
   session and rejected-request counts), read in the poll's own request.
 - `auto_config` standalone action behind the config form's Auto-configure button:
   localhost well-known ports, the Local Discovery Server and mDNS (`zeroconf`).

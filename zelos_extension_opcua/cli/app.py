@@ -21,7 +21,6 @@ from zelos_sdk.extensions import ConfigValidationError, load_config
 from zelos_extension_opcua import ACTION_PREFIX
 from zelos_extension_opcua import actions as opcua_actions
 from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, default_server_name
-from zelos_extension_opcua.discovery import HEALTH_EVENT
 from zelos_extension_opcua.node_map import NodeMap
 
 logger = logging.getLogger(__name__)
@@ -241,8 +240,6 @@ def load_node_map(map_file: str | None, server: str = "", discovery: bool = True
         return None
     try:
         node_map = NodeMap.from_file(Path(map_file))
-        if HEALTH_EVENT in node_map.events:
-            raise ValueError(f"event name '{HEALTH_EVENT}' is reserved for the server health event")
     except Exception as e:
         logger.error("[%s] Failed to load node map '%s': %s", server, map_file, e)
         sys.exit(1)
