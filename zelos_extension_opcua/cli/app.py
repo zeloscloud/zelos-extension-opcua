@@ -19,10 +19,13 @@ from zelos_sdk.extensions import ConfigValidationError, load_config
 from zelos_extension_opcua import ACTION_PREFIX
 from zelos_extension_opcua import actions as opcua_actions
 from zelos_extension_opcua.client import (
+    LOG_EVENT,
+    LOG_SOURCE_NAME,
     OPCUAClient,
     OPCUARunner,
     SharedSource,
     default_server_name,
+    install_log_handler,
 )
 from zelos_extension_opcua.node_map import NodeMap
 
@@ -130,6 +133,9 @@ def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[di
             logger.error("servers[%d] has no endpoint", i)
             sys.exit(1)
         name = trace_name(str(server["name"])) or default_server_name(endpoint)
+        if name in (LOG_EVENT, LOG_SOURCE_NAME):
+            logger.error("Server %s: name '%s' is reserved for the extension's log", endpoint, name)
+            sys.exit(1)
         if name in seen:
             logger.error(
                 "Servers %s and %s both resolve to name '%s'; set a distinct name on one",
@@ -240,6 +246,19 @@ def load_node_map(map_file: str | None, server: str = "", discovery: bool = True
     return node_map
 
 
+def open_sources(prefix: str) -> SharedSource | None:
+    """The prefix's shared source with the log on its `log` event, following rotation;
+    cleared, None and the log on its own source. Earlier records reach stderr only."""
+    if not prefix:
+        install_log_handler(LOG_SOURCE_NAME)
+        logger.info("Trace prefix cleared: one trace source per server")
+        return None
+    source = zelos_sdk.TraceSource(prefix)
+    shared = SharedSource(source, install_log_handler(source))
+    logger.info("Trace prefix: %s", prefix)
+    return shared
+
+
 def serve(clients: list[OPCUAClient], prefix: str) -> None:
     """Publish the action surface, then poll every server until shutdown.
 
@@ -251,12 +270,7 @@ def serve(clients: list[OPCUAClient], prefix: str) -> None:
     runner = OPCUARunner(clients)
     opcua_actions.set_runner(runner)
     opcua_actions.register_actions(zelos_sdk.actions_registry)
-    if prefix:
-        logger.info("Trace prefix: %s", prefix)
-        shared = SharedSource(zelos_sdk.TraceSource(prefix))
-    else:
-        logger.info("Trace prefix cleared: one trace source per server")
-        shared = None
+    shared = open_sources(prefix)
     zelos_sdk.init(name=ACTION_PREFIX, actions=True)
 
     for client in clients:

@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Manifest uses `[host] type = "agent"` + `[host.agent]` and `[package]`; `name` is `OPC-UA` (archive slug `opc-ua`); packaging runs `zelos extensions package`.
 - CI checks `uv lock --locked`; `just check` enforces `ruff format --check`.
 - Log lines use UTC ISO 8601 timestamps with milliseconds.
+- Extension logs are the `log` event on the prefix source (`OPC-UA/log`, was source `opcua_log`; `opcua_log` when the prefix is cleared). `log` is a reserved server name.
 
 ### Removed
 - `scripts/package_extension.py`.

@@ -21,7 +21,6 @@ import time
 from pathlib import Path
 
 import rich_click as click
-from zelos_sdk.hooks.logging import TraceLoggingHandler
 
 from zelos_extension_opcua import ACTION_PREFIX as _ACTION_PREFIX
 from zelos_extension_opcua.cli import app as app_mode
@@ -41,15 +40,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # asyncua logs a record per request at INFO, which at a 1 Hz poll is a permanent
-# stream into the trace through the handler below. Only DEBUG re-opens it - see
-# cli/app.apply_log_level.
+# stream into the trace log (installed in cli/app.serve). Only DEBUG re-opens it -
+# see cli/app.apply_log_level.
 logging.getLogger("asyncua").setLevel(logging.WARNING)
-
-# Capture logs at INFO and above into the trace. DEBUG is excluded so verbose
-# library chatter cannot flood the backend.
-_handler = TraceLoggingHandler("opcua_log")
-_handler.setLevel(logging.INFO)
-logging.getLogger().addHandler(_handler)
 
 
 @click.group(invoke_without_command=True)

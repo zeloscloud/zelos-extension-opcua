@@ -34,6 +34,8 @@ from asyncua.ua.uatypes import NodeId
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import ExtendedKeyUsageOID
+from zelos_sdk import schemas
+from zelos_sdk.hooks.logging import TraceLoggingHandler
 
 from zelos_extension_opcua.diagnostics import SERVER, peak_rss_bytes, watch_loop
 from zelos_extension_opcua.discovery import (
@@ -500,12 +502,29 @@ class _ServerLog(logging.LoggerAdapter):
         return f"[{self.extra['server']}] {msg}", kwargs
 
 
-class SharedSource:
-    """A trace source and the clients writing it, rotated as one."""
+#: Log event on the prefix source (`<prefix>/log`); a server may not take this name.
+LOG_EVENT = "log"
+#: Log source when the prefix is cleared.
+LOG_SOURCE_NAME = "opcua_log"
 
-    def __init__(self, source: zelos_sdk.TraceSource) -> None:
+
+def install_log_handler(source: zelos_sdk.TraceSource | str) -> TraceLoggingHandler:
+    """Route INFO and above into the trace; DEBUG would flood it with library chatter."""
+    handler = TraceLoggingHandler(source)
+    handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+class SharedSource:
+    """A trace source and the clients writing it, rotated as one, with the log handler."""
+
+    def __init__(
+        self, source: zelos_sdk.TraceSource, log_handler: TraceLoggingHandler | None = None
+    ) -> None:
         self.source = source
         self.clients: list[OPCUAClient] = []
+        self.log_handler = log_handler
 
 
 def _field(node: Node) -> tuple[str, zelos_sdk.DataType, str]:
@@ -858,27 +877,35 @@ class OPCUAClient:
         """
         shared = self._shared
         assert shared is not None
-        name = shared.source.name
-        shared.source.flush()
-        # Release every reference to the old source and its events first, so its
-        # segment ends before the new one starts.
-        shared.source = None
-        for client in shared.clients:
-            client._events = {}
-        source = zelos_sdk.TraceSource(name)
-        events = {
-            client: {
-                name: source.add_event(
-                    f"{client._event_prefix}{name}",
-                    [zelos_sdk.TraceEventFieldMetadata(*f) for f in fields],
-                )
-                for name, fields in client._fields.items()
+        handler = shared.log_handler
+        # The handler lock holds other threads' records until the log event is back.
+        with handler.lock if handler else contextlib.nullcontext():
+            name = shared.source.name
+            shared.source.flush()
+            # Release every reference to the old source and its events first, so its
+            # segment ends before the new one starts.
+            shared.source = None
+            for client in shared.clients:
+                client._events = {}
+            if handler:
+                handler.trace_source = handler.trace_event = None
+            source = zelos_sdk.TraceSource(name)
+            events = {
+                client: {
+                    name: source.add_event(
+                        f"{client._event_prefix}{name}",
+                        [zelos_sdk.TraceEventFieldMetadata(*f) for f in fields],
+                    )
+                    for name, fields in client._fields.items()
+                }
+                for client in shared.clients
             }
-            for client in shared.clients
-        }
-        shared.source = source
-        for client, client_events in events.items():
-            client._events = client_events
+            shared.source = source
+            for client, client_events in events.items():
+                client._events = client_events
+            if handler:
+                handler.trace_source = source
+                handler.trace_event = source.add_event(LOG_EVENT, schemas.Log)
 
     async def _discover(self) -> None:
         """Browse the server and replace node_map with what it holds now."""

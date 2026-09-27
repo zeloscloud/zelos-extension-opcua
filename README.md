@@ -55,7 +55,7 @@ uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: disco
 | `advanced.user_certificate_file` | string | `""` | Default X.509 user certificate (DER/PEM); empty for Anonymous; needs Sign or SignAndEncrypt |
 | `advanced.user_private_key_file` | string | `""` | Unencrypted user key (DER/PEM); set with `user_certificate_file` |
 
-Trace layout: `OPC-UA/<server>/<event>` (e.g. `OPC-UA/plc01/temperature`); with `advanced.prefix` cleared, one source per server (`plc01/temperature`). Logs go to `opcua_log`.
+Trace layout: `OPC-UA/<server>/<event>` (e.g. `OPC-UA/plc01/temperature`); with `advanced.prefix` cleared, one source per server (`plc01/temperature`). Logs go to `OPC-UA/log` (cleared: `opcua_log`); `log` is not a valid server name.
 
 Startup errors: the pre-`servers[]` flat config; `username` / `password` (no secret is stored in config, use a user certificate); a missing or unparseable `node_map_file`.
 

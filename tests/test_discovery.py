@@ -376,17 +376,19 @@ class RecordingSource:
         self._source = REAL_SOURCE(name)
         self.name = name
         self.writes: list[tuple[str, dict]] = []
+        self.stamped: list[tuple[str, dict]] = []
         RecordingSource.made.append(self)
 
     def add_event(self, name, fields):
-        event, writes = self._source.add_event(name, fields), self.writes
+        event, writes, stamped = self._source.add_event(name, fields), self.writes, self.stamped
 
         class Event:
             def log(self, **values):
                 writes.append((name, values))
                 event.log(**values)
 
-            def log_at(self, stamp, **values):  # subscription rows: not recorded
+            def log_at(self, stamp, **values):  # subscription rows and log records
+                stamped.append((name, values))
                 event.log_at(stamp, **values)
 
         Event.name = event.name
@@ -459,6 +461,34 @@ async def test_added_field_rotates_the_shared_source(monkeypatch, caplog):
         logging.WARNING,
         f"[plc] Discovered fields changed datatype, not traced until restart: {METER}: Relay1",
     ) in messages
+
+
+@pytest.mark.parametrize(("prefix", "source"), [("OPC-UA", "OPC-UA"), ("", "opcua_log")])
+def test_log_records_follow_the_prefix_source(monkeypatch, prefix, source):
+    """Logs land on `<prefix>/log` and move with a rotation; cleared, on `opcua_log`."""
+    monkeypatch.setattr(zelos_sdk, "TraceSource", RecordingSource)
+    RecordingSource.made = []
+    root = logging.getLogger()
+    before = list(root.handlers)
+    log = logging.getLogger("zelos_extension_opcua.test")
+    try:
+        shared = app.open_sources(prefix)
+        [first] = RecordingSource.made
+        log.warning("one")
+        assert first.name == source and ("log", "one") in logs(first)
+        if shared:
+            OPCUAClient(endpoint="", name="plc").start(shared)
+            shared.clients[0]._rotate_source()
+            [_, new] = RecordingSource.made
+            log.warning("two")
+            assert shared.source is new and logs(new) == [("log", "two")]
+            assert ("log", "two") not in logs(first)
+    finally:
+        root.handlers[:] = before
+
+
+def logs(source: RecordingSource) -> list[tuple[str, str]]:
+    return [(e, v["message"]) for e, v in source.stamped if "message" in v]
 
 
 async def test_browse_survives_a_continuation_point_cap(caplog):

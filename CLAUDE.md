@@ -17,7 +17,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 | Path | Role |
 |------|------|
-| `main.py` | Click entry point; re-exports `ACTION_PREFIX`, installs `TraceLoggingHandler("opcua_log")` |
+| `main.py` | Click entry point; re-exports `ACTION_PREFIX` |
 | `zelos_extension_opcua/__init__.py` | `ACTION_PREFIX = "OPC-UA"` - must match `name` in `extension.toml` |
 | `zelos_extension_opcua/actions.py` | Free-function action surface + `register_actions()` |
 | `zelos_extension_opcua/client.py` | `OPCUAClient` (one server: connection, subscriptions, batch polling, reconnect) and `OPCUARunner` (the loop, signals, shutdown, action dispatch) |
@@ -42,7 +42,8 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 ### Startup
 
-- `cli/app.serve()` is the only place that starts clients: config -> clients -> `set_runner` -> `register_actions` -> `init_global_source(prefix)` -> `zelos_sdk.init(name=ACTION_PREFIX)` -> `client.start` -> `runner.run()`.
+- `cli/app.serve()` is the only place that starts clients: config -> clients -> `set_runner` -> `register_actions` -> `open_sources(prefix)` -> `zelos_sdk.init(name=ACTION_PREFIX)` -> `client.start` -> `runner.run()`.
+- Logs: `open_sources` installs the trace handler (INFO+) on the prefix source's `log` event (server name `log` is a config error); cleared prefix, own `opcua_log` source. Earlier records reach stderr only.
 - Registration must precede `init()` (later actions may never be advertised); the prefix source must exist before `init()` so it is reused, not duplicated.
 - Startup problems (bad config, missing/unparseable node map) are one `logger.error` + `sys.exit(1)`; tracebacks are for bugs.
 
@@ -86,7 +87,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 - BadNoContinuationPoints nodes are re-browsed alone after the batch (one point held at a time; `s7` sim holds 3).
 - Typing (`field_datatype`): concrete builtin exactly; Number/Integer/UInteger widest; BaseDataType always string via `render_text`, so a type change never fails the node.
 - Collisions (`assign_names`): every collider gets `_<hash>` of its nsu= id, never an ordinal, so a name never re-points. Unbounded by design: a limit needs measured data.
-- Source rotation: a declared event's schema is fixed per `TraceSource` instance, each construction is a new segment, the app joins them. Added fields rotate at most once per reconnect: `flush()`, construct same name, replay every client's `_fields`, switch every `SharedSource` writer, no await in between. `SharedSource` holds the only reference. A changed datatype is skipped (types not reconciled across segments). The `init_global_source` prefix source is kept by the SDK, so its first segment is never ended. `opcua_log` never rotates.
+- Source rotation: a declared event's schema is fixed per `TraceSource` instance, each construction is a new segment, the app joins them. Added fields rotate at most once per reconnect: `flush()`, construct same name, replay every client's `_fields`, switch every `SharedSource` writer, no await in between. `SharedSource` holds the only reference. A changed datatype is skipped (types not reconciled across segments). The log handler moves with it (under the handler lock). `opcua_log` never rotates.
 - Measured (`--nodes`, localhost): 10k vars discover 1.3s, poll 139 ms/cycle, 177 MB; 50k 6.8s, 734 ms/cycle, 323 MB (baseline 122 MB).
 
 ### Shutdown
