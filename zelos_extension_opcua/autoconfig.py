@@ -170,17 +170,17 @@ async def find_servers() -> tuple[list[dict[str, Any]], list[str]]:
     for found in unique.values():
         entry = _server_entry(found, taken)
         if entry is None:
-            notes.append(f"{found.url} offers no security policy this extension supports")
+            notes.append(f"{found.url} offers no security policy this extension supports.")
             continue
         servers.append(entry)
     if any(s["security_mode"] == "default" for s in servers):
         notes.append(
             "Servers that accept security None are set to 'default': they follow "
-            "Advanced > Security Mode (None unless changed there)"
+            "Advanced > Security Mode (None unless changed there)."
         )
     if any(s["security_mode"] != "default" for s in servers):
         notes.append(
             "Secure servers need this extension's client certificate trusted on the server; "
-            "it is generated on the first connect and its thumbprint logged"
+            "it is generated on the first connect and its thumbprint logged."
         )
     return servers, notes
