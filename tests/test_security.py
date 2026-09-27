@@ -177,6 +177,7 @@ def resolve(config: dict) -> list[OPCUAClient]:
             {"name": " ok "},
             "opc.tcp://ok:4840 and opc.tcp://plc:4840 both resolve to name 'ok'",
         ),
+        ({}, {"name": "log"}, "opc.tcp://plc:4840: name 'log' is reserved"),
     ],
 )
 def test_invalid_server_config_exits(caplog, advanced, server, reason):
