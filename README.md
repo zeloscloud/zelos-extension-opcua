@@ -92,6 +92,10 @@ A server without a `node_map_file` is browsed on every connect (read-only, nothi
 
 Event `_server`, every poll interval, at host time: `state`, `state_name`, `current_time`, `clock_skew_ms` (server minus host), `start_time`, `service_level`, `current_session_count`, `cumulated_session_count`, `rejected_requests_count`, `security_rejected_requests_count`, `current_subscription_count`. Fields the server does not publish are dropped for the connection.
 
+### Diagnostics
+
+A response with an array length past the bytes left in the message is rejected (one WARNING per server); an event loop blocked > 10s dumps every thread's stack to the extension log; peak RSS over 2 GB (then each doubling) logs one WARNING with per-server node and subscription counts.
+
 ### Auto-configure
 
 The config form's button runs `auto_config` (extension stopped); it replaces `servers` only.
@@ -145,7 +149,7 @@ Names are sanitized at load (`. @ : ; =` and whitespace, and `/` in node names, 
 
 | Action | Description |
 |--------|-------------|
-| `OPC-UA/get_status` | Connection state, transport with subscribed / polled counts, poll and error counts; every server's when `server` is omitted |
+| `OPC-UA/get_status` | Connection state, transport with subscribed / polled counts, poll and error counts, process `peak_rss_mb`; every server's when `server` is omitted |
 | `OPC-UA/read_node` | Read by node ID |
 | `OPC-UA/write_node` | Write by node ID; value is text, coerced to the server's type |
 | `OPC-UA/read_named_node` | Read by node map name |
