@@ -35,6 +35,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+from zelos_extension_opcua.diagnostics import SERVER, peak_rss_bytes, watch_loop
 from zelos_extension_opcua.discovery import (
     HEALTH_EVENT,
     MAX_OPERATIONS,
@@ -1560,6 +1561,7 @@ class OPCUAClient:
         State is per client: one dead server never stalls another in the loop.
         """
         self._stop_event = stop_event
+        SERVER.set(self.name)
         backoff = RECONNECT_INITIAL
         losses = 0  # connection losses since the last completed request
         failures = 0  # unclassified failures since the last completed request
@@ -1679,6 +1681,7 @@ class OPCUAClient:
             "polled_variant": self._polled_variant,
             "nodes": len(self.node_map.nodes) if self.node_map else 0,
             "discovery": self.discovery,
+            "peak_rss_mb": rss >> 20 if (rss := peak_rss_bytes()) is not None else None,
         }
 
 
@@ -1706,13 +1709,22 @@ class OPCUARunner:
         self._loop = asyncio.get_running_loop()
         remove_signal_handlers = self._install_signal_handlers()
         tasks = [asyncio.create_task(c._run_async(self._stop_event)) for c in self.clients.values()]
+        watchdog = asyncio.create_task(watch_loop(self._describe))
         try:
             await asyncio.gather(*tasks)
         finally:
+            watchdog.cancel()
             # A client that raised is a bug; stop the rest cleanly.
             self._stop_event.set()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, watchdog, return_exceptions=True)
             remove_signal_handlers()
+
+    def _describe(self) -> str:
+        return ", ".join(
+            f"{c.name}: {len(c.node_map.nodes) if c.node_map else 0} nodes, "
+            f"{len(c._monitored)} subscribed"
+            for c in self.clients.values()
+        )
 
     def stop(self) -> None:
         """Request shutdown. Safe from any thread, including a signal handler."""

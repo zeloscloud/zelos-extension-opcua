@@ -635,6 +635,7 @@ class TestActionsUnit:
     def test_listing(self, offline_client):
         status = actions.get_status()["servers"][0]
         assert (status["connected"], status["nodes"]) == (False, 4)
+        assert status["peak_rss_mb"] > 0
         assert {n["name"] for n in actions.list_nodes()["nodes"]} == {
             "temp",
             "press",

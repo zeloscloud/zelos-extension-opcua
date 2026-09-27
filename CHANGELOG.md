@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sign / SignAndEncrypt never engaged (security call not awaited, every session plaintext). A secure mode now gets exactly that mode and policy or refuses; never falls back to None.
 - Discovery found nothing on .NET-stack servers (BadNodeNotInView): Browse asks for the current view.
 - Discovery re-browses a node refused BadNoContinuationPoints instead of dropping its branch; other Bad browse statuses are one WARNING per connect.
+- A garbage array length in a response (seen once: a Null-element Variant array) froze the loop at 100% CPU growing to 10 GB; a length past the bytes left is now a decode error with one WARNING per server. Added a loop stall watchdog (thread stacks to the log after 10s blocked), peak RSS WARNING from 2 GB, `get_status` `peak_rss_mb`.
 
 ---
 

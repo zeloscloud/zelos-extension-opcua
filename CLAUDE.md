@@ -22,6 +22,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 | `zelos_extension_opcua/actions.py` | Free-function action surface + `register_actions()` |
 | `zelos_extension_opcua/client.py` | `OPCUAClient` (one server: connection, subscriptions, batch polling, reconnect) and `OPCUARunner` (the loop, signals, shutdown, action dispatch) |
 | `zelos_extension_opcua/node_map.py` | Node/NodeMap parsing, name sanitization, collision rules, json/csv export |
+| `zelos_extension_opcua/diagnostics.py` | Import-time asyncua array-length guard, `SERVER` contextvar for its WARNING, loop stall watchdog (`faulthandler` to stderr), peak RSS WARNING; tests in `tests/test_diagnostics.py` |
 | `zelos_extension_opcua/discovery.py` | Live discovery (walk, describe, name), OperationLimits, `HEALTH_EVENT` |
 | `zelos_extension_opcua/autoconfig.py` | `auto_config` sources: localhost ports, LDS, mDNS |
 | `zelos_extension_opcua/cli/app.py` | Config load, `servers[]` / `advanced` resolution, startup validation, `serve()` |
