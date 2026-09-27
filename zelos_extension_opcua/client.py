@@ -858,8 +858,14 @@ class OPCUAClient:
         """
         shared = self._shared
         assert shared is not None
+        name = shared.source.name
         shared.source.flush()
-        source = zelos_sdk.TraceSource(shared.source.name)
+        # Release every reference to the old source and its events first, so its
+        # segment ends before the new one starts.
+        shared.source = None
+        for client in shared.clients:
+            client._events = {}
+        source = zelos_sdk.TraceSource(name)
         events = {
             client: {
                 name: source.add_event(

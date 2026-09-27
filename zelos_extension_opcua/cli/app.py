@@ -243,15 +243,17 @@ def load_node_map(map_file: str | None, server: str = "", discovery: bool = True
 def serve(clients: list[OPCUAClient], prefix: str) -> None:
     """Publish the action surface, then poll every server until shutdown.
 
-    Before `init()`: actions (registered later may never be advertised) and the
-    prefix source (else init adds an empty second one of the same name).
+    Actions register before `init()`: registered later they may never be
+    advertised. The prefix source is a plain TraceSource, not init's global one,
+    which the SDK holds for the process: rotation must be able to drop it so its
+    segment ends. init's global of the same name stays empty.
     """
     runner = OPCUARunner(clients)
     opcua_actions.set_runner(runner)
     opcua_actions.register_actions(zelos_sdk.actions_registry)
     if prefix:
         logger.info("Trace prefix: %s", prefix)
-        shared = SharedSource(zelos_sdk.init_global_source(prefix))
+        shared = SharedSource(zelos_sdk.TraceSource(prefix))
     else:
         logger.info("Trace prefix cleared: one trace source per server")
         shared = None
