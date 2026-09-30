@@ -24,6 +24,17 @@ DEMO_NAMESPACE = "urn:zelos:demo:plc"
 # Building the address space takes well under a second; this only bounds a hang.
 DEMO_START_TIMEOUT = 15.0
 
+# Client-owned: the updater reads these into the simulator and never writes them,
+# so a client write persists and drives the simulation.
+WRITABLE = (
+    "temp_setpoint",
+    "motor_speed_setpoint",
+    "motor_running",
+    "output1",
+    "output2",
+    "device_name",
+)
+
 
 class PLCSimulator:
     """Simulates a PLC with various sensors and actuators."""
@@ -207,15 +218,24 @@ class SimulatorUpdater:
             dt = now - last_time
             last_time = now
 
+            await self._read_writable()
             values = self.simulator.update(dt)
             await self._update_nodes(values)
 
             await asyncio.sleep(self.interval)
 
+    async def _read_writable(self) -> None:
+        """Pull client-written values into the simulator state."""
+        for name in WRITABLE:
+            try:
+                setattr(self.simulator, name, await self.node_vars[name].read_value())
+            except Exception as e:
+                logger.debug(f"Error reading {name}: {e}")
+
     async def _update_nodes(self, values: dict) -> None:
-        """Write simulator values to OPC-UA nodes with correct types."""
+        """Write simulator values to read-only OPC-UA nodes with correct types."""
         for name, node_var in self.node_vars.items():
-            if name in values:
+            if name in values and name not in WRITABLE:
                 try:
                     value = values[name]
                     variant_type = self.node_types.get(name)
@@ -294,7 +314,6 @@ async def populate_demo(server: Server, idx: int) -> tuple[PLCSimulator, Simulat
     node_vars["temp_setpoint"] = await temp_folder.add_variable(
         _nodeid(idx, "Temperature.Setpoint"), "Setpoint", 25.0, ua.VariantType.Float
     )
-    await node_vars["temp_setpoint"].set_writable()
 
     # Pressure folder
     pressure_folder = await device.add_folder(idx, "Pressure")
@@ -313,14 +332,12 @@ async def populate_demo(server: Server, idx: int) -> tuple[PLCSimulator, Simulat
     node_vars["motor_speed_setpoint"] = await motor_folder.add_variable(
         _nodeid(idx, "Motor.SpeedSetpoint"), "SpeedSetpoint", 1500.0, ua.VariantType.Float
     )
-    await node_vars["motor_speed_setpoint"].set_writable()
     node_vars["motor_current"] = await motor_folder.add_variable(
         _nodeid(idx, "Motor.Current"), "Current", 0.0, ua.VariantType.Float
     )
     node_vars["motor_running"] = await motor_folder.add_variable(
         _nodeid(idx, "Motor.Running"), "Running", False, ua.VariantType.Boolean
     )
-    await node_vars["motor_running"].set_writable()
 
     # Counters folder
     counters_folder = await device.add_folder(idx, "Counters")
@@ -342,11 +359,9 @@ async def populate_demo(server: Server, idx: int) -> tuple[PLCSimulator, Simulat
     node_vars["output1"] = await dio_folder.add_variable(
         _nodeid(idx, "DigitalIO.Output1"), "Output1", False, ua.VariantType.Boolean
     )
-    await node_vars["output1"].set_writable()
     node_vars["output2"] = await dio_folder.add_variable(
         _nodeid(idx, "DigitalIO.Output2"), "Output2", False, ua.VariantType.Boolean
     )
-    await node_vars["output2"].set_writable()
 
     # Analog folder
     analog_folder = await device.add_folder(idx, "Analog")
@@ -368,10 +383,11 @@ async def populate_demo(server: Server, idx: int) -> tuple[PLCSimulator, Simulat
     node_vars["device_name"] = await status_folder.add_variable(
         _nodeid(idx, "Status.DeviceName"), "DeviceName", "Demo PLC", ua.VariantType.String
     )
-    await node_vars["device_name"].set_writable()
     node_vars["status_message"] = await status_folder.add_variable(
         _nodeid(idx, "Status.StatusMessage"), "StatusMessage", "Running", ua.VariantType.String
     )
+    for name in WRITABLE:
+        await node_vars[name].set_writable()
 
     # Create simulator and updater with type mapping
     node_types = {
