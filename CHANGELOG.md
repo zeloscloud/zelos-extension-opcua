@@ -24,10 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - X.509 user identity (`user_certificate_file` / `user_private_key_file`) on Sign / SignAndEncrypt; a server without a Certificate user token policy is refused.
 - Reconnect with capped exponential backoff (3s doubling to 60s, reset on a completed request); connection loss detected from asyncua status codes, not message text.
 - Names are sanitized (`. @ : ; = /` and whitespace become `_`); duplicates after sanitization are a load error.
-- A lost connection resumes its session on the new channel (ActivateSession) and keeps its subscriptions; missed notifications are recovered by Republish. A session the server no longer holds (timed out, server restarted) is replaced, with one INFO saying why. Discovery still re-browses; subscriptions are rebuilt only if the discovered nodes changed.
-- Subscription recovery on a live connection: a missed notification (sequence-number gap) is fetched by Republish; a missed keep-alive, an unrecoverable gap or a server-ended subscription recreates that subscription and re-reads its items. One WARNING per event.
+- A lost connection resumes its session on the new channel (ActivateSession) and keeps its subscriptions, which live as long as the session; missed notifications are recovered by Republish. A session the server no longer holds (timed out, server restarted) is replaced, with one INFO saying why. Discovery still re-browses; subscriptions are rebuilt if the discovered nodes changed or the link was lost mid-setup. One WARNING per lost link.
+- Subscription recovery on a live connection: a missed notification (sequence-number gap) the server still holds is fetched by Republish (INFO); a missed keep-alive, an unrecoverable gap or a server-ended subscription recreates that subscription and re-reads its items (one WARNING).
 - Read MaxAge: polled nodes accept a value up to one poll interval old, staleness re-reads up to `min_update_interval`; health and discovery reads stay fresh (0).
-- Discovery `include` / `exclude` globs (`advanced`, per-server override) over the browse path (`*` one segment, `**` any depth); exclude wins; branches no pattern can reach are not browsed; filtered and pruned counts in the discovery INFO line.
+- Discovery `include` / `exclude` globs (`advanced`, per-server override) over the browse path (`*` one segment, `**` any depth); an included branch takes its subtree; exclude wins; branches no pattern can reach are not browsed; a `filtered` count in the discovery INFO line, a WARNING when nothing is left.
 - `get_status` reports transport and subscribed / polled counts.
 - `demo-server` / `just sim`: simulator with `gateway`, `s7` (enforced limits and session caps) and `device` profiles, `--secure`, `--secure-only`, trust lists, `--shuffle-namespaces`, `--map`, `--nodes N`, request log.
 
@@ -35,14 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Writes send only the Value (DataValue mask 0x01), no StatusCode or SourceTimestamp: servers that refuse them answered BadWriteNotSupported.
 - Session timeout 120 s requested (was asyncua's 1 h). A session left open by a lost connection is re-activated on the new channel and closed before a new one is created; on the 4-session `s7` sim the 4th flap no longer fails with BadTooManySessions.
 - An endpoint URL with a user name or password is a startup error and an `auto_config` problem (asyncua logged in with it, in plain text on a None channel).
-- A Bad node is logged once per connection (was once per process), so a later outage is logged again.
+- A Bad node is logged once per connection (was once per process), so it is logged again after a reconnect.
 - Uncertain values are traced (were dropped), subscribed or polled, with one INFO per node per connection naming the status; Bad stays a gap.
-- Revised publishing / sampling interval and queue size are logged once per subscription; a slower revised publishing interval paces the staleness sweep.
+- Revised publishing / sampling interval and queue size (whole ms) are logged once per subscription; a slower revised publishing interval paces the staleness sweep.
 - Discovery types a vendor DataType deriving from a builtin integer as that integer (was float64): 64-bit values stay exact.
 - A server that cannot be reached or refuses the session at start (untrusted certificate, security not offered, user rejected) stops the extension with one ERROR naming it; once connected, drops are retried as before.
 - `get_status` reports `state` (`ok`, `connecting`, `disconnected`) and `last_error`.
-- Server certificates are checked against a trust list (`server_certificate: trust_list`, the new default; v0.1.1's `auto` means the same): an unknown or changed one is saved to `pki/rejected/` and refused with one ERROR saying how to trust it. `trust_server_certificate` and `list_server_certificates` standalone actions.
-- Every secure connect refuses a server certificate outside its validity period or not naming the server's ApplicationUri; `allow_expired_server_certificate` (per server) connects anyway with a WARNING.
+- Server certificates are checked against a trust list (`server_certificate: trust_list`, the new default; v0.1.1's `auto` means the same): an unknown or changed one is saved to `pki/rejected/` and refused with one ERROR naming its thumbprint and every other problem. `trust_server_certificate` (by thumbprint) and `list_server_certificates` standalone actions.
+- Every secure connect refuses a server certificate outside its validity period; `allow_expired_server_certificate` (per server) connects anyway with a WARNING. A trusted certificate not naming the server's ApplicationUri is a WARNING.
 - `auto_config` checks the form's servers (unsaved edits, Advanced security included) and names each outcome: found, couldn't connect, no supported security; with none it looks on this machine as before.
 - Demo Mode toggle removed from the settings form; `main.py demo` / `just demo` remain.
 - Extension icon.

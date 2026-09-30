@@ -24,6 +24,7 @@ import rich_click as click
 
 from zelos_extension_opcua import ACTION_PREFIX as _ACTION_PREFIX
 from zelos_extension_opcua.cli import app as app_mode
+from zelos_extension_opcua.client import default_server_name
 
 #: Re-exported so a packaging-time action inventory - which reads this entry
 #: module - sees the same namespace the live registration uses. See the
@@ -265,7 +266,8 @@ def trace(
         uv run main.py trace opc.tcp://server:4840 -s SignAndEncrypt -p Basic256Sha256 \\
             --user-certificate-file user.der --user-private-key-file user.pem
     """
-    logger.info("Starting OPC-UA trace: %s", endpoint)
+    # The host only: an endpoint may carry a password, refused at config.
+    logger.info("Starting OPC-UA trace: %s", default_server_name(endpoint))
     # One server through the same resolution as app mode.
     app_mode.run_config(
         {

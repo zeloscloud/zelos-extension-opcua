@@ -23,14 +23,12 @@ from urllib.parse import urlparse
 import zelos_sdk
 from asyncua import Client, ua
 from asyncua.common.node import Node as UaNode
-from asyncua.common.utils import ServiceError
 from asyncua.crypto import security_policies, uacrypto
 from asyncua.crypto.cert_gen import (
     dump_private_key_as_pem,
     generate_private_key,
     generate_self_signed_app_certificate,
 )
-from asyncua.crypto.validator import CertificateValidator, CertificateValidatorOptions
 from asyncua.ua.uaerrors import UaStructParsingError
 from asyncua.ua.uatypes import NodeId
 from cryptography import x509
@@ -55,6 +53,13 @@ from zelos_extension_opcua.discovery import (
 from zelos_extension_opcua.node_map import Node, NodeMap, parse_node_id
 
 logger = logging.getLogger(__name__)
+
+# asyncua WARNs when told to close a connection already gone, i.e. after every
+# lost link, which is logged once already.
+for _name in ("asyncua.client.ua_client.UaClient", "asyncua.client.ua_session.UaSession"):
+    logging.getLogger(_name).addFilter(
+        lambda record: not record.getMessage().endswith("was called but connection is closed")
+    )
 
 # Reconnect backoff: a server down for hours costs one attempt a minute.
 RECONNECT_INITIAL = 3.0
@@ -84,6 +89,9 @@ LIFETIME_KEEPALIVES = 10
 KEEPALIVE_MARGIN = 1.0
 # How often stalled subscriptions are looked for; sends nothing.
 WATCH_SECONDS = 1.0
+# Republish requests per gap, each a round trip holding asyncua's publish loop;
+# the rest of a longer gap is recovered by recreating (one Read).
+MAX_REPUBLISH = 10
 
 # The server takes no more: later items are refused without asking (an S7 would
 # otherwise cost one rejected request per 100 items).
@@ -358,26 +366,21 @@ def server_certificates(pki_dir: Path) -> dict[str, list[dict[str, str]]]:
     return listed
 
 
-def trust(pki_dir: Path, sha1: str = "") -> tuple[Path, bytes]:
-    """Move a rejected certificate into trusted/: by thumbprint, or the only one rejected.
+def trust(pki_dir: Path, sha1: str) -> tuple[Path, bytes]:
+    """Move the rejected certificate with thumbprint `sha1` into trusted/.
 
     Returns:
         (its new path, its DER)
 
     Raises:
-        ValueError: If no such certificate, or several rejected and none named
+        ValueError: If none is named or none matches, listing the rejected ones
     """
     rejected = {p.stem.upper(): p for p in (pki_dir / REJECTED_DIR).glob("*.der")}
     wanted = sha1.replace(":", "").replace(" ", "").upper()
-    if not wanted:
-        if len(rejected) != 1:
-            listing = ", ".join(sorted(rejected)) or "none"
-            raise ValueError(f"Set the thumbprint of the certificate to trust. Rejected: {listing}")
-        wanted = next(iter(rejected))
     if wanted not in rejected:
-        raise ValueError(
-            f"No rejected certificate {wanted}. Rejected: {', '.join(sorted(rejected)) or 'none'}"
-        )
+        listing = "; ".join(certificate_name(load_cert_der(p)) for _, p in sorted(rejected.items()))
+        problem = f"No rejected certificate {wanted}" if wanted else "Set the thumbprint to trust"
+        raise ValueError(f"{problem}. Rejected: {listing or 'none'}")
     der = load_cert_der(rejected[wanted])
     target = pki_dir / TRUSTED_DIR / f"{wanted}.der"
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -385,47 +388,24 @@ def trust(pki_dir: Path, sha1: str = "") -> tuple[Path, bytes]:
     return target, der
 
 
-async def check_server_certificate(
-    der: bytes, server: ua.ApplicationDescription, allow_expired: bool
-) -> str:
-    """Refuse a certificate outside its validity period, or not naming the server's
-    ApplicationUri (Part 4 6.1.3). No chain or revocation check.
-
-    Returns:
-        A warning when `allow_expired` let an out-of-date certificate through, else ""
-
-    Raises:
-        ConnectionSecurityError: With the reason
-    """
+def certificate_problems(der: bytes, application_uri: str) -> tuple[str, str]:
+    """(ApplicationUri mismatch, validity problem) of a server certificate, "" when
+    none (Part 4 6.1.3). No chain or revocation check."""
     cert = x509.load_der_x509_certificate(der)
-    try:
-        await CertificateValidator(CertificateValidatorOptions.URI).validate(cert, server)
-    except ServiceError:
-        uris = ", ".join(_san_uris(cert)) or "none"
-        raise ConnectionSecurityError(
-            f"server certificate {certificate_name(der)} does not match the server: it names "
-            f"ApplicationUri {uris}, the server reports {server.ApplicationUri or 'none'}",
-            "the server needs a certificate issued for its ApplicationUri",
-        ) from None
-    try:
-        await CertificateValidator(CertificateValidatorOptions.TIME_RANGE).validate(cert, server)
-    except ServiceError:
-        now = datetime.now(UTC)
-        period = (
-            f"expired {cert.not_valid_after_utc.date().isoformat()}"
-            if cert.not_valid_after_utc < now
-            else f"is not valid until {cert.not_valid_before_utc.date().isoformat()}"
-        )
-        if allow_expired:
-            return (
-                f"Server certificate {certificate_name(der)} {period}; connecting anyway "
-                "(allow_expired_server_certificate)"
-            )
-        raise ConnectionSecurityError(
-            f"server certificate {certificate_name(der)} {period}",
-            "renew it on the server, or set allow_expired_server_certificate on this server",
-        ) from None
-    return ""
+    uris = _san_uris(cert)
+    uri = (
+        ""
+        if application_uri in uris
+        else f"names ApplicationUri {', '.join(uris) or 'none'}, the server reports "
+        f"{application_uri or 'none'}"
+    )
+    now = datetime.now(UTC)
+    period = ""
+    if cert.not_valid_after_utc < now:
+        period = f"expired {cert.not_valid_after_utc.date().isoformat()}"
+    elif cert.not_valid_before_utc > now:
+        period = f"is not valid until {cert.not_valid_before_utc.date().isoformat()}"
+    return uri, period
 
 
 def _is_pem(data: bytes) -> bool:
@@ -706,21 +686,20 @@ def revisions(
     requested_ms: float,
     subscription: ua.CreateSubscriptionResult,
     items: Iterable[ua.MonitoredItemCreateResult],
-) -> list[str]:
-    """What the server revised from our request (queue size 1), e.g. `publishing 100 -> 500 ms`."""
+) -> str:
+    """What the server revised from our request (queue size 1), in whole ms: servers
+    round-trip intervals through floats. E.g. `publishing 100 -> 500 ms`; "" for nothing."""
     out = []
-    if subscription.RevisedPublishingInterval != requested_ms:
+    if round(subscription.RevisedPublishingInterval) != round(requested_ms):
         out.append(f"publishing {requested_ms:g} -> {subscription.RevisedPublishingInterval:g} ms")
     created = [r for r in items if r.StatusCode.is_good()]
-    for label, requested, unit, values in (
-        ("sampling", requested_ms, " ms", Counter(r.RevisedSamplingInterval for r in created)),
-        ("queue size", 1, "", Counter(r.RevisedQueueSize for r in created)),
-    ):
-        revised = sorted(v for v in values if v != requested)
-        if revised:
-            shown = ", ".join(f"{v:g}{unit} ({values[v]} items)" for v in revised)
-            out.append(f"{label} {requested:g}{unit} -> {shown}")
-    return out
+    sampling = sorted({round(r.RevisedSamplingInterval) for r in created} - {round(requested_ms)})
+    if sampling:
+        out.append(f"sampling {requested_ms:g} -> {', '.join(map(str, sampling))} ms")
+    queue = sorted({r.RevisedQueueSize for r in created} - {1})
+    if queue:
+        out.append(f"queue size 1 -> {', '.join(map(str, queue))}")
+    return "; ".join(out)
 
 
 def has_userinfo(endpoint: str) -> bool:
@@ -787,7 +766,7 @@ class _Sub:
     stalled: str = ""  # why it must be recreated
 
 
-def _seqs(numbers: range) -> str:
+def _seqs(numbers: Sequence[int]) -> str:
     return str(numbers[0]) if len(numbers) == 1 else f"{numbers[0]}-{numbers[-1]}"
 
 
@@ -901,8 +880,6 @@ class OPCUAClient:
         self._identity: tuple[bytes, uacrypto.CertProperties, str] | None = None
         self._cert_path: Path | None = None
         self._server_thumbprint: str | None = None
-        # Thumbprint of the last server certificate refused as untrusted.
-        self.rejected_thumbprint: str | None = None
 
         self._client: Client | None = None
         # The last session, if its channel is gone (see _detach, _resume_on_open);
@@ -940,6 +917,10 @@ class OPCUAClient:
         # revised publishing interval (nothing can arrive sooner).
         self._stale_after = min_update_interval
         self._subs: dict[int, _Sub] = {}
+        # Subscriptions and jobs match the session: false from a new session or a
+        # rebuild until _start_transport completes, and during a recreate. A
+        # resumed session that is not ready is rebuilt, whatever the link cut.
+        self._ready = False
         self._acks: list[ua.SubscriptionAcknowledgement] = []
         self._on_publish: Callable[[ua.PublishResult], Awaitable[None]] | None = None
         self._polled = 0
@@ -990,8 +971,7 @@ class OPCUAClient:
         client.session_timeout = SESSION_TIMEOUT_MS
         if self.security_mode != "None":
             await self._apply_security(client)
-        if self._detached:
-            self._resume_on_open(client)
+        self._resume_on_open(client)
 
         if self.user_certificate_file:
             # asyncua's `load_client_certificate` is the USER identity; the app cert
@@ -1073,12 +1053,10 @@ class OPCUAClient:
 
         # A chained ServerCertificate is trimmed to the leaf.
         server_cert = uacrypto.der_from_x509(uacrypto.x509_from_der(endpoint.ServerCertificate))
-        actual = thumbprint(server_cert)
-        warning = await check_server_certificate(
-            server_cert, endpoint.Server, self.allow_expired_server_certificate
-        )
-        if warning:
-            self._log.warning("%s", warning)
+        actual, name = thumbprint(server_cert), certificate_name(server_cert)
+        uri, period = certificate_problems(server_cert, endpoint.Server.ApplicationUri)
+        # Trust first: an unknown certificate is saved whatever else is wrong with
+        # it, and the error names every problem, so one fix and restart suffice.
         if self._pinned_server_cert is not None:
             if server_cert != self._pinned_server_cert:
                 raise ConnectionSecurityError(
@@ -1087,15 +1065,30 @@ class OPCUAClient:
                 )
         elif not is_trusted(server_cert, PKI_DIR):
             saved = reject(server_cert, PKI_DIR)
-            self.rejected_thumbprint = actual
+            also = "".join(f"; it {p}" for p in (uri, period) if p)
             raise ConnectionSecurityError(
-                f"server certificate {certificate_name(server_cert)} is not trusted; "
-                f"saved to {saved}",
-                f"move it into {PKI_DIR / TRUSTED_DIR} or run the trust_server_certificate action",
+                f"server certificate {name} is not trusted{also}; saved to {saved}",
+                f"move it into {PKI_DIR / TRUSTED_DIR} or run the trust_server_certificate "
+                f"action with thumbprint {actual}",
+            )
+        if period and not self.allow_expired_server_certificate:
+            raise ConnectionSecurityError(
+                f"server certificate {name} {period}",
+                "renew it on the server, or set allow_expired_server_certificate on this server",
+            )
+        if period:
+            self._log.warning(
+                "Server certificate %s %s; connecting anyway (allow_expired_server_certificate)",
+                name,
+                period,
             )
         if actual != self._server_thumbprint:
             self._server_thumbprint = actual
             self._log.info("Server certificate SHA-1 %s", actual)
+            # GetEndpoints is unauthenticated: once this exact certificate is
+            # trusted, its ApplicationUri adds nothing.
+            if uri:
+                self._log.warning("Server certificate %s %s; trusted, connecting", name, uri)
 
         await client.set_security(
             policy,
@@ -1236,6 +1229,11 @@ class OPCUAClient:
             result.requests,
             skipped or "none",
         )
+        if self.filters and not result.node_map.nodes:
+            self._log.warning(
+                "Discovery include/exclude leave nothing to trace: patterns match browse "
+                "paths below Objects, e.g. ModbusTCP/PowerMeter"
+            )
         if result.browse_failed:
             self._log.warning(
                 "Browse failed, branches skipped or incomplete: %s", "; ".join(result.browse_failed)
@@ -1306,11 +1304,14 @@ class OPCUAClient:
             namespaces, self._namespaces = self._namespaces, None
             rebuild = ""  # why a resumed session's subscriptions are rebuilt
             if not resumed:
+                self._subs = {}  # the new session holds none
                 (
                     self._browse_chunk,
                     self._read_chunk,
                     self._monitor_chunk,
                 ) = await operation_limits(self._client)
+            elif not self._ready:
+                rebuild = "previous setup incomplete"
             elif namespaces is not None and await self._namespace_array() != namespaces:
                 rebuild = "namespace array changed"  # resolved indexes are stale
             if self.discovery:
@@ -1322,12 +1323,14 @@ class OPCUAClient:
                 self._rebind(self._client)
                 self._log.info("Reconnected; session and subscriptions kept")
             else:
-                if self._subs and resumed:  # they hold server slots
+                self._ready = False
+                if self._subs:  # a resumed session's: they hold server slots
                     await self._delete_subscriptions(self._client, list(self._subs))
                 await self._resolve_nodes()
                 self._health_targets = [(name, ua.NodeId(i)) for name, i in HEALTH_NODES]
                 # After discovery and any rotation: the events are declared.
                 await self._start_transport()
+                self._ready = True
                 if resumed:
                     self._log.info("Reconnected; session kept, subscriptions rebuilt: %s", rebuild)
                 else:
@@ -1413,7 +1416,7 @@ class OPCUAClient:
             self._detached = detached
 
     def _resume_on_open(self, client: Client) -> None:
-        """ActivateSession on the detached session once `client`'s channel opens.
+        """ActivateSession on the detached session, if any, once `client`'s channel opens.
 
         Kept: resumed in place of CreateSession, subscriptions and all (Part 4
         6.7). Otherwise closed: a server holds a session whose channel died (a
@@ -1425,35 +1428,36 @@ class OPCUAClient:
 
         async def resume() -> bool:
             detached, self._detached = self._detached, None
-            if detached is None:
-                return False
             session = client.uaclient.session
-            session.restore_authentication_token(detached.token)
-            client._server_nonce, client._policy_ids = detached.nonce, detached.policies
-            try:
-                await asyncio.wait_for(
-                    client.activate_session(certificate=client.user_certificate), self.timeout
-                )
-            except Exception as e:
-                code = e.code if isinstance(e, ua.UaStatusCodeError) else None
-                if detached.keep and is_connection_error(e) and code not in SESSION_GONE_CODES:
-                    self._detached = detached  # the channel failed, not the session
-                    raise
-                why = ua.StatusCode(code).name if code is not None else describe_error(e)
-                if detached.keep:
-                    self._log.info("Previous session not resumed (%s); creating a new one", why)
-                else:  # expired already, or refused: it times out anyway
-                    self._log.debug("Previous session not closed: %s", why)
+            if detached is not None:
+                session.restore_authentication_token(detached.token)
+                client._server_nonce, client._policy_ids = detached.nonce, detached.policies
+                try:
+                    await asyncio.wait_for(
+                        client.activate_session(certificate=client.user_certificate), self.timeout
+                    )
+                except Exception as e:
+                    code = e.code if isinstance(e, ua.UaStatusCodeError) else None
+                    if detached.keep and is_connection_error(e) and code not in SESSION_GONE_CODES:
+                        self._detached = detached  # the channel failed, not the session
+                        raise
+                    why = ua.StatusCode(code).name if code is not None else describe_error(e)
+                    if detached.keep:
+                        self._log.info("Previous session not resumed (%s); creating a new one", why)
+                    else:  # expired already, or refused: it times out anyway
+                        self._log.debug("Previous session not closed: %s", why)
+                else:
+                    if detached.keep:
+                        self._resumed = True
+                        client._start_renew_loop()
+                        return True
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(client.uaclient.close_session(True), self.timeout)
+                        self._log.info(
+                            "Closed the previous session, left open by the lost connection"
+                        )
                 session.reset_authentication_token()
-                return False
-            if detached.keep:
-                self._resumed = True
-                client._start_renew_loop()
-                return True
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.uaclient.close_session(True), self.timeout)
-                self._log.info("Closed the previous session, left open by the lost connection")
-            session.reset_authentication_token()
+            self._ready = False  # a new session follows
             return False
 
         client._try_resume_persisted_session = resume  # type: ignore[method-assign]
@@ -1674,7 +1678,10 @@ class OPCUAClient:
         keepalive = max(1, math.ceil(KEEPALIVE_SECONDS / interval))
         params = ua.CreateSubscriptionParameters(
             RequestedPublishingInterval=ms,
-            RequestedLifetimeCount=keepalive * LIFETIME_KEEPALIVES,
+            # At least the session's timeout: a resumed session finds it alive.
+            RequestedLifetimeCount=max(
+                keepalive * LIFETIME_KEEPALIVES, math.ceil(SESSION_TIMEOUT_MS / ms)
+            ),
             RequestedMaxKeepAliveCount=keepalive,
             MaxNotificationsPerPublish=0,
             PublishingEnabled=True,
@@ -1758,9 +1765,7 @@ class OPCUAClient:
         revised = revisions(ms, subscription, created)
         if revised:
             self._log.info(
-                "Subscription %d: server revised %s",
-                subscription.SubscriptionId,
-                "; ".join(revised),
+                "Subscription %d: server revised %s", subscription.SubscriptionId, revised
             )
         self._stale_after = max(self._stale_after, subscription.RevisedPublishingInterval / 1000)
         return refused, full
@@ -1843,10 +1848,9 @@ class OPCUAClient:
                     if sub and status.value not in LINK_LOST_CODES:
                         sub.stalled = f"server ended it ({status.name})"  # e.g. BadTimeout
                         continue
-                    # asyncua's supervisor saw the link go.
-                    self._log.warning(
-                        "Subscription %d ended (%s), reconnecting", subscription_id, status.name
-                    )
+                    # asyncua's supervisor saw the link go: one line per loss.
+                    if self._connected:
+                        self._log.warning("Connection to %s lost: %s", self.endpoint, status.name)
                     self._connected = False
             self._log_samples(samples, received)
 
@@ -1861,8 +1865,11 @@ class OPCUAClient:
                 # Lower than expected (wrap, renumbering) resyncs.
                 missing = range(sub.expected, message.SequenceNumber)
                 sub.expected = message.SequenceNumber + bool(message.NotificationData)
-                if missing:
-                    await self._republish(client, result.SubscriptionId, sub, missing, deliver)
+                held = set(result.AvailableSequenceNumbers or ())
+                if missing and not await self._republish(
+                    client, result.SubscriptionId, sub, missing, held, deliver
+                ):
+                    return  # unacknowledged, so Republished with the gap once resumed
             deliver(result.SubscriptionId, message, received)
 
         return on_publish
@@ -1873,15 +1880,26 @@ class OPCUAClient:
         subscription_id: int,
         sub: _Sub,
         missing: range,
+        held: set[int],
         deliver: Callable[[int, ua.NotificationMessage, int], None],
-    ) -> None:
-        """Recover missed notifications from the server's retransmission queue; a
-        gap left open stalls `sub` (recreated by `_watch`)."""
+    ) -> bool:
+        """Recover missed notifications the server still holds; a gap left open
+        stalls `sub` (recreated by `_watch`).
+
+        Returns:
+            False if the link failed: `sub` expects the rest of the gap again, for
+            the resumed session to Republish
+        """
         session = client.uaclient.session
-        for seq in missing:
+        recovered: set[int] = set()
+        why, end = "not held by the server", missing.stop
+        for seq in [n for n in missing if n in held][:MAX_REPUBLISH]:
             try:
                 message = await session.republish(subscription_id, seq)
             except Exception as e:
+                if is_connection_error(e):
+                    sub.expected = end = seq
+                    break
                 why = (
                     ua.StatusCode(e.code).name
                     if isinstance(e, ua.UaStatusCodeError)
@@ -1895,15 +1913,18 @@ class OPCUAClient:
                 ua.SubscriptionAcknowledgement(SubscriptionId=subscription_id, SequenceNumber=seq)
             )
             deliver(subscription_id, message, time.time_ns())
-        else:
-            self._log.warning(
+            recovered.add(seq)
+        lost = [n for n in range(missing.start, end) if n not in recovered]
+        if lost:
+            sub.stalled = f"notifications {_seqs(lost)} lost ({why})"
+        elif end == missing.stop:
+            self._log.info(
                 "Subscription %d (%g s): notifications %s missed, recovered by Republish",
                 subscription_id,
                 sub.interval,
                 _seqs(missing),
             )
-            return
-        sub.stalled = f"notifications {_seqs(range(seq, missing.stop))} lost ({why})"
+        return end == missing.stop
 
     async def _watch(self) -> None:
         """Recreate every stalled subscription: silent past its keep-alive, a
@@ -1922,10 +1943,12 @@ class OPCUAClient:
         )
         client = self._require_client()
         assert self._on_publish is not None
-        del self._subs[subscription_id]
+        # Until done, a lost link leaves both ids in _subs for the rebuild to delete.
+        self._ready = False
         # A dead link fails the create below as well.
         await self._delete_subscriptions(client, [subscription_id])
         refused, _ = await self._subscribe(client, sub.interval, sub.items, self._on_publish, None)
+        del self._subs[subscription_id]
         if refused:
             # Reconnecting rebuilds the transport, polling what the server refuses.
             self._log.warning(
@@ -1936,6 +1959,7 @@ class OPCUAClient:
             )
             self._connected, self._fresh = False, True
             return
+        self._ready = True
         targets = [t for _, t in sub.items]
         self._log_samples(await self._read_targets(targets), time.time_ns(), refresh=True)
 
