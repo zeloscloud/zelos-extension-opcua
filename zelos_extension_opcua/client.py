@@ -209,6 +209,45 @@ class ConnectionSecurityError(Exception):
     """A secure connect refused on security grounds. Never retried insecurely."""
 
 
+class Unreachable(Exception):
+    """The transport never opened: refused, no route, unknown host or timed out."""
+
+
+def mark_unreachable(client: Client) -> Client:
+    """Make `client` raise Unreachable when its socket never opens.
+
+    Only the socket open can tell "nothing there" from "answered, then failed":
+    a timeout or reset after it is the server's.
+    """
+    open_socket = client.connect_socket
+
+    async def connect_socket() -> None:
+        try:
+            await open_socket()
+        except OSError as e:  # TimeoutError and socket.gaierror included
+            if isinstance(e, socket.gaierror):
+                reason = "host not found"
+            elif isinstance(e, ConnectionRefusedError):
+                reason = "connection refused"
+            elif isinstance(e, TimeoutError):
+                reason = "timed out"
+            else:
+                reason = e.strerror or describe_error(e)
+            raise Unreachable(reason) from e
+
+    client.connect_socket = connect_socket  # type: ignore[method-assign]
+    return client
+
+
+def offered_security(endpoints: Iterable[ua.EndpointDescription]) -> str:
+    """`None/None, SignAndEncrypt/Basic256Sha256`: the mode/policy pairs a server offers."""
+    offered = {
+        f"{ep.SecurityMode.name.rstrip('_')}/{ep.SecurityPolicyUri.rsplit('#', 1)[-1]}"
+        for ep in endpoints
+    }
+    return ", ".join(sorted(offered)) or "no endpoints"
+
+
 def thumbprint(der: bytes) -> str:
     """SHA-1 certificate thumbprint, uppercase hex, as OPC UA servers show it."""
     return hashlib.sha1(der).hexdigest().upper()
@@ -630,6 +669,7 @@ class OPCUAClient:
         )
         # (cert DER, key, application URI), resolved on the first secure connect.
         self._identity: tuple[bytes, uacrypto.CertProperties, str] | None = None
+        self._cert_path: Path | None = None
         self._server_thumbprint: str | None = None
 
         self._client: Client | None = None
@@ -637,6 +677,13 @@ class OPCUAClient:
         self._stop_event: asyncio.Event | None = None
         self._running = False
         self._connected = False
+        # Why the last connect failed; whether it was the server refusing our certificate.
+        self.last_error: str | None = None
+        self._cert_rejected = False
+        self.ever_connected = False
+        # In the runner's first connect: the runner reports a failure. Set when it is over.
+        self._at_start = False
+        self._contacted = asyncio.Event()
         self._poll_count = 0
         self._error_count = 0
 
@@ -692,7 +739,9 @@ class OPCUAClient:
         """
         # The supervisor's 1s default watchdog drops sessions to slower servers.
         # Its auto_reconnect stays off: reconnect is ours.
-        client = Client(url=self.endpoint, timeout=self.timeout, watchdog_intervall=self.timeout)
+        client = mark_unreachable(
+            Client(url=self.endpoint, timeout=self.timeout, watchdog_intervall=self.timeout)
+        )
         if self.security_mode != "None":
             await self._apply_security(client)
 
@@ -715,6 +764,7 @@ class OPCUAClient:
             else:
                 cert_path, key_path = ensure_client_certificate(PKI_DIR)
             cert_der = load_cert_der(cert_path)
+            self._cert_path = cert_path.expanduser()
             self._identity = (cert_der, _load_private_key(key_path), _application_uri(cert_der))
             expires = x509.load_der_x509_certificate(cert_der).not_valid_after_utc
             self._log.info(
@@ -758,15 +808,9 @@ class OPCUAClient:
             None,
         )
         if endpoint is None:
-            offered = sorted(
-                {
-                    f"{ep.SecurityMode.name.rstrip('_')}/{ep.SecurityPolicyUri.rsplit('#', 1)[-1]}"
-                    for ep in endpoints
-                }
-            )
             raise ConnectionSecurityError(
                 f"server does not offer {self.security_mode}/{self.security_policy}; "
-                f"it offers {', '.join(offered) or 'no endpoints'}"
+                f"it offers {offered_security(endpoints)}"
             )
 
         # asyncua invents a policy when the server has none for the token type.
@@ -1008,36 +1052,39 @@ class OPCUAClient:
             # After discovery and any rotation: the events are declared.
             await self._start_transport()
             self._log.info("Connected to OPC-UA server: %s", self.endpoint)
+            self.last_error, self.ever_connected = None, True
             return True
         except Exception as e:
             self._connected = False
-            if isinstance(e, ConnectionSecurityError):
-                self._log.error("Secure connection to %s refused: %s", self.endpoint, e)
-            elif (
-                isinstance(e, ua.UaStatusCodeError)
-                and e.code in CERT_REJECTED_CODES
-                and self._identity is not None
-            ):
-                self._log.error(
-                    "Server %s rejected client certificate SHA-1 %s (%s); trust it on the server",
-                    self.endpoint,
-                    thumbprint(self._identity[0]),
-                    ua.StatusCode(e.code).name,
+            self.last_error, level = self._connect_failure(e)
+            if not self._at_start:  # at start the runner reports it
+                hint = "; trust it on the server" if self._cert_rejected else ""
+                self._log.log(
+                    level, "Connection to %s failed: %s%s", self.endpoint, self.last_error, hint
                 )
-            elif isinstance(e, ua.UaStatusCodeError) and e.code in USER_REJECTED_CODES:
-                user = "anonymous login"
-                if self.user_certificate_file:
-                    user_der = load_cert_der(self.user_certificate_file)
-                    user = f"user certificate SHA-1 {thumbprint(user_der)}"
-                self._log.error(
-                    "Server %s rejected %s (%s)",
-                    self.endpoint,
-                    user,
-                    ua.StatusCode(e.code).name,
-                )
-            else:
-                self._log.warning("Connection to %s failed: %s", self.endpoint, describe_error(e))
             return False
+
+    def _connect_failure(self, error: Exception) -> tuple[str, int]:
+        """Why a connect failed, and the level to log it at: a security refusal is an ERROR."""
+        self._cert_rejected = False
+        if isinstance(error, Unreachable):
+            return str(error), logging.WARNING
+        if isinstance(error, ConnectionSecurityError):
+            return str(error), logging.ERROR
+        code = error.code if isinstance(error, ua.UaStatusCodeError) else None
+        if code in CERT_REJECTED_CODES and self._identity is not None:
+            self._cert_rejected = True
+            return (
+                f"server rejected this extension's client certificate {self._cert_path} "
+                f"(SHA-1 {thumbprint(self._identity[0])})"
+            ), logging.ERROR
+        if code in USER_REJECTED_CODES:
+            user = "anonymous login"
+            if self.user_certificate_file:
+                user_der = load_cert_der(self.user_certificate_file)
+                user = f"user certificate SHA-1 {thumbprint(user_der)}"
+            return f"server rejected {user} ({ua.StatusCode(code).name})", logging.ERROR
+        return describe_error(error), logging.WARNING
 
     async def disconnect(self) -> None:
         """Close the session, ignoring errors from an already-dead socket."""
@@ -1045,7 +1092,8 @@ class OPCUAClient:
             with contextlib.suppress(Exception):
                 await self._client.disconnect()
             self._connected = False
-            self._log.info("Disconnected from OPC-UA server")
+            if self.ever_connected:
+                self._log.info("Disconnected from OPC-UA server")
 
     async def _ensure_connected(self) -> bool:
         """Connect if not connected. No separate liveness probe: the health Read is one."""
@@ -1595,6 +1643,7 @@ class OPCUAClient:
         """
         self._stop_event = stop_event
         SERVER.set(self.name)
+        self._at_start = not self.ever_connected
         backoff = RECONNECT_INITIAL
         losses = 0  # connection losses since the last completed request
         failures = 0  # unclassified failures since the last completed request
@@ -1603,9 +1652,11 @@ class OPCUAClient:
             while self._running and not stop_event.is_set():
                 # Raced: a black-holed connect sits far past the manifest's grace.
                 _, connected = await self._or_stop(self._ensure_connected())
+                first, self._at_start = self._at_start, False
+                self._contacted.set()
                 if not connected:
-                    if stop_event.is_set():
-                        break
+                    if stop_event.is_set() or first:
+                        break  # at start the runner stops the extension
                     self._log.warning("Retrying %s in %.0fs", self.endpoint, backoff)
                     if await self._wait_or_stop(backoff):
                         break
@@ -1651,6 +1702,8 @@ class OPCUAClient:
                         self._connected = False
                         failures = 0
         finally:
+            self._at_start = False
+            self._contacted.set()
             self._running = False
             try:
                 await asyncio.wait_for(self.disconnect(), SHUTDOWN_TIMEOUT)
@@ -1696,11 +1749,20 @@ class OPCUAClient:
             or (n.writable is None and self._writable_cache.get(n.node_id, False))
         ]
 
+    @property
+    def state(self) -> str:
+        """ok, connecting (the first connect) or disconnected (was up, retrying)."""
+        if self._connected:
+            return "ok"
+        return "disconnected" if self.ever_connected else "connecting"
+
     def status(self) -> dict[str, Any]:
         """Connection and polling counters."""
         return {
             "server": self.name,
             "connected": self._connected,
+            "state": self.state,
+            "last_error": self.last_error,
             "endpoint": self.endpoint,
             "security_mode": self.security_mode,
             "security_policy": self.security_policy,
@@ -1729,6 +1791,8 @@ class OPCUARunner:
         self.clients = {c.name: c for c in clients}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
+        # Servers whose first connect failed: the caller exits 1.
+        self.failed_at_start: list[OPCUAClient] = []
 
     def is_running(self) -> bool:
         """Whether the polling loop is up."""
@@ -1744,6 +1808,8 @@ class OPCUARunner:
         tasks = [asyncio.create_task(c._run_async(self._stop_event)) for c in self.clients.values()]
         watchdog = asyncio.create_task(watch_loop(self._describe))
         try:
+            if await self._failed_at_start():
+                return
             await asyncio.gather(*tasks)
         finally:
             watchdog.cancel()
@@ -1751,6 +1817,34 @@ class OPCUARunner:
             self._stop_event.set()
             await asyncio.gather(*tasks, watchdog, return_exceptions=True)
             remove_signal_handlers()
+
+    async def _failed_at_start(self) -> bool:
+        """After every client's first connect, log each server that failed it.
+
+        First contact is a hard requirement: a server that cannot be reached or
+        refuses us at start is a config error, fixed before starting again. Once a
+        server has connected, drops go through the reconnect backoff.
+        """
+        first = asyncio.gather(*(c._contacted.wait() for c in self.clients.values()))
+        stop = asyncio.ensure_future(self._stop_event.wait())
+        try:
+            await asyncio.wait({first, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            first.cancel()
+            stop.cancel()
+        if self._stop_event.is_set():
+            return False
+        self.failed_at_start = [c for c in self.clients.values() if not c._connected]
+        for c in self.failed_at_start:
+            hint = (
+                "; trust it on the server, then start the extension again"
+                if c._cert_rejected
+                else ""
+            )
+            logger.error(
+                "Server '%s' (%s): cannot connect: %s%s", c.name, c.endpoint, c.last_error, hint
+            )
+        return bool(self.failed_at_start)
 
     def _describe(self) -> str:
         return ", ".join(

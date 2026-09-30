@@ -7,16 +7,10 @@
     "autoconfig": "OPC-UA/auto_config"
   },
   "properties": {
-    "demo": {
-      "type": "boolean",
-      "title": "Demo Mode",
-      "description": "Use built-in PLC simulator (no hardware required)",
-      "default": false
-    },
     "servers": {
       "type": "array",
       "title": "Servers",
-      "description": "OPC-UA servers to poll. At least one unless Demo Mode is on. Click 'Add' to add a server.",
+      "description": "OPC-UA servers to poll. Click 'Add' to add a server, or use Auto-configure to check the servers here (none: it looks for servers on this machine).",
       "default": [],
       "items": {
         "type": "object",

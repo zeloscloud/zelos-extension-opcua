@@ -131,20 +131,38 @@ async def test_strict_server_certificate(tmp_path, caplog):
     assert any(actual in e and expected in e for e in errors)
 
 
-async def test_trust_list_rejects_until_cert_is_trusted(tmp_path, pki, caplog):
+async def test_untrusted_cert_stops_the_start(tmp_path, pki, caplog):
+    """Rejected at start: exit with what to do; trusted, the next start connects."""
     trust = tmp_path / "trusted"
     trust.mkdir()
     async with Simulator(port=0, secure=True, trust_dir=trust) as sim:
         client = secure_client(sim)
-        assert await client.connect() is False
+        client.start()
+        runner = OPCUARunner([client])
+        await asyncio.wait_for(runner._run_async(), 10.0)
+        assert runner.failed_at_start == [client]
         assert not sim.sessions
-        rejected = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("rejected client certificate" in e for e in rejected)
+        cert = pki / client_mod.CLIENT_CERT_FILE
+        assert [e for e in errors(caplog) if e.startswith("Server")] == [
+            f"Server '127_0_0_1' ({sim.endpoint}): cannot connect: server rejected this "
+            f"extension's client certificate {cert} (SHA-1 {thumbprint(cert.read_bytes())}); "
+            "trust it on the server, then start the extension again"
+        ]
 
-        shutil.copy(pki / client_mod.CLIENT_CERT_FILE, trust)
-        assert await client.connect() is True
-        await client.disconnect()
-        assert list(sim.sessions.values()) == [("SignAndEncrypt", "Basic256Sha256")]
+        shutil.copy(cert, trust)
+        client = secure_client(sim)
+        client.start()
+        runner = OPCUARunner([client])
+        task = asyncio.create_task(runner._run_async())
+        try:
+            while not client._connected:
+                assert not task.done()
+                await asyncio.sleep(0.05)
+            assert client.status()["state"] == "ok"
+        finally:
+            runner.stop()
+            await asyncio.wait_for(task, 10.0)
+    assert list(sim.sessions.values()) == [("SignAndEncrypt", "Basic256Sha256")]
 
 
 SECURE = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}
