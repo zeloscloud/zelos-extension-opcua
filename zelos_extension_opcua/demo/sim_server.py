@@ -9,8 +9,9 @@ asyncua 2.0.1 has no hook for its per-connection `UaProcessor`, so `_SimServer`
 re-implements `Server.start` to swap in `_SimProcessor`. The processor adds what
 asyncua lacks: the request log, enforced OperationLimits, a session cap,
 RequestedMaxReferencesPerNode, BrowseNext with continuation points, per-session
-caps on subscriptions, monitored items and continuation points, and
-ServerTimestamp on Read.
+caps on subscriptions, monitored items and continuation points,
+ServerTimestamp on Read, Part 4 Republish errors, and lost Publish responses
+(`drop_notifications`).
 """
 
 from __future__ import annotations
@@ -144,6 +145,8 @@ class _SimProcessor(UaProcessor):
                 raise ServiceError(ua.StatusCodes.BadTooManySubscriptions)
             if service == "ActivateSession":
                 identity = await self._check_identity(body)
+            if service == "Republish":
+                self._check_republish(body)
             if (
                 service == "CreateSession"
                 and limits
@@ -177,6 +180,31 @@ class _SimProcessor(UaProcessor):
             logger.warning("rejected unknown user certificate")
             raise ServiceError(ua.StatusCodes.BadUserAccessDenied)
         return f"certificate:{hashlib.sha1(token.CertificateData).hexdigest().upper()}"
+
+    def _check_republish(self, body) -> None:
+        # asyncua answers Good with an empty message for one it no longer holds.
+        if not self.session:
+            return  # asyncua's own checks answer
+        params = struct_from_binary(ua.RepublishParameters, body.copy())
+        sub = self.session.subscription_service.subscriptions.get(params.SubscriptionId)
+        if sub is None:
+            raise ServiceError(ua.StatusCodes.BadSubscriptionIdInvalid)
+        if params.RetransmitSequenceNumber not in sub._not_acknowledged_results:
+            raise ServiceError(ua.StatusCodes.BadMessageNotAvailable)
+
+    async def forward_publish_response(self, result, requestdata) -> None:
+        # A lost response: the client's Publish times out, the server keeps the
+        # message for Republish unless `retain_dropped` is off.
+        message = result.NotificationMessage
+        if self._sim.drop_notifications and message.NotificationData:
+            self._sim.drop_notifications -= 1
+            self._sim.dropped.append(message)
+            if not self._sim.retain_dropped:
+                sub = self.session.subscription_service.subscriptions[result.SubscriptionId]
+                sub._not_acknowledged_results.pop(message.SequenceNumber, None)
+            self._send_publish_request_timeout(requestdata)
+            return
+        await super().forward_publish_response(result, requestdata)
 
     def _on_session_created(self) -> None:
         policy = self._connection.security_policy
@@ -426,6 +454,11 @@ class Simulator:
         self.sessions: dict[str, tuple[str, str]] = {}
         #: session id -> "anonymous", "username" or "certificate:<SHA-1>", once activated
         self.identities: dict[str, str] = {}
+        #: Lose this many Publish responses carrying notifications (see
+        #: `_SimProcessor.forward_publish_response`); `dropped` records them.
+        self.drop_notifications = 0
+        self.retain_dropped = True
+        self.dropped: list[ua.NotificationMessage] = []
         self.server: _SimServer | None = None
         self._updater: Any = None
         self._pki: Path | None = None
@@ -535,6 +568,13 @@ class Simulator:
                 ua.NodeId(getattr(ua.ObjectIds, prefix + name)),
                 ua.DataValue(ua.Variant(value, ua.VariantType.UInt32)),
             )
+
+    async def delete_subscriptions(self) -> int:
+        """Delete every client subscription server-side, telling no one; the count."""
+        service = self.server.iserver.subscription_service
+        ids = [i for i, s in service.subscriptions.items() if s.pub_request_callback]
+        await service.delete_subscriptions(ids)
+        return len(ids)
 
     async def stop(self) -> None:
         """Stop within `SHUTDOWN_TIMEOUT`, then give up."""

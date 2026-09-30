@@ -82,9 +82,11 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 - Backoff 3s doubling to 60s, reset on a completed request (not on connect).
 - Sessions: 120 s requested (`SESSION_TIMEOUT_MS`). `_close_session` sends CloseSession on the old channel; if the channel is dead the session is kept as `_orphan` and, once the next channel opens (`open_secure_channel` wrapped like `connect_socket`), activated there and closed before CreateSession (Part 4: CloseSession only on the session's channel). Reads asyncua privates `_server_nonce` / `_policy_ids`: recheck on a bump.
 - Subscriptions: revised values logged once per subscription (`revisions`); `_stale_after` = max(min_update_interval, revised publishing interval).
+- Recovery (`_Sub` per subscription): `on_publish` checks sequence numbers (a keep-alive carries the next, a notification its own; lower resyncs) and Republishes each missing one inside asyncua's publish loop (it awaits a coroutine callback), acking recovered ones via the `_guard_publish` wrapper. `_watch` (job, every 1 s, no request) recreates a stalled one: silent past publishing x (keep-alive count + 1) + 1 s (.NET client margin), a gap left open, or a server StatusChange outside `LINK_LOST_CODES` (e.g. BadTimeout). Recreate: raw DeleteSubscriptions (asyncua's WARNs on an already-gone id) + `_subscribe` + one Read; any refusal reconnects.
+- asyncua's server answers Republish of an unknown message Good + empty: the sim returns BadMessageNotAvailable. `Simulator.drop_notifications` / `retain_dropped` lose Publish responses (client sees BadTimeout); `delete_subscriptions()` drops them server-side.
 - Writes: DataValue with Value only (`StatusCode=None`); asyncua's `write_value` adds StatusCode and SourceTimestamp.
 - Endpoint userinfo (`user:pw@`) is refused (`has_userinfo`) at config and in `auto_config`: asyncua turns it into a UserName login. Never echo such an endpoint.
-- asyncua 2.0 supervisor: `watchdog_intervall` = request timeout (the 1s default drops slow servers); `auto_reconnect` must stay off, reconnect and re-discovery are ours. A Bad StatusChangeNotification (incl. supervisor BadShutdown) marks disconnected.
+- asyncua 2.0 supervisor: `watchdog_intervall` = request timeout (the 1s default drops slow servers); `auto_reconnect` must stay off, reconnect and re-discovery are ours. A Bad StatusChangeNotification in `LINK_LOST_CODES` (incl. supervisor BadShutdown) marks disconnected; others recreate that subscription.
 
 ### Discovery
 

@@ -85,6 +85,7 @@ A server without a `node_map_file` is browsed on every connect (read-only, nothi
 ### Transport and timestamps
 
 - `subscription`: one subscription per distinct interval (event `poll_interval`, else server's), queue size 1, change of value or status, no deadband. Refused items (e.g. BadTooManyMonitoredItems) and an undecodable Publish fall back to polling for the connection, one WARNING per connect.
+- A stalled subscription on a live connection is recovered: a sequence-number gap is filled by Republish; a keep-alive missed by 1 s past (revised MaxKeepAliveCount + 1) publishing intervals, a gap Republish cannot fill, or a server-ended subscription (e.g. BadTimeout) recreates it and reads its items once. One WARNING per event.
 - `poll`: batched Reads of min(MaxNodesPerRead, 100) nodes, spread evenly across the interval.
 - Values the server revises (publishing / sampling interval, queue size) are logged once per subscription (INFO); a revised publishing interval slower than `min_update_interval` becomes the staleness threshold.
 - A Bad value is a gap, logged once per node per connection (ERROR). An Uncertain value is traced (usable per Part 8), with one INFO per node per connection naming the status.

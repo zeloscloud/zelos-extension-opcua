@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - X.509 user identity (`user_certificate_file` / `user_private_key_file`) on Sign / SignAndEncrypt; a server without a Certificate user token policy is refused.
 - Reconnect with capped exponential backoff (3s doubling to 60s, reset on a completed request); connection loss detected from asyncua status codes, not message text.
 - Names are sanitized (`. @ : ; = /` and whitespace become `_`); duplicates after sanitization are a load error.
+- Subscription recovery on a live connection: a missed notification (sequence-number gap) is fetched by Republish; a missed keep-alive, an unrecoverable gap or a server-ended subscription recreates that subscription and re-reads its items. One WARNING per event.
 - `get_status` reports transport and subscribed / polled counts.
 - `demo-server` / `just sim`: simulator with `gateway`, `s7` (enforced limits and session caps) and `device` profiles, `--secure`, `--secure-only`, trust lists, `--shuffle-namespaces`, `--map`, `--nodes N`, request log.
 
