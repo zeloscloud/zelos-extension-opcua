@@ -18,6 +18,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+from zelos_extension_opcua import actions
 from zelos_extension_opcua import client as client_mod
 from zelos_extension_opcua.cli import app
 from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, thumbprint
@@ -221,6 +222,20 @@ def test_inherited_user_cert_on_downgraded_server_exits(tmp_path, caplog):
         "Server 'plc': invalid security configuration: "
         "a user certificate needs security_mode Sign or SignAndEncrypt"
     ]
+
+
+def test_endpoint_credentials_are_refused(caplog):
+    """asyncua would log in with them, in plain text on a None channel; never echoed."""
+    config = {"servers": [{"endpoint": "opc.tcp://admin:secret@plc:4840"}]}
+    with pytest.raises(SystemExit):
+        resolve(config)
+    result = actions.auto_config(config)  # never contacted
+    assert errors(caplog) == [
+        "Server 'plc': remove the user name / password from the endpoint URL; "
+        "user name login is not supported, use a user certificate"
+    ]
+    assert result["status"] == "error" and result["message"].startswith("plc: remove the user")
+    assert "secret" not in result["message"]
 
 
 @pytest.mark.parametrize(

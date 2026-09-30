@@ -25,6 +25,7 @@ from zelos_extension_opcua.client import (
     OPCUARunner,
     SharedSource,
     default_server_name,
+    has_userinfo,
     install_log_handler,
 )
 from zelos_extension_opcua.node_map import NodeMap
@@ -134,6 +135,14 @@ def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[di
             logger.error("servers[%d] has no endpoint", i)
             sys.exit(1)
         name = trace_name(str(server["name"])) or default_server_name(endpoint)
+        # Never echo the endpoint here: it holds the password.
+        if has_userinfo(endpoint):
+            logger.error(
+                "Server '%s': remove the user name / password from the endpoint URL; "
+                "user name login is not supported, use a user certificate",
+                name,
+            )
+            sys.exit(1)
         if name in (LOG_EVENT, LOG_SOURCE_NAME):
             logger.error("Server %s: name '%s' is reserved for the extension's log", endpoint, name)
             sys.exit(1)

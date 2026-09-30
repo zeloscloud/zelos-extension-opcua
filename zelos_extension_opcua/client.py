@@ -60,6 +60,10 @@ RECONNECT_MAX = 60.0
 # Ceiling on the disconnect at shutdown: a wedged session must not make the process unkillable.
 SHUTDOWN_TIMEOUT = 3.0
 
+# Requested session timeout, ms (Ignition's default; asyncua asks 1 h). A session
+# whose connection died holds one of a PLC's few slots until it expires.
+SESSION_TIMEOUT_MS = 120_000
+
 # Unclassified request failures in a row that force a reconnect: never wedge on a dead session.
 POLL_FAILURES_BEFORE_RECONNECT = 5
 
@@ -203,6 +207,15 @@ USER_REJECTED_CODES = frozenset(
         ua.StatusCodes.BadUserSignatureInvalid,
     )
 )
+
+
+@dataclass
+class _Orphan:
+    """A session whose CloseSession could not be sent: what re-activating it takes."""
+
+    token: NodeId
+    nonce: bytes | None
+    policies: list[ua.UserTokenPolicy]
 
 
 class ConnectionSecurityError(Exception):
@@ -528,6 +541,33 @@ def is_connection_error(error: BaseException) -> bool:
     return isinstance(error.__cause__, (TimeoutError, OSError))
 
 
+def revisions(
+    requested_ms: float,
+    subscription: ua.CreateSubscriptionResult,
+    items: Iterable[ua.MonitoredItemCreateResult],
+) -> list[str]:
+    """What the server revised from our request (queue size 1), e.g. `publishing 100 -> 500 ms`."""
+    out = []
+    if subscription.RevisedPublishingInterval != requested_ms:
+        out.append(f"publishing {requested_ms:g} -> {subscription.RevisedPublishingInterval:g} ms")
+    created = [r for r in items if r.StatusCode.is_good()]
+    for label, requested, unit, values in (
+        ("sampling", requested_ms, " ms", Counter(r.RevisedSamplingInterval for r in created)),
+        ("queue size", 1, "", Counter(r.RevisedQueueSize for r in created)),
+    ):
+        revised = sorted(v for v in values if v != requested)
+        if revised:
+            shown = ", ".join(f"{v:g}{unit} ({values[v]} items)" for v in revised)
+            out.append(f"{label} {requested:g}{unit} -> {shown}")
+    return out
+
+
+def has_userinfo(endpoint: str) -> bool:
+    """Whether `endpoint` carries `user[:password]@`: asyncua would log in with it,
+    in plain text on a None channel."""
+    return "@" in urlparse(endpoint.strip()).netloc
+
+
 def default_server_name(endpoint: str) -> str:
     """The endpoint host as a trace name: `plc01`, `192_168_1_10`."""
     host = urlparse(endpoint).hostname or endpoint
@@ -673,6 +713,8 @@ class OPCUAClient:
         self._server_thumbprint: str | None = None
 
         self._client: Client | None = None
+        # The last session, if its channel died before CloseSession (see _close_orphan).
+        self._orphan: _Orphan | None = None
         # The runner's, bound in _run_async.
         self._stop_event: asyncio.Event | None = None
         self._running = False
@@ -698,6 +740,9 @@ class OPCUAClient:
         self._groups: dict[float, list[Target]] = {}
         self._monitored: dict[int, Target] = {}
         self._stale: OrderedDict[int, float] = OrderedDict()
+        # Silence before the sweep re-reads: min_update_interval, or a slower
+        # revised publishing interval (nothing can arrive sooner).
+        self._stale_after = min_update_interval
         self._subscription_ids: list[int] = []
         self._polled = 0
         self._jobs: list[_Job] = []
@@ -715,8 +760,10 @@ class OPCUAClient:
         # Server NamespaceArray, read lazily once per connection: indexes are only
         # stable within a session, so nsu= IDs re-resolve after every reconnect.
         self._namespaces: list[str] | None = None
-        # Node IDs that have already reported a read failure - see _log_node_failure.
+        # Node IDs that have reported a read failure this connection - see _log_node_failure.
         self._failed_nodes: set[str] = set()
+        # Node IDs that have reported an Uncertain value this connection (one INFO each).
+        self._uncertain_nodes: set[str] = set()
 
         self._shared: SharedSource | None = None
         # Map event name -> trace event, captured from add_event. Never getattr on
@@ -742,8 +789,11 @@ class OPCUAClient:
         client = mark_unreachable(
             Client(url=self.endpoint, timeout=self.timeout, watchdog_intervall=self.timeout)
         )
+        client.session_timeout = SESSION_TIMEOUT_MS
         if self.security_mode != "None":
             await self._apply_security(client)
+        if self._orphan:
+            self._close_orphan_on_open(client)
 
         if self.user_certificate_file:
             # asyncua's `load_client_certificate` is the USER identity; the app cert
@@ -1038,6 +1088,7 @@ class OPCUAClient:
             await self._client.connect()
             self._connected = True
             self._namespaces = None
+            self._failed_nodes, self._uncertain_nodes = set(), set()
             (
                 self._browse_chunk,
                 self._read_chunk,
@@ -1100,11 +1151,54 @@ class OPCUAClient:
         if self._connected and self._client:
             return True
         if self._client:
-            with contextlib.suppress(Exception):
-                await self._client.disconnect()
+            await self._close_session(self._client)
         self._connected = False
         self._log.info("Connecting to %s...", self.endpoint)
         return await self.connect()
+
+    async def _close_session(self, client: Client) -> None:
+        """CloseSession on the old channel, else keep the session to close on the next one."""
+        session, protocol = client.uaclient.session, client.uaclient.protocol
+        held = session.has_session
+        orphan = _Orphan(session.authentication_token, client._server_nonce, client._policy_ids)
+        closed = False
+        if held and protocol is not None and not protocol.is_closed:
+            with contextlib.suppress(Exception):
+                await client.uaclient.close_session(True)
+                closed = True
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+        if held and not closed:
+            self._orphan = orphan
+
+    def _close_orphan_on_open(self, client: Client) -> None:
+        """Close the orphaned session once `client`'s channel opens, before CreateSession.
+
+        A server keeps a session whose channel died (a slot on a PLC) until it times
+        out, and takes CloseSession only on the session's channel: ActivateSession
+        moves it there first (Part 4 5.6.3). Best effort, bounded by `timeout`.
+        """
+        open_channel = client.open_secure_channel
+
+        async def open_secure_channel(renew: bool = False) -> None:
+            await open_channel(renew)
+            orphan, self._orphan = self._orphan, None
+            if renew or orphan is None:
+                return
+            client.uaclient.session.restore_authentication_token(orphan.token)
+            client._server_nonce, client._policy_ids = orphan.nonce, orphan.policies
+            try:
+                await asyncio.wait_for(self._close_orphan(client), self.timeout)
+            except Exception as e:  # expired already, or refused: it times out anyway
+                self._log.debug("Old session not closed: %s", describe_error(e))
+            client.uaclient.session.reset_authentication_token()
+
+        client.open_secure_channel = open_secure_channel  # type: ignore[method-assign]
+
+    async def _close_orphan(self, client: Client) -> None:
+        await client.activate_session(certificate=client.user_certificate)
+        await client.uaclient.close_session(True)
+        self._log.info("Closed the previous session, left open by the lost connection")
 
     def _require_client(self) -> Client:
         if not self._client or not self._connected:
@@ -1147,7 +1241,8 @@ class OPCUAClient:
         variant = ua.Variant(value, variant_type) if variant_type else ua.Variant(value)
         if sent is not None:
             sent.append(time.monotonic())
-        await node.write_value(variant)
+        # Value only: servers may refuse a StatusCode or timestamps (BadWriteNotSupported).
+        await node.write_attribute(ua.AttributeIds.Value, ua.DataValue(variant, StatusCode=None))
 
     async def read_node_value(self, node: Node) -> float | int | bool | str | None:
         """Read and decode a node using its map definition."""
@@ -1244,6 +1339,7 @@ class OPCUAClient:
         self._groups = {i: [t for _, t in items] for i, items in groups.items()}
         client = self._require_client()
         self._monitored, self._stale, self._subscription_ids = {}, OrderedDict(), []
+        self._stale_after = self.min_update_interval
         self._subscribing, self._publish_failed = True, False
         on_publish = self._publish_callback(client, self._monitored, self._stale)
         if self.transport == "subscription":
@@ -1324,6 +1420,7 @@ class OPCUAClient:
 
         change = ua.DataChangeFilter(Trigger=ua.DataChangeTrigger.StatusValue)
         refused: list[tuple[Target, str]] = []
+        created: list[ua.MonitoredItemCreateResult] = []
         for start in range(0, len(items), self._monitor_chunk):
             chunk = items[start : start + self._monitor_chunk]
             if full:
@@ -1360,6 +1457,7 @@ class OPCUAClient:
                     ua.MonitoredItemCreateResult(StatusCode=ua.StatusCode(e.code)) for _ in chunk
                 ]
             now = time.monotonic()
+            created += results
             for (handle, target), result in zip(chunk, results, strict=True):
                 if result.StatusCode.is_good():
                     self._stale[handle] = now
@@ -1374,6 +1472,15 @@ class OPCUAClient:
             with contextlib.suppress(ua.UaStatusCodeError):
                 await client.uaclient.delete_subscriptions([subscription.SubscriptionId])
                 self._subscription_ids.remove(subscription.SubscriptionId)
+            return refused, full
+        revised = revisions(ms, subscription, created)
+        if revised:
+            self._log.info(
+                "Subscription %d: server revised %s",
+                subscription.SubscriptionId,
+                "; ".join(revised),
+            )
+        self._stale_after = max(self._stale_after, subscription.RevisedPublishingInterval / 1000)
         return refused, full
 
     def _guard_publish(self, client: Client) -> None:
@@ -1471,7 +1578,7 @@ class OPCUAClient:
             ]
         if self._monitored:
             chunks = -(-len(self._monitored) // self._read_chunk)
-            step = self.min_update_interval / max(SWEEP_STEPS, chunks)
+            step = self._stale_after / max(SWEEP_STEPS, chunks)
             jobs.append(_Job(now + step, step, self._sweep))
         return jobs
 
@@ -1483,7 +1590,7 @@ class OPCUAClient:
         self._log_samples(await self._read_targets(targets), time.time_ns())
 
     async def _sweep(self) -> None:
-        """Re-read up to one Read of subscribed items silent for min_update_interval.
+        """Re-read up to one Read of subscribed items silent for `_stale_after`.
 
         `_stale` is in last-update order, so the due items are the front run: no scan.
         """
@@ -1492,7 +1599,7 @@ class OPCUAClient:
             handle
             for handle, _ in itertools.islice(
                 itertools.takewhile(
-                    lambda item: now - item[1] >= self.min_update_interval, self._stale.items()
+                    lambda item: now - item[1] >= self._stale_after, self._stale.items()
                 ),
                 self._read_chunk,
             )
@@ -1551,9 +1658,21 @@ class OPCUAClient:
         return results
 
     def _decode(self, node: Node, dv: ua.DataValue) -> Any:
-        """A sample's value in its node's datatype; None if Bad, empty or undecodable."""
+        """A sample's value in its node's datatype; None if Bad, empty or undecodable.
+
+        Uncertain is traced: usable per Part 8, as Kepware keeps it.
+        """
         status = dv.StatusCode
-        if status is not None and not status.is_good():
+        if status is not None and status.is_uncertain():
+            if node.node_id not in self._uncertain_nodes:
+                self._uncertain_nodes.add(node.node_id)
+                self._log.info(
+                    "Node '%s' (%s) is %s; traced, further reports suppressed this connection",
+                    node.name,
+                    node.node_id,
+                    status.name,
+                )
+        elif status is not None and not status.is_good():
             self._log_node_failure(node, status.name)
             return None
         raw = dv.Value.Value if dv.Value else None
@@ -1610,12 +1729,12 @@ class OPCUAClient:
         return values
 
     def _log_node_failure(self, node: Node, reason: str) -> None:
-        """One ERROR per bad node per process: per cycle would flood the log and the trace."""
+        """One ERROR per bad node per connection: per cycle would flood the log and the trace."""
         if node.node_id in self._failed_nodes:
             return
         self._failed_nodes.add(node.node_id)
         self._log.error(
-            "Node '%s' (%s) unreadable: %s - further reports suppressed",
+            "Node '%s' (%s) unreadable: %s - further reports suppressed this connection",
             node.name,
             node.node_id,
             reason,

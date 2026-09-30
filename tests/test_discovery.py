@@ -114,6 +114,27 @@ def test_field_datatype(dtype, sample, expected):
     assert field_datatype(ua.NodeId(dtype), dv) == (expected, "")
 
 
+async def test_vendor_integer_subtypes_stay_exact():
+    """A DataType deriving from Int64 / UInt64 (two levels here) is typed as it, not float64."""
+    async with Simulator("device", port=0) as sim:
+        server = sim.server
+        idx = await server.register_namespace("urn:test:vendor")
+        counter = await server.get_node(ua.ObjectIds.UInt64).add_data_type(idx, "Counter64")
+        wide = await counter.add_data_type(idx, "WideCounter")
+        signed = await server.get_node(ua.ObjectIds.Int64).add_data_type(idx, "Ticks")
+        folder = await server.nodes.objects.add_folder(idx, "Vendor")
+        for name, value, vtype, dtype in (
+            ("wide", 2**64 - 1, ua.VariantType.UInt64, wide),
+            ("ticks", -(2**62) - 1, ua.VariantType.Int64, signed),
+        ):
+            await folder.add_variable(idx, name, ua.Variant(value, vtype), datatype=dtype.nodeid)
+        client, values = await discovered(sim)
+        await client.disconnect()
+    types = {n.name: n.datatype for n in client.node_map.events["Vendor"]}
+    assert types == {"wide": "uint64", "ticks": "int64"}
+    assert values["Vendor"] == {"wide": 2**64 - 1, "ticks": -(2**62) - 1}  # no float round trip
+
+
 async def test_s7_honors_operation_limits():
     async with Simulator("s7", port=0) as sim:
         client, values = await discovered(sim)

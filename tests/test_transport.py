@@ -11,11 +11,19 @@ from collections.abc import AsyncIterator
 import pytest
 import zelos_sdk
 from asyncua import ua
+from asyncua.client.ua_client import UaClient
 from asyncua.ua.uaerrors import UaStructParsingError
 
 from zelos_extension_opcua import client as client_mod
 from zelos_extension_opcua.cli.app import get_demo_node_map_path
-from zelos_extension_opcua.client import OPCUAClient, OPCUARunner, SharedSource, timestamp_ns
+from zelos_extension_opcua.client import (
+    SESSION_TIMEOUT_MS,
+    OPCUAClient,
+    OPCUARunner,
+    SharedSource,
+    revisions,
+    timestamp_ns,
+)
 from zelos_extension_opcua.demo import profiles
 from zelos_extension_opcua.demo.sim_server import Simulator
 from zelos_extension_opcua.demo.simulator import DEMO_NAMESPACE
@@ -277,3 +285,120 @@ async def test_shutdown_does_not_wait_out_a_hung_request(monkeypatch):
         runner.stop()
         await asyncio.wait_for(task, 10.0)
         assert time.monotonic() - started < 3.5
+
+
+async def drop_connections(sim: Simulator, client: OPCUAClient) -> None:
+    """Reset every TCP connection, sessions left open as on a network loss; await the reconnect."""
+    old = client._client
+    for transport in list(sim.server.iserver.asyncio_transports):
+        transport.abort()
+    await wait_until(lambda: client._connected and client._client is not old, 20.0)
+
+
+async def test_lost_connections_leave_no_session_behind():
+    """The s7 sim holds a lost connection's session, as a PLC does, and caps sessions at 4."""
+    async with Simulator("s7", port=0) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, poll_interval=0.2)
+        async with running(client):
+            await wait_until(lambda: client._connected, 10.0)
+            for _ in range(4):  # unclosed, the fourth reconnect finds every slot held
+                await drop_connections(sim, client)
+                assert sim.held_sessions == 1
+            (session,) = sim.server.iserver._external_sessions.values()
+            assert session.session_timeout == SESSION_TIMEOUT_MS / 1000
+
+
+async def test_bad_node_is_reported_again_on_a_new_connection(caplog):
+    node_map = NodeMap.from_dict({"events": {"e": [{"name": "gone", "node_id": "ns=0;s=Gone"}]}})
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(
+            endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2, transport="poll"
+        )
+
+        def reports() -> int:
+            return sum("'gone'" in r.getMessage() for r in caplog.records)
+
+        async with running(client):
+            await wait_until(lambda: reports() == 1, 10.0)
+            await asyncio.sleep(0.5)  # several polls: still one
+            assert reports() == 1
+            await drop_connections(sim, client)
+            await wait_until(lambda: reports() == 2, 10.0)
+
+
+async def test_revised_publishing_interval_is_honored(monkeypatch, caplog):
+    """A slower revised publishing interval is logged once and paces the staleness sweep."""
+    real = UaClient.create_subscription
+
+    async def revise(self, params, callback):
+        result = await real(self, params, callback)
+        result.RevisedPublishingInterval = 2000.0
+        return result
+
+    monkeypatch.setattr(UaClient, "create_subscription", revise)
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
+    node_map = NodeMap.from_file(get_demo_node_map_path())
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(
+            endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2, min_update_interval=1.0
+        )
+        async with running(client):
+            await wait_until(lambda: client._jobs, 10.0)
+            assert client._stale_after == 2.0
+            subscriptions = len(client._subscription_ids)
+    revised = [r.getMessage() for r in caplog.records if "server revised" in r.getMessage()]
+    assert len(revised) == subscriptions >= 1  # one line per subscription
+    assert all(m.endswith(" -> 2000 ms") and "publishing" in m for m in revised)
+
+
+def test_revisions_report_sampling_and_queue_size():
+    good, refused = ua.StatusCode(), ua.StatusCode(ua.StatusCodes.BadNodeIdUnknown)
+    items = [
+        ua.MonitoredItemCreateResult(good, RevisedSamplingInterval=100.0, RevisedQueueSize=1),
+        ua.MonitoredItemCreateResult(good, RevisedSamplingInterval=250.0, RevisedQueueSize=1),
+        ua.MonitoredItemCreateResult(good, RevisedSamplingInterval=250.0, RevisedQueueSize=5),
+        ua.MonitoredItemCreateResult(refused, RevisedSamplingInterval=0.0),
+    ]
+    subscription = ua.CreateSubscriptionResult(RevisedPublishingInterval=100.0)
+    assert revisions(100.0, subscription, items) == [
+        "sampling 100 ms -> 250 ms (2 items)",
+        "queue size 1 -> 5 (1 items)",
+    ]
+    assert revisions(100.0, subscription, items[:1]) == []
+
+
+@pytest.mark.parametrize("transport", ["subscription", "poll"])
+async def test_uncertain_values_are_traced_bad_are_not(transport, caplog):
+    """Uncertain is usable (Part 8, as Kepware keeps it); Bad is a gap."""
+    node_map = NodeMap.from_dict(
+        {
+            "events": {
+                "e": [
+                    {"name": name, "node_id": f"ns=2;s={name}", "writable": True}
+                    for name in ("uncertain", "bad")
+                ]
+            }
+        }
+    )
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
+    async with Simulator(port=0, node_map=node_map) as sim:
+        for name, code, value in (
+            ("uncertain", ua.StatusCodes.UncertainLastUsableValue, 7.5),
+            ("bad", ua.StatusCodes.BadSensorFailure, 9.5),
+        ):
+            node = sim.server.get_node(ua.NodeId(name, 2))
+            vtype = (await node.read_data_value()).Value.VariantType
+            await sim.server.write_attribute_value(
+                node.nodeid, ua.DataValue(ua.Variant(value, vtype), ua.StatusCode(code))
+            )
+        client = OPCUAClient(
+            endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2, transport=transport
+        )
+        async with running(client) as rows:
+            await wait_until(lambda: rows.of("uncertain"), 10.0)
+            await asyncio.sleep(0.6)  # several cycles: one report each
+
+    assert {v for _, v in rows.of("uncertain")} == {7.5} and not rows.of("bad")
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("'uncertain'" in m and "UncertainLastUsableValue" in m for m in messages) == 1
+    assert sum("'bad'" in m and "BadSensorFailure" in m for m in messages) == 1

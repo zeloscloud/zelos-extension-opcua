@@ -72,7 +72,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 - Polling: `_schedule` builds `_Job`s run one at a time (late job restarts from now, no burst): health Read, one job per `_read_chunk` phased across the interval, staleness sweep. Never smaller chunks: server cost follows request count. `_read_chunk` = MaxNodesPerRead capped at 100 (missing/0 = 100); servers reject a whole over-limit request.
 - Sweep: `_stale` OrderedDict in last-update order (due items are the front, no scan); step = `min_update_interval / max(SWEEP_STEPS, chunks)`, staleness bounded at 1.25x.
 - Timestamps: `sample_time_ns` via `log_at`; `_log_samples` groups by (event, time). No skew correction.
-- A value that fails decoding (asyncua raises for the whole response) makes `read_many` re-read the chunk item by item, returning BadDecodingError; that node leaves polling until reconnect. `_log_node_failure`: **one ERROR per bad node per process**.
+- A value that fails decoding (asyncua raises for the whole response) makes `read_many` re-read the chunk item by item, returning BadDecodingError; that node leaves polling until reconnect. `_log_node_failure`: **one ERROR per bad node per connection**. Uncertain is traced (`_decode`), one INFO per node per connection.
 - Measured on OPC PLC (10k nodes/s): server CPU idle 1.8%, one subscription 5.2%, 100-node Reads 7.5%, 25-node Reads 21.4%. Don't tune against the in-process sim (it does monitored-item work inside each write).
 
 ### Connection
@@ -80,13 +80,17 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 - No separate liveness probe: the health Read is one (midpoint = host time for `clock_skew_ms`; a Bad/empty health node is dropped for the connection).
 - `is_connection_error` classifies by type, never message text: `OSError` / `TimeoutError`, session/channel/connection `UaStatusCodeError`, or `__cause__` timeout/`OSError` (asyncua 2.0.1 raises bare `Exception` on a black-holed socket). Five unclassified consecutive failures still force a reconnect.
 - Backoff 3s doubling to 60s, reset on a completed request (not on connect).
+- Sessions: 120 s requested (`SESSION_TIMEOUT_MS`). `_close_session` sends CloseSession on the old channel; if the channel is dead the session is kept as `_orphan` and, once the next channel opens (`open_secure_channel` wrapped like `connect_socket`), activated there and closed before CreateSession (Part 4: CloseSession only on the session's channel). Reads asyncua privates `_server_nonce` / `_policy_ids`: recheck on a bump.
+- Subscriptions: revised values logged once per subscription (`revisions`); `_stale_after` = max(min_update_interval, revised publishing interval).
+- Writes: DataValue with Value only (`StatusCode=None`); asyncua's `write_value` adds StatusCode and SourceTimestamp.
+- Endpoint userinfo (`user:pw@`) is refused (`has_userinfo`) at config and in `auto_config`: asyncua turns it into a UserName login. Never echo such an endpoint.
 - asyncua 2.0 supervisor: `watchdog_intervall` = request timeout (the 1s default drops slow servers); `auto_reconnect` must stay off, reconnect and re-discovery are ours. A Bad StatusChangeNotification (incl. supervisor BadShutdown) marks disconnected.
 
 ### Discovery
 
 - Browse View Timestamp must be null: asyncua defaults it to now, which .NET servers answer with BadNodeNotInView.
 - BadNoContinuationPoints nodes are re-browsed alone after the batch (one point held at a time; `s7` sim holds 3).
-- Typing (`field_datatype`): concrete builtin exactly; Number/Integer/UInteger widest; BaseDataType always string via `render_text`, so a type change never fails the node.
+- Typing (`field_datatype`): concrete builtin exactly; vendor subtypes of builtin integers as that integer (`integer_subtypes`, inverse HasSubtype, one Browse per level); Number/Integer/UInteger widest; BaseDataType always string via `render_text`, so a type change never fails the node.
 - Collisions (`assign_names`): every collider gets `_<hash>` of its nsu= id, never an ordinal, so a name never re-points. Unbounded by design: a limit needs measured data.
 - Source rotation: a declared event's schema is fixed per `TraceSource` instance, each construction is a new segment, the app joins them. Added fields rotate at most once per reconnect: `flush()`, construct same name, replay every client's `_fields`, switch every `SharedSource` writer, no await in between. `SharedSource` holds the only reference. A changed datatype is skipped (types not reconciled across segments). The log handler moves with it (under the handler lock). `opcua_log` never rotates.
 - Measured (`--nodes`, localhost): 10k vars discover 1.3s, poll 139 ms/cycle, 177 MB; 50k 6.8s, 734 ms/cycle, 323 MB (baseline 122 MB).
@@ -113,7 +117,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 ### Simulator
 
 - asyncua has no `UaProcessor` hook, so `_SimServer.start` re-implements `Server.start` (asyncua 2.0.1) to install `_SimProcessor`, which adds enforced limits, session/subscription/item/continuation caps, BrowseNext, ServerTimestamp on Read, diagnostics counts.
-- On an asyncua bump recheck `Server.start`, `OPCUAProtocol.connection_made`, and `UaProcessor._process_message` around a request (`_browse` mirrors its session checks and activity stamps).
+- Session cap counts `iserver._external_sessions` (a lost connection's session with subscriptions stays until timeout, as on a PLC). On an asyncua bump recheck `Server.start`, `OPCUAProtocol.connection_made`, and `UaProcessor._process_message` around a request (`_browse` mirrors its session checks and activity stamps).
 - Unique ApplicationUri per start (`auto_config` dedupes on it). `--nodes` uses one AddNodes per folder with read-time callbacks (node-by-node costs ~1.3 ms each).
 
 ## Node ID Format

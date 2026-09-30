@@ -21,6 +21,7 @@ from zelos_extension_opcua.client import (
     SECURITY_MODES,
     SECURITY_POLICIES,
     Unreachable,
+    has_userinfo,
     mark_unreachable,
     offered_security,
 )
@@ -42,7 +43,7 @@ MDNS_SERVICE = "_opcua-tcp._tcp.local."
 PROBE_TIMEOUT = 2.0
 MDNS_SECONDS = 2.0
 
-UNREACHABLE, FAILED = "unreachable", "failed"
+UNREACHABLE, FAILED, CREDENTIALS = "unreachable", "failed", "credentials"
 
 # Strongest first; only the policies this extension can connect with.
 POLICY_RANK = ("Aes256Sha256RsaPss", "Aes128Sha256RsaOaep", "Basic256Sha256")
@@ -63,8 +64,10 @@ class FoundServer:
 
 
 async def _endpoints(url: str) -> FoundServer | str:
-    """The server at `url`, or why not: UNREACHABLE, or FAILED when it answered
-    but not with endpoints."""
+    """The server at `url`, or why not: UNREACHABLE, FAILED when it answered
+    but not with endpoints, CREDENTIALS (never contacted: asyncua would log in)."""
+    if has_userinfo(url):
+        return CREDENTIALS
     try:
         client = mark_unreachable(Client(url, timeout=PROBE_TIMEOUT))
         # Past the socket timeout: a socket that never opened raises Unreachable first.
@@ -251,7 +254,13 @@ async def check_servers(servers: list[dict[str, Any]], advanced: dict[str, Any])
     for entry, result in zip(servers, results, strict=True):
         entry = dict(entry)
         out.append(entry)
-        if result == UNREACHABLE:
+        if result == CREDENTIALS:
+            name = entry.get("name") or urlparse(entry.get("endpoint", "")).hostname
+            report.problems.append(
+                f"{name}: remove the user name / password from the endpoint URL; user name "
+                "login is not supported, use a user certificate."
+            )
+        elif result == UNREACHABLE:
             report.unreachable.append(entry.get("endpoint", ""))
         elif result == FAILED:
             report.problems.append(

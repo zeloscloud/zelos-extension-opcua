@@ -10,7 +10,7 @@ Traces OPC-UA servers into Zelos trace events, by subscription or polling, and e
 | Discovery | A server without a node map is browsed on every connect and every scalar variable traced (read-only) |
 | Security | None / Sign / SignAndEncrypt, with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss; X.509 user login |
 | Multiple servers | Any number in one extension; one unreachable server never stalls the others |
-| Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request |
+| Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request. Session timeout 120 s requested; a session left open by a lost connection is closed on the next one, so flaps never exhaust a PLC's few session slots |
 | Start | Every server must connect at start: one that cannot be reached or refuses the session (e.g. an untrusted certificate) stops the extension with one ERROR naming it (`Server 'plc' (opc.tcp://10.0.0.5:4840): cannot connect: connection refused`); fix it and start again. Once connected, drops are retried |
 | Data types | bool, int8-64, uint8-64, float32/64, string |
 | Demo | `main.py demo`: built-in PLC simulator, no hardware |
@@ -57,7 +57,7 @@ uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: disco
 
 Trace layout: `OPC-UA/<server>/<event>` (e.g. `OPC-UA/plc01/temperature`); with `advanced.prefix` cleared, one source per server (`plc01/temperature`). Logs go to `OPC-UA/log` (cleared: `opcua_log`); `log` is not a valid server name.
 
-Startup errors: the pre-`servers[]` flat config; `username` / `password` (no secret is stored in config, use a user certificate); a missing or unparseable `node_map_file`.
+Startup errors: the pre-`servers[]` flat config; `username` / `password`, or credentials in the endpoint URL (`opc.tcp://user:pw@host`; no secret is stored in config, use a user certificate); a missing or unparseable `node_map_file`.
 
 ### Secure connections
 
@@ -74,6 +74,7 @@ A server without a `node_map_file` is browsed on every connect (read-only, nothi
 |---|---|
 | Walk | Forward hierarchical references from `Objects`; skips `Server`, Objects named `_*` (Kepware `_System`, ...), properties |
 | Traced | Every scalar variable of a supported type; arrays, structs, other types skipped (one INFO count per connect) |
+| Vendor DataTypes | A subtype (HasSubtype) of a builtin integer is typed as it: a vendor Int64 keeps all 64 bits |
 | Event / field | Event = parent path below `Objects` (`Line1/Motor`), field = BrowseName; vendor string ids (Kepware/TwinCAT dots, Siemens `"DB"."tag"`, CODESYS, B&R `::Task:Var`) name the event from the id |
 | Collisions | Every collider is named `<field>_<hash>` (6 hex of SHA-1 of its `nsu=` id, stable); one WARNING per connect; a name never moves to another node |
 | Changes on reconnect | New event: traced. New field: new trace segment (joined by the app). Changed datatype: skipped with one WARNING until restart |
@@ -85,6 +86,8 @@ A server without a `node_map_file` is browsed on every connect (read-only, nothi
 
 - `subscription`: one subscription per distinct interval (event `poll_interval`, else server's), queue size 1, change of value or status, no deadband. Refused items (e.g. BadTooManyMonitoredItems) and an undecodable Publish fall back to polling for the connection, one WARNING per connect.
 - `poll`: batched Reads of min(MaxNodesPerRead, 100) nodes, spread evenly across the interval.
+- Values the server revises (publishing / sampling interval, queue size) are logged once per subscription (INFO); a revised publishing interval slower than `min_update_interval` becomes the staleness threshold.
+- A Bad value is a gap, logged once per node per connection (ERROR). An Uncertain value is traced (usable per Part 8), with one INFO per node per connection naming the status.
 - A subscribed node silent for `min_update_interval` is re-read (worst case ceil(nodes / 100) Reads per interval) and logged at the Read's ServerTimestamp.
 - Samples are logged at SourceTimestamp, else ServerTimestamp, else receipt. No clock-skew correction (see `_server.clock_skew_ms`). Fields with different timestamps are separate rows.
 
@@ -155,7 +158,7 @@ Names are sanitized at load (`. @ : ; =` and whitespace, and `/` in node names, 
 |--------|-------------|
 | `OPC-UA/get_status` | Connection `state` (`ok`, `connecting` at start, `disconnected` while retrying) and `last_error`, transport with subscribed / polled counts, poll and error counts, process `peak_rss_mb`; every server's when `server` is omitted |
 | `OPC-UA/read_node` | Read by node ID |
-| `OPC-UA/write_node` | Write by node ID; value is text, coerced to the server's type |
+| `OPC-UA/write_node` | Write by node ID; value is text, coerced to the server's type; only the Value is sent (no StatusCode or timestamps) |
 | `OPC-UA/read_named_node` | Read by node map name |
 | `OPC-UA/write_named_node` | Write by node map name; value is text, coerced to the map's datatype (checks writability); discovered nodes are rejected, use `write_node` |
 | `OPC-UA/list_nodes` | Mapped or discovered nodes, each with its `server` and `event`; every server's when omitted |
@@ -189,7 +192,7 @@ just sim          # standalone simulator (see Simulator)
 |---|---|
 | `demo` | The demo-mode PLC (`ns=2;s=Temperature.Sensor1`, ...) |
 | `gateway` | Kepware-shaped `ns=2;s=Channel.Device.Tag` (power meter, genset) with `_System` / `_Statistics` noise |
-| `s7` | S7-1500-shaped `ns=3;s="DB"."tag"`; enforced MaxNodesPerBrowse 10, MaxNodesPerRead 20, 10 references per node (BrowseNext), 3 continuation points, 4 sessions, 5 subscriptions and 10 monitored items per session |
+| `s7` | S7-1500-shaped `ns=3;s="DB"."tag"`; enforced MaxNodesPerBrowse 10, MaxNodesPerRead 20, 10 references per node (BrowseNext), 3 continuation points, 4 sessions (a lost connection's counts until it times out), 5 subscriptions and 10 monitored items per session |
 | `device` | DI `DeviceSet` identity, EngineeringUnits + EURange, a Double[4] array, a vendor struct, an abstract Number node, a Bad-status node, a reference cycle, a 14-level branch |
 
 | Flag | Effect |
