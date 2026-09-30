@@ -74,6 +74,14 @@ TRANSPORTS = ("subscription", "poll")
 KEEPALIVE_SECONDS = 10.0
 LIFETIME_KEEPALIVES = 10
 
+# A subscription silent for (revised MaxKeepAliveCount + 1) revised publishing
+# intervals plus this has stalled: the extra interval is the cycle the keep-alive
+# goes out on, the margin covers transit and Publish queuing (the OPC Foundation
+# .NET client's).
+KEEPALIVE_MARGIN = 1.0
+# How often stalled subscriptions are looked for; sends nothing.
+WATCH_SECONDS = 1.0
+
 # The server takes no more: later items are refused without asking (an S7 would
 # otherwise cost one rejected request per 100 items).
 SERVER_FULL_CODES = frozenset(
@@ -112,6 +120,10 @@ CONNECTION_STATUS_CODES = frozenset(
         "BadShutdown",
     )
 )
+# In a StatusChangeNotification: the link is gone (asyncua's supervisor sends
+# BadShutdown). Anything else, e.g. BadTimeout (lifetime expired), ends only that
+# subscription.
+LINK_LOST_CODES = CONNECTION_STATUS_CODES - {ua.StatusCodes.BadTimeout}
 
 SDK_DATATYPES = {
     "bool": zelos_sdk.DataType.Boolean,
@@ -615,6 +627,22 @@ Target = tuple[str, Node, UaNode]
 
 
 @dataclass
+class _Sub:
+    """A live subscription: what recreates it, and whether it still publishes."""
+
+    interval: float  # requested, s
+    items: list[tuple[int, Target]]
+    deadline: float  # s of silence that means it stalled
+    heard: float  # monotonic: last message, or creation
+    expected: int = 1  # next sequence number
+    stalled: str = ""  # why it must be recreated
+
+
+def _seqs(numbers: range) -> str:
+    return str(numbers[0]) if len(numbers) == 1 else f"{numbers[0]}-{numbers[-1]}"
+
+
+@dataclass
 class _Job:
     """A periodic request on the connection: health, a poll chunk, the sweep."""
 
@@ -736,14 +764,17 @@ class OPCUAClient:
         self._health_targets: list[tuple[str, UaNode]] = []
         # Per connection: targets by interval; client handle -> subscribed
         # target; handles in last-update order, oldest first (see _sweep); live
-        # subscriptions; polled item count; the periodic requests.
+        # subscriptions by id; Republished sequence numbers to acknowledge; polled
+        # item count; the periodic requests.
         self._groups: dict[float, list[Target]] = {}
         self._monitored: dict[int, Target] = {}
         self._stale: OrderedDict[int, float] = OrderedDict()
         # Silence before the sweep re-reads: min_update_interval, or a slower
         # revised publishing interval (nothing can arrive sooner).
         self._stale_after = min_update_interval
-        self._subscription_ids: list[int] = []
+        self._subs: dict[int, _Sub] = {}
+        self._acks: list[ua.SubscriptionAcknowledgement] = []
+        self._on_publish: Callable[[ua.PublishResult], Awaitable[None]] | None = None
         self._polled = 0
         self._jobs: list[_Job] = []
         # A Publish failed to decode this connection; applied once setup is done
@@ -1338,10 +1369,10 @@ class OPCUAClient:
             )
         self._groups = {i: [t for _, t in items] for i, items in groups.items()}
         client = self._require_client()
-        self._monitored, self._stale, self._subscription_ids = {}, OrderedDict(), []
+        self._monitored, self._stale, self._subs, self._acks = {}, OrderedDict(), {}, []
         self._stale_after = self.min_update_interval
         self._subscribing, self._publish_failed = True, False
-        on_publish = self._publish_callback(client, self._monitored, self._stale)
+        on_publish = self._on_publish = self._publish_callback(client, self._monitored, self._stale)
         if self.transport == "subscription":
             self._guard_publish(client)
         polled: dict[float, list[Target]] = {}
@@ -1386,7 +1417,7 @@ class OPCUAClient:
         client: Client,
         interval: float,
         items: list[tuple[int, Target]],
-        on_publish: Callable[[ua.PublishResult], None],
+        on_publish: Callable[[ua.PublishResult], Awaitable[None]],
         full: str | None,
     ) -> tuple[list[tuple[Target, str]], str | None]:
         """One subscription publishing and sampling at `interval`.
@@ -1416,7 +1447,16 @@ class OPCUAClient:
                 raise
             name = ua.StatusCode(e.code).name
             return [(t, name) for _, t in items], name if e.code in SERVER_FULL_CODES else None
-        self._subscription_ids.append(subscription.SubscriptionId)
+        # Registered first: its first message can precede CreateMonitoredItems' reply.
+        sub = self._subs[subscription.SubscriptionId] = _Sub(
+            interval,
+            items,
+            subscription.RevisedPublishingInterval
+            / 1000
+            * (subscription.RevisedMaxKeepAliveCount + 1)
+            + KEEPALIVE_MARGIN,
+            time.monotonic(),
+        )
 
         change = ua.DataChangeFilter(Trigger=ua.DataChangeTrigger.StatusValue)
         refused: list[tuple[Target, str]] = []
@@ -1461,6 +1501,7 @@ class OPCUAClient:
             for (handle, target), result in zip(chunk, results, strict=True):
                 if result.StatusCode.is_good():
                     self._stale[handle] = now
+                    self._stale.move_to_end(handle)  # a recreated subscription's items
                     continue
                 del self._monitored[handle]
                 name = result.StatusCode.name
@@ -1471,8 +1512,9 @@ class OPCUAClient:
             # An empty subscription still holds one of the server's few slots.
             with contextlib.suppress(ua.UaStatusCodeError):
                 await client.uaclient.delete_subscriptions([subscription.SubscriptionId])
-                self._subscription_ids.remove(subscription.SubscriptionId)
+                del self._subs[subscription.SubscriptionId]
             return refused, full
+        sub.items = [(h, t) for h, t in items if h in self._monitored]
         revised = revisions(ms, subscription, created)
         if revised:
             self._log.info(
@@ -1492,6 +1534,8 @@ class OPCUAClient:
         publish = session.publish
 
         async def guarded(acks: list[ua.SubscriptionAcknowledgement]) -> ua.PublishResponse:
+            if client is self._client and self._acks:
+                acks, self._acks = [*acks, *self._acks], []
             try:
                 return await publish(acks)
             except UaStructParsingError:
@@ -1518,23 +1562,22 @@ class OPCUAClient:
         self._monitored.clear()
         self._stale.clear()
         self._polled = len(self._poll_targets)
+        ids, self._subs = list(self._subs), {}
         self._jobs = self._schedule(self._groups)
-        ids, self._subscription_ids = self._subscription_ids, []
         # Best effort: a failure here is the connection's, seen by the next request.
         with contextlib.suppress(Exception):
             await client.uaclient.delete_subscriptions(ids)
 
     def _publish_callback(
         self, client: Client, monitored: dict[int, Target], stale: OrderedDict[int, float]
-    ) -> Callable[[ua.PublishResult], None]:
+    ) -> Callable[[ua.PublishResult], Awaitable[None]]:
         """This connection's Publish handler: a late response from an old session
         cannot resolve a new handle. asyncua awaits it before the next Publish."""
 
-        def on_publish(result: ua.PublishResult) -> None:
-            received = time.time_ns()
+        def deliver(subscription_id: int, message: ua.NotificationMessage, received: int) -> None:
             now = time.monotonic()
             samples = []
-            for notification in result.NotificationMessage.NotificationData or []:
+            for notification in message.NotificationData or []:
                 if isinstance(notification, ua.DataChangeNotification):
                     for item in notification.MonitoredItems:
                         target = monitored.get(item.ClientHandle)
@@ -1548,16 +1591,112 @@ class OPCUAClient:
                     and not notification.Status.is_good()
                     and client is self._client
                 ):
-                    # Timed out server-side, or asyncua's supervisor saw the link go.
+                    status = notification.Status
+                    sub = self._subs.get(subscription_id)
+                    if sub and status.value not in LINK_LOST_CODES:
+                        sub.stalled = f"server ended it ({status.name})"  # e.g. BadTimeout
+                        continue
+                    # asyncua's supervisor saw the link go.
                     self._log.warning(
-                        "Subscription %d ended (%s), reconnecting",
-                        result.SubscriptionId,
-                        notification.Status.name,
+                        "Subscription %d ended (%s), reconnecting", subscription_id, status.name
                     )
                     self._connected = False
             self._log_samples(samples, received)
 
+        async def on_publish(result: ua.PublishResult) -> None:
+            received = time.time_ns()
+            message = result.NotificationMessage
+            sub = self._subs.get(result.SubscriptionId) if client is self._client else None
+            # Sequence number 0 is asyncua's own status message, not the server's.
+            if sub is not None and message.SequenceNumber:
+                sub.heard = time.monotonic()
+                # A keep-alive carries the next number, a notification its own.
+                # Lower than expected (wrap, renumbering) resyncs.
+                missing = range(sub.expected, message.SequenceNumber)
+                sub.expected = message.SequenceNumber + bool(message.NotificationData)
+                if missing:
+                    await self._republish(client, result.SubscriptionId, sub, missing, deliver)
+            deliver(result.SubscriptionId, message, received)
+
         return on_publish
+
+    async def _republish(
+        self,
+        client: Client,
+        subscription_id: int,
+        sub: _Sub,
+        missing: range,
+        deliver: Callable[[int, ua.NotificationMessage, int], None],
+    ) -> None:
+        """Recover missed notifications from the server's retransmission queue; a
+        gap left open stalls `sub` (recreated by `_watch`)."""
+        session = client.uaclient.session
+        for seq in missing:
+            try:
+                message = await session.republish(subscription_id, seq)
+            except Exception as e:
+                why = (
+                    ua.StatusCode(e.code).name
+                    if isinstance(e, ua.UaStatusCodeError)
+                    else describe_error(e)
+                )
+                break
+            if message.SequenceNumber != seq:  # asyncua's server answers Good and empty
+                why = "not returned"
+                break
+            self._acks.append(
+                ua.SubscriptionAcknowledgement(SubscriptionId=subscription_id, SequenceNumber=seq)
+            )
+            deliver(subscription_id, message, time.time_ns())
+        else:
+            self._log.warning(
+                "Subscription %d (%g s): notifications %s missed, recovered by Republish",
+                subscription_id,
+                sub.interval,
+                _seqs(missing),
+            )
+            return
+        sub.stalled = f"notifications {_seqs(range(seq, missing.stop))} lost ({why})"
+
+    async def _watch(self) -> None:
+        """Recreate every stalled subscription: silent past its keep-alive, a
+        notification lost, or ended by the server."""
+        now = time.monotonic()
+        for subscription_id, sub in list(self._subs.items()):
+            if not sub.stalled and now - sub.heard > sub.deadline:
+                sub.stalled = f"no keep-alive in {sub.deadline:g} s"
+            if sub.stalled and self._subs.get(subscription_id) is sub:
+                await self._recreate(subscription_id, sub)
+
+    async def _recreate(self, subscription_id: int, sub: _Sub) -> None:
+        """Delete (best effort) and recreate one subscription, then read its items once."""
+        self._log.warning(
+            "Subscription %d (%g s): %s; recreating it", subscription_id, sub.interval, sub.stalled
+        )
+        client = self._require_client()
+        assert self._on_publish is not None
+        del self._subs[subscription_id]
+        # Raw: asyncua's delete_subscriptions WARNs, and keeps the callback, when the
+        # server already dropped it. A dead link fails the create below as well.
+        session = client.uaclient.session
+        request = ua.DeleteSubscriptionsRequest()
+        request.Parameters.SubscriptionIds = [subscription_id]
+        with contextlib.suppress(Exception):
+            await session._send_request(request)
+        session._subscription_callbacks.pop(subscription_id, None)
+        refused, _ = await self._subscribe(client, sub.interval, sub.items, self._on_publish, None)
+        if refused:
+            # Reconnecting rebuilds the transport, polling what the server refuses.
+            self._log.warning(
+                "Server refused %d of %d items recreating the %g s subscription; reconnecting",
+                len(refused),
+                len(sub.items),
+                sub.interval,
+            )
+            self._connected = False
+            return
+        targets = [t for _, t in sub.items]
+        self._log_samples(await self._read_targets(targets), time.time_ns(), refresh=True)
 
     def _schedule(self, polled: dict[float, list[Target]]) -> list[_Job]:
         """This connection's periodic requests.
@@ -1576,6 +1715,8 @@ class OPCUAClient:
                 _Job(now + i * step, interval, lambda c=chunk: self._poll_chunk(c))
                 for i, chunk in enumerate(chunks)
             ]
+        if self._subs:
+            jobs.append(_Job(now + WATCH_SECONDS, WATCH_SECONDS, self._watch))
         if self._monitored:
             chunks = -(-len(self._monitored) // self._read_chunk)
             step = self._stale_after / max(SWEEP_STEPS, chunks)

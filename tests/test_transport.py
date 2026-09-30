@@ -345,7 +345,7 @@ async def test_revised_publishing_interval_is_honored(monkeypatch, caplog):
         async with running(client):
             await wait_until(lambda: client._jobs, 10.0)
             assert client._stale_after == 2.0
-            subscriptions = len(client._subscription_ids)
+            subscriptions = len(client._subs)
     revised = [r.getMessage() for r in caplog.records if "server revised" in r.getMessage()]
     assert len(revised) == subscriptions >= 1  # one line per subscription
     assert all(m.endswith(" -> 2000 ms") and "publishing" in m for m in revised)
@@ -402,3 +402,79 @@ async def test_uncertain_values_are_traced_bad_are_not(transport, caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert sum("'uncertain'" in m and "UncertainLastUsableValue" in m for m in messages) == 1
     assert sum("'bad'" in m and "BadSensorFailure" in m for m in messages) == 1
+
+
+def subscription_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "Subscription" in r.getMessage()
+    ]
+
+
+async def test_lost_notification_is_recovered_by_republish(caplog):
+    """A lost Publish response comes back via Republish at its own source timestamps."""
+    caplog.set_level(logging.WARNING, logger="zelos_extension_opcua.client")
+    node_map = NodeMap.from_file(get_demo_node_map_path())
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs, 10.0)
+            subs = set(client._subs)
+            sim.drop_notifications = 1
+            await wait_until(lambda: subscription_warnings(caplog), 10.0)
+            assert set(client._subs) == subs  # not recreated
+    [lost] = sim.dropped
+    [warning] = subscription_warnings(caplog)
+    assert warning.endswith(f"notifications {lost.SequenceNumber} missed, recovered by Republish")
+    items = [i for n in lost.NotificationData for i in n.MonitoredItems]
+    assert items
+    for item in items:
+        name = client._monitored[item.ClientHandle][1].name
+        assert timestamp_ns(item.Value.SourceTimestamp) in {t for t, _ in rows.of(name)}
+
+
+async def test_subscription_deleted_by_the_server_is_recreated(monkeypatch, caplog):
+    """Silent past its keep-alive: recreated (one WARNING each), values resume."""
+    monkeypatch.setattr(client_mod, "KEEPALIVE_SECONDS", 1.0)
+    caplog.set_level(logging.WARNING, logger="zelos_extension_opcua.client")
+    node_map = NodeMap.from_file(get_demo_node_map_path())
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs, 10.0)
+            old = set(client._subs)
+            deadline = max(s.deadline for s in client._subs.values())
+            assert await sim.delete_subscriptions() == len(old)
+            deleted = time.monotonic()
+            await wait_until(
+                lambda: len(client._subs) == len(old) and not old & set(client._subs), 10.0
+            )
+            latency = time.monotonic() - deleted
+            seen = len(rows.of("temp_sensor1"))
+            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+    assert latency <= deadline + client_mod.WATCH_SECONDS + 0.5
+    warnings = subscription_warnings(caplog)
+    assert len(warnings) == len(old)
+    assert all(w.endswith(f"no keep-alive in {deadline:g} s; recreating it") for w in warnings)
+
+
+async def test_unrecoverable_notification_recreates_the_subscription(caplog):
+    """Republish answering BadMessageNotAvailable falls back to recreating (one WARNING)."""
+    caplog.set_level(logging.WARNING, logger="zelos_extension_opcua.client")
+    node_map = NodeMap.from_file(get_demo_node_map_path())
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs, 10.0)
+            subs = set(client._subs)
+            sim.retain_dropped, sim.drop_notifications = False, 1
+            await wait_until(lambda: len(set(client._subs) - subs) == 1, 10.0)
+            seen = len(rows.of("temp_sensor1"))
+            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+    [lost] = sim.dropped
+    assert "Republish" in services(sim)
+    [warning] = subscription_warnings(caplog)
+    assert warning.endswith(
+        f"notifications {lost.SequenceNumber} lost (BadMessageNotAvailable); recreating it"
+    )
