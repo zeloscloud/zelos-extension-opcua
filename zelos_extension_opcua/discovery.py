@@ -12,7 +12,7 @@ import re
 import struct
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,6 +50,12 @@ BUILTIN_DATATYPES = {
     _IDS.Double: "float64",
     _IDS.String: "string",
 }
+
+_INTEGER_TYPES = frozenset(
+    k for k, v in BUILTIN_DATATYPES.items() if v not in ("bool", "float32", "float64", "string")
+)
+# DataType hierarchy levels followed from a vendor type to a builtin one.
+_TYPE_DEPTH = 8
 
 # Abstract numeric DataType -> the widest exact type of its family: any subtype
 # may arrive, and values coerce into it.
@@ -228,6 +234,27 @@ class _Counter:
         self.requests += 1
         return await self.client.uaclient.browse(params)
 
+    async def supertypes(self, types: list[NodeId], chunk: int) -> list[NodeId | None]:
+        """Each DataType's HasSubtype parent, None when it has none."""
+        out: list[NodeId | None] = []
+        for start in range(0, len(types), chunk):
+            params = ua.BrowseParameters()
+            params.View = ua.ViewDescription()
+            params.View.Timestamp = ua.get_win_epoch()  # null: see _browse_batch
+            for node_id in types[start : start + chunk]:
+                desc = ua.BrowseDescription()
+                desc.NodeId = node_id
+                desc.BrowseDirection = ua.BrowseDirection.Inverse
+                desc.ReferenceTypeId = NodeId(_IDS.HasSubtype)
+                desc.IncludeSubtypes = False
+                desc.NodeClassMask = ua.NodeClass.DataType
+                params.NodesToBrowse.append(desc)
+            out += [
+                _local(r.References[0].NodeId) if r.StatusCode.is_good() and r.References else None
+                for r in await self.browse(params)
+            ]
+        return out
+
     async def browse_next(self, params: Any) -> list[ua.BrowseResult]:
         self.requests += 1
         return await self.client.uaclient.browse_next(params)
@@ -363,8 +390,41 @@ def _text(dv: ua.DataValue) -> str:
     return (value.Text or "") if isinstance(value, ua.LocalizedText) else ""
 
 
+def _builtin_or_abstract(dtype: NodeId) -> bool:
+    """ns=0 builtin (i=1..25) and abstract (Number..Enumeration) types: nothing to resolve."""
+    return (
+        dtype.NamespaceIndex == 0
+        and isinstance(dtype.Identifier, int)
+        and dtype.Identifier <= _IDS.Enumeration
+    )
+
+
+async def integer_subtypes(rpc: _Counter, types: set[NodeId], chunk: int) -> dict[NodeId, str]:
+    """DataTypes deriving (HasSubtype) from a builtin integer, as that integer.
+
+    Their values arrive in its encoding: typed exactly, a vendor Int64 subtype keeps
+    all 64 bits. One inverse Browse per hierarchy level for every type at once.
+    """
+    ancestor = {t: t for t in types}
+    for _ in range(_TYPE_DEPTH):
+        pending = sorted({a for a in ancestor.values() if not _builtin_or_abstract(a)}, key=str)
+        if not pending:
+            break
+        parents = dict(zip(pending, await rpc.supertypes(pending, chunk), strict=True))
+        ancestor = {
+            t: parent
+            for t, a in ancestor.items()
+            if (parent := a if _builtin_or_abstract(a) else parents[a]) is not None
+        }
+    return {
+        t: BUILTIN_DATATYPES[a.Identifier]
+        for t, a in ancestor.items()
+        if a.NamespaceIndex == 0 and a.Identifier in _INTEGER_TYPES
+    }
+
+
 async def describe(
-    rpc: _Counter, found: list[Found], chunk: int
+    rpc: _Counter, found: list[Found], chunk: int, browse_chunk: int = MAX_OPERATIONS
 ) -> tuple[list[tuple[Found, str, str, str]], Counter[str], set[NodeId]]:
     """(variable, datatype, unit, description) per traceable Variable, skip counts,
     and the traceable ones declared BaseDataType.
@@ -390,7 +450,7 @@ async def describe(
     }
 
     skipped: Counter[str] = Counter()
-    typed: list[tuple[Found, Any, bool, list[ua.DataValue]]] = []
+    kept: list[tuple[Found, Any, Any, list[ua.DataValue]]] = []
     for i, var in enumerate(found):
         attrs = dvs[i * n : (i + 1) * n]
         dtype, rank, access = (value_of(dv) for dv in attrs[:3])
@@ -400,7 +460,13 @@ async def describe(
         if rank is not None and rank not in (_SCALAR, *_MAYBE_SCALAR):
             skipped["array"] += 1
             continue
-        typed.append((var, dtype, declared_datatype(dtype) is None or rank in _MAYBE_SCALAR, attrs))
+        kept.append((var, dtype, rank, attrs))
+    vendor = {d for _, d, _, _ in kept if isinstance(d, NodeId) and not _builtin_or_abstract(d)}
+    subtypes = await integer_subtypes(rpc, vendor, browse_chunk) if vendor else {}
+    typed = [
+        (var, dtype, declared_datatype(dtype, subtypes) is None or rank in _MAYBE_SCALAR, attrs)
+        for var, dtype, rank, attrs in kept
+    ]
 
     unresolved = [var.node_id for var, _, needs_value, _ in typed if needs_value]
     values = iter(await rpc.read([(nid, None) for nid in unresolved], chunk))
@@ -408,7 +474,7 @@ async def describe(
     out = []
     variant: set[NodeId] = set()
     for var, dtype, needs_value, attrs in typed:
-        datatype, reason = field_datatype(dtype, next(values) if needs_value else None)
+        datatype, reason = field_datatype(dtype, next(values) if needs_value else None, subtypes)
         if datatype is None:
             skipped[reason] += 1
             continue
@@ -425,20 +491,27 @@ async def describe(
     return out, skipped, variant
 
 
-def declared_datatype(dtype: Any) -> str | None:
-    """Datatype a DataType declaration fixes: concrete builtin or abstract numeric."""
-    if not isinstance(dtype, NodeId) or dtype.NamespaceIndex != 0:
+def declared_datatype(dtype: Any, subtypes: Mapping[NodeId, str] | None = None) -> str | None:
+    """Datatype a DataType declaration fixes: concrete builtin, abstract numeric, or
+    the builtin integer it derives from (`subtypes`, see integer_subtypes)."""
+    if not isinstance(dtype, NodeId):
         return None
-    return BUILTIN_DATATYPES.get(dtype.Identifier) or ABSTRACT_DATATYPES.get(dtype.Identifier)
+    if dtype.NamespaceIndex == 0 and (
+        known := BUILTIN_DATATYPES.get(dtype.Identifier) or ABSTRACT_DATATYPES.get(dtype.Identifier)
+    ):
+        return known
+    return (subtypes or {}).get(dtype)
 
 
-def field_datatype(dtype: Any, dv: ua.DataValue | None) -> tuple[str | None, str]:
+def field_datatype(
+    dtype: Any, dv: ua.DataValue | None, subtypes: Mapping[NodeId, str] | None = None
+) -> tuple[str | None, str]:
     """A Variable's field datatype, or (None, skip reason); `dv` None when not read.
 
     The declaration wins where it fixes one; BaseDataType is string (its value
     type may change); otherwise the value's kind at its widest.
     """
-    declared = declared_datatype(dtype)
+    declared = declared_datatype(dtype, subtypes)
     if dv is None:
         return declared, ""
     if dv.StatusCode is not None and dv.StatusCode.value == _BAD_DECODING:
@@ -550,7 +623,7 @@ async def discover(
     started = time.monotonic()
     rpc = _Counter(client)
     found, browse_failed = await walk(rpc, browse_chunk)
-    described, skipped, variant = await describe(rpc, found, read_chunk)
+    described, skipped, variant = await describe(rpc, found, read_chunk, browse_chunk)
     events, renames = assign_names(described, namespaces, max_event_bytes)
     return Discovery(
         node_map=NodeMap(events=events, name=name, description="discovered"),

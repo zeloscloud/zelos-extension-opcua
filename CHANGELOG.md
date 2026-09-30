@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `demo-server` / `just sim`: simulator with `gateway`, `s7` (enforced limits and session caps) and `device` profiles, `--secure`, `--secure-only`, trust lists, `--shuffle-namespaces`, `--map`, `--nodes N`, request log.
 
 ### Changed
+- Writes send only the Value (DataValue mask 0x01), no StatusCode or SourceTimestamp: servers that refuse them answered BadWriteNotSupported.
+- Session timeout 120 s requested (was asyncua's 1 h). A session left open by a lost connection is re-activated on the new channel and closed before a new one is created; on the 4-session `s7` sim the 4th flap no longer fails with BadTooManySessions.
+- An endpoint URL with a user name or password is a startup error and an `auto_config` problem (asyncua logged in with it, in plain text on a None channel).
+- A Bad node is logged once per connection (was once per process), so a later outage is logged again.
+- Uncertain values are traced (were dropped), subscribed or polled, with one INFO per node per connection naming the status; Bad stays a gap.
+- Revised publishing / sampling interval and queue size are logged once per subscription; a slower revised publishing interval paces the staleness sweep.
+- Discovery types a vendor DataType deriving from a builtin integer as that integer (was float64): 64-bit values stay exact.
 - A server that cannot be reached or refuses the session at start (untrusted certificate, security not offered, user rejected) stops the extension with one ERROR naming it; once connected, drops are retried as before.
 - `get_status` reports `state` (`ok`, `connecting`, `disconnected`) and `last_error`.
 - `auto_config` checks the form's servers (unsaved edits, Advanced security included) and names each outcome: found, couldn't connect, no supported security; with none it looks on this machine as before.

@@ -255,3 +255,6 @@ __marimo__/
 # Zelos
 .last_config
 config.json
+
+# Claude Code worktrees and local settings
+.claude/

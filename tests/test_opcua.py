@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import zelos_sdk
 from asyncua import ua
+from asyncua.ua.ua_binary import to_binary
 
 from zelos_extension_opcua import actions
 from zelos_extension_opcua.client import (
@@ -345,6 +346,22 @@ class TestDemoServerIntegration:
             assert await client.read_node_value(node) == value
         with pytest.raises(ValueError, match="not writable"):
             await client.write_node_value(client.node_map.get_by_name("input1"), True)
+
+    async def test_write_sends_the_value_only(self, client, monkeypatch):
+        """Encoding mask 0x01: no StatusCode or timestamps, which some servers refuse."""
+        sent = []
+        write = client._client.uaclient.session.write
+
+        async def spy(params):
+            sent.extend(params.NodesToWrite)
+            return await write(params)
+
+        monkeypatch.setattr(client._client.uaclient.session, "write", spy)
+        await client.write_node_value(client.node_map.get_by_name("setpoint"), 31.0)
+        (dv,) = [w.Value for w in sent]
+        assert to_binary(ua.DataValue, dv)[0] == 0x01
+        node = client._ua_nodes["ns=2;s=Temperature.Setpoint"]
+        assert dv.Value.VariantType == (await node.read_data_value()).Value.VariantType
 
     async def test_poll_is_one_read_per_chunk(self, client, monkeypatch):
         calls = 0

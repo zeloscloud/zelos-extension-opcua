@@ -147,7 +147,7 @@ class _SimProcessor(UaProcessor):
             if (
                 service == "CreateSession"
                 and limits
-                and len(self._sim.open_sessions) >= limits.max_sessions
+                and self._sim.held_sessions >= limits.max_sessions
             ):
                 raise ServiceError(ua.StatusCodes.BadTooManySessions)
             result = await super()._process_message(typeid, requesthdr, seqhdr, body)
@@ -157,7 +157,6 @@ class _SimProcessor(UaProcessor):
             elif service == "ActivateSession":
                 self._sim.identities[self._session_id()] = identity
             elif service == "CloseSession":
-                self._sim.open_sessions.discard(self)
                 await self._sim.publish_diagnostics()
             return result
         finally:
@@ -184,12 +183,10 @@ class _SimProcessor(UaProcessor):
         mode = getattr(policy, "Mode", ua.MessageSecurityMode.None_)
         record = (mode.name.rstrip("_"), policy.URI.rsplit("#", 1)[-1])
         self._sim.sessions[self._session_id()] = record
-        self._sim.open_sessions.add(self)
         logger.info("session %s: mode=%s policy=%s", self._session_id(), *record)
 
     async def close(self) -> None:
-        """Drop the session from the open set, then clean up as asyncua does."""
-        self._sim.open_sessions.discard(self)
+        """Clean up as asyncua does: a session with subscriptions outlives its connection."""
         await super().close()
         with contextlib.suppress(Exception):  # the server may be stopping
             await self._sim.publish_diagnostics()
@@ -429,7 +426,6 @@ class Simulator:
         self.sessions: dict[str, tuple[str, str]] = {}
         #: session id -> "anonymous", "username" or "certificate:<SHA-1>", once activated
         self.identities: dict[str, str] = {}
-        self.open_sessions: set[_SimProcessor] = set()
         self.server: _SimServer | None = None
         self._updater: Any = None
         self._pki: Path | None = None
@@ -439,6 +435,12 @@ class Simulator:
         """Client URL, with the bound port."""
         port = self.server.bserver.port if self.server and self.server.bserver else self.port
         return f"opc.tcp://{self.host}:{port}/freeopcua/server/"
+
+    @property
+    def held_sessions(self) -> int:
+        """Sessions the server holds, as a PLC counts them: one whose connection was
+        lost stays until it times out or is closed."""
+        return len(self.server.iserver._external_sessions) if self.server else 0
 
     async def start(self) -> None:
         """Build the address space and start listening."""
@@ -523,7 +525,7 @@ class Simulator:
             return
         prefix = "Server_ServerDiagnostics_ServerDiagnosticsSummary_"
         for name, value in (
-            ("CurrentSessionCount", len(self.open_sessions)),
+            ("CurrentSessionCount", self.held_sessions),
             ("CumulatedSessionCount", len(self.sessions)),
             ("RejectedRequestsCount", 0),
             ("SecurityRejectedRequestsCount", 0),
