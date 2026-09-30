@@ -7,6 +7,7 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import pytest
 import zelos_sdk
@@ -96,9 +97,9 @@ def reads(monkeypatch) -> list[ua.NodeId]:
     seen: list[ua.NodeId] = []
     real = client_mod.read_many
 
-    async def spy(client, items, chunk):
+    async def spy(client, items, chunk, max_age=0.0):
         seen.extend(node_id for node_id, _ in items)
-        return await real(client, items, chunk)
+        return await real(client, items, chunk, max_age)
 
     monkeypatch.setattr(client_mod, "read_many", spy)
     return seen
@@ -127,7 +128,7 @@ async def test_subscription_samples_carry_the_source_timestamp(reads):
     assert value == pytest.approx(written.Value.Value, rel=1e-6)
     assert (status["subscribed"], status["polled"]) == (len(node_map.nodes), 0)
     assert services(sim) >= SUBSCRIPTION_SERVICES
-    mapped = {t[2].nodeid for t in client._poll_targets}
+    mapped = {t[2] for t in client._poll_targets}
     assert not mapped & set(reads)  # only health is read per cycle
 
 
@@ -201,8 +202,40 @@ async def test_static_node_is_refreshed_at_the_server_timestamp(reads):
     # Refreshes: logged at the read's ServerTimestamp, about min_update_interval apart.
     assert started < second < third <= time.time_ns()
     assert 0.9e9 < third - second < 1.25e9 + 0.5e9
-    moving = {t[2].nodeid for t in client._poll_targets if t[1].name == "moving"}
+    moving = {t[2] for t in client._poll_targets if t[1].name == "moving"}
     assert not moving & set(reads)  # a changing item is never re-read
+
+
+async def test_read_max_age_per_kind(monkeypatch):
+    """Polled chunks accept a value one interval old, staleness refreshes one
+    min_update_interval old; health and discovery read fresh."""
+    sent: list[tuple[float, set[ua.NodeId], set[int]]] = []  # MaxAge, nodes, attributes
+    read = UaClient.read
+
+    async def spy(self, params):
+        nodes = params.NodesToRead
+        sent.append((params.MaxAge, {r.NodeId for r in nodes}, {r.AttributeId for r in nodes}))
+        return await read(self, params)
+
+    monkeypatch.setattr(UaClient, "read", spy)
+    static = ua.NodeId("Static", 2)
+    node_map = NodeMap.from_dict(
+        {"events": {"e": [{"name": "static", "node_id": "ns=2;s=Static"}]}}
+    )
+    async with Simulator(port=0, node_map=node_map) as sim:
+        subscribed = OPCUAClient(
+            endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2, min_update_interval=0.5
+        )
+        async with running(subscribed):
+            await wait_until(lambda: any(static in n for a, n, _ in sent if a == 500), 10.0)
+        discovered = OPCUAClient(endpoint=sim.endpoint, poll_interval=0.2, transport="poll")
+        async with running(discovered):
+            await wait_until(lambda: any(static in n for a, n, _ in sent if a == 200), 10.0)
+
+    health = ua.NodeId(ua.ObjectIds.Server_ServerStatus_State)
+    value = {ua.AttributeIds.Value}
+    assert all(age == 0 for age, nodes, attrs in sent if health in nodes or attrs != value)
+    assert {age for age, _, _ in sent} == {0, 200, 500}
 
 
 async def test_poll_transport_never_subscribes():
@@ -267,10 +300,10 @@ async def test_shutdown_does_not_wait_out_a_hung_request(monkeypatch):
     hung = asyncio.Event()
     real = client_mod.read_many
 
-    async def read_many(client, items, chunk):
+    async def read_many(client, items, chunk, max_age=0.0):
         if hung.is_set():
             await asyncio.Event().wait()
-        return await real(client, items, chunk)
+        return await real(client, items, chunk, max_age)
 
     monkeypatch.setattr(client_mod, "read_many", read_many)
     async with Simulator(port=0) as sim:
@@ -306,6 +339,102 @@ async def test_lost_connections_leave_no_session_behind():
                 assert sim.held_sessions == 1
             (session,) = sim.server.iserver._external_sessions.values()
             assert session.session_timeout == SESSION_TIMEOUT_MS / 1000
+    assert len(sim.sessions) == 1  # resumed every time
+
+
+def gate(client: OPCUAClient) -> asyncio.Event:
+    """Holds the client's connects while cleared: an outage with the server up."""
+    opened = asyncio.Event()
+    opened.set()
+    create = client._create_client
+
+    async def gated():
+        await opened.wait()
+        return await create()
+
+    client._create_client = gated
+    return opened
+
+
+def infos(caplog, text: str) -> list[str]:
+    return [
+        m for r in caplog.records if r.levelno == logging.INFO and text in (m := r.getMessage())
+    ]
+
+
+async def test_lost_connection_resumes_the_session_and_its_subscriptions(caplog):
+    """A 2 s outage: the session is re-activated, nothing re-created, a value
+    written meanwhile is traced at its source timestamp."""
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
+    node_map = NodeMap.from_file(get_demo_node_map_path())
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
+        opened = gate(client)
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs, 10.0)
+            subs = set(client._subs)
+            opened.clear()
+            for transport in list(sim.server.iserver.asyncio_transports):
+                transport.abort()
+            await wait_until(lambda: not client._connected, 10.0)
+            since = len(sim.request_log)
+            stamp = datetime.now(UTC)
+            value = ua.DataValue(ua.Variant(42.5, ua.VariantType.Float), SourceTimestamp=stamp)
+            await sim.server.get_node("ns=2;s=Temperature.Setpoint").write_value(value)
+            await asyncio.sleep(2.0)
+            opened.set()
+            await wait_until(lambda: (timestamp_ns(stamp), 42.5) in rows.of("setpoint"), 10.0)
+            seen = len(rows.of("temp_sensor1"))
+            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+            assert sim.held_sessions == 1
+    after = {svc for _, svc in sim.request_log[since:]}
+    assert {"ActivateSession", "Republish"} <= after  # the response lost with the link
+    assert not after & {"CreateSession", "CreateSubscription", "CreateMonitoredItems"}
+    assert set(client._subs) == subs
+    assert len(infos(caplog, "Reconnected; session and subscriptions kept")) == 1
+
+
+async def test_expired_session_falls_back_to_a_new_one(monkeypatch, caplog):
+    """An outage past the session timeout: one INFO, a new session, values resume."""
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
+    monkeypatch.setattr(client_mod, "SESSION_TIMEOUT_MS", 1000)
+    node_map = NodeMap.from_file(get_demo_node_map_path())
+    async with Simulator(port=0) as sim:
+        sim.server.iserver.min_session_timeout_ms = 1000
+        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
+        opened = gate(client)
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs, 10.0)
+            opened.clear()
+            for transport in list(sim.server.iserver.asyncio_transports):
+                transport.abort()
+            await wait_until(lambda: not client._connected and not sim.held_sessions, 10.0)
+            opened.set()
+            await wait_until(lambda: client._connected, 10.0)
+            seen = len(rows.of("temp_sensor1"))
+            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+            assert sim.held_sessions == 1
+    assert infos(caplog, "not resumed") == [
+        "[127_0_0_1] Previous session not resumed (BadSessionIdInvalid); creating a new one"
+    ]
+    assert len(sim.sessions) == 2
+
+
+async def test_restarted_server_gets_a_new_session(caplog):
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
+    node_map = NodeMap.from_file(get_demo_node_map_path())
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
+        port = sim.server.bserver.port
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs, 10.0)
+            await sim.stop()
+            async with Simulator(port=port) as restarted:
+                await wait_until(lambda: restarted.held_sessions == 1, 15.0)
+                seen = len(rows.of("temp_sensor1"))
+                await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+    assert len(infos(caplog, "Previous session not resumed (BadSessionIdInvalid)")) == 1
+    assert not infos(caplog, "session and subscriptions kept")
 
 
 async def test_bad_node_is_reported_again_on_a_new_connection(caplog):

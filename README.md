@@ -10,7 +10,7 @@ Traces OPC-UA servers into Zelos trace events, by subscription or polling, and e
 | Discovery | A server without a node map is browsed on every connect and every scalar variable traced (read-only) |
 | Security | None / Sign / SignAndEncrypt, with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss; X.509 user login |
 | Multiple servers | Any number in one extension; one unreachable server never stalls the others |
-| Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request. Session timeout 120 s requested; a session left open by a lost connection is closed on the next one, so flaps never exhaust a PLC's few session slots |
+| Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request. Session timeout 120 s requested. A lost connection resumes its session on the new one, subscriptions kept and notifications missed meanwhile recovered by Republish; a session the server no longer holds (timed out, server restarted) is replaced by a new one. Either way one session per server, so flaps never exhaust a PLC's few session slots |
 | Start | Every server must connect at start: one that cannot be reached or refuses the session (e.g. an untrusted certificate) stops the extension with one ERROR naming it (`Server 'plc' (opc.tcp://10.0.0.5:4840): cannot connect: connection refused`); fix it and start again. Once connected, drops are retried |
 | Data types | bool, int8-64, uint8-64, float32/64, string |
 | Demo | `main.py demo`: built-in PLC simulator, no hardware |
@@ -36,6 +36,7 @@ uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: disco
 | `servers[].poll_interval` | number | `1.0` | Seconds: subscription sampling/publishing interval, poll period, `_server` period |
 | `servers[].transport` | string | `default` | `default` (inherit), `subscription`, `poll` |
 | `servers[].min_update_interval` | number \| null | `null` | Seconds; empty inherits the advanced value |
+| `servers[].include` / `exclude` | string[] | `[]` | Discovery path globs; empty inherits the advanced list |
 | `servers[].security_mode` | string | `default` | `default` (inherit), None, Sign, SignAndEncrypt |
 | `servers[].security_policy` | string | `default` | `default` (inherit), None, Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss |
 | `servers[].user_certificate_file` | string | `""` | User certificate; empty inherits the advanced pair |
@@ -46,6 +47,8 @@ uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: disco
 | `advanced.timeout` | number | `5.0` | Request timeout in seconds |
 | `advanced.log_level` | string | `INFO` | Logging verbosity; an unknown value falls back to INFO |
 | `advanced.discovery` | boolean | `true` | Browse servers without a node map; off, such a server polls only its health |
+| `advanced.include` | string[] | `[]` | Discovery: path globs to trace (see Discovery); empty traces everything |
+| `advanced.exclude` | string[] | `[]` | Discovery: path globs not traced nor browsed below; wins over include |
 | `advanced.transport` | string | `subscription` | `subscription`: server-pushed changes, polling what is refused; `poll`: batched Reads only |
 | `advanced.min_update_interval` | number | `60` | Seconds a subscribed node may stay silent before it is re-read |
 | `advanced.certificate_file` | string | `""` | Client certificate (DER/PEM), shared by every server; empty generates one |
@@ -73,6 +76,7 @@ A server without a `node_map_file` is browsed on every connect (read-only, nothi
 | Aspect | Behavior |
 |---|---|
 | Walk | Forward hierarchical references from `Objects`; skips `Server`, Objects named `_*` (Kepware `_System`, ...), properties |
+| Filters | `include` / `exclude` globs over the browse path below `Objects`, each BrowseName sanitized as traced (`ModbusTCP/PowerMeter/Voltage_L1`): `*` `?` `[..]` within one segment (fnmatch, case-sensitive), `**` any number of segments. Empty include = everything; a node matching an exclude is dropped with everything below it; exclude wins. Branches no include can reach are not browsed. The path equals the trace name except on vendor-id servers (Siemens, CODESYS, B&R, TwinCAT), where the trace name comes from the node id (an S7 `"DB"."tag"` traces as `DB/tag` whatever folders hold it). Counts: `filtered` variables, `pruned` branches, in the discovery INFO line |
 | Traced | Every scalar variable of a supported type; arrays, structs, other types skipped (one INFO count per connect) |
 | Vendor DataTypes | A subtype (HasSubtype) of a builtin integer is typed as it: a vendor Int64 keeps all 64 bits |
 | Event / field | Event = parent path below `Objects` (`Line1/Motor`), field = BrowseName; vendor string ids (Kepware/TwinCAT dots, Siemens `"DB"."tag"`, CODESYS, B&R `::Task:Var`) name the event from the id |
@@ -87,6 +91,7 @@ A server without a `node_map_file` is browsed on every connect (read-only, nothi
 - `subscription`: one subscription per distinct interval (event `poll_interval`, else server's), queue size 1, change of value or status, no deadband. Refused items (e.g. BadTooManyMonitoredItems) and an undecodable Publish fall back to polling for the connection, one WARNING per connect.
 - A stalled subscription on a live connection is recovered: a sequence-number gap is filled by Republish; a keep-alive missed by 1 s past (revised MaxKeepAliveCount + 1) publishing intervals, a gap Republish cannot fill, or a server-ended subscription (e.g. BadTimeout) recreates it and reads its items once. One WARNING per event.
 - `poll`: batched Reads of min(MaxNodesPerRead, 100) nodes, spread evenly across the interval.
+- Read MaxAge: polled nodes their poll interval, staleness re-reads `min_update_interval` (the server may answer from a cache that recent); health and discovery 0 (from the device).
 - Values the server revises (publishing / sampling interval, queue size) are logged once per subscription (INFO); a revised publishing interval slower than `min_update_interval` becomes the staleness threshold.
 - A Bad value is a gap, logged once per node per connection (ERROR). An Uncertain value is traced (usable per Part 8), with one INFO per node per connection naming the status.
 - A subscribed node silent for `min_update_interval` is re-read (worst case ceil(nodes / 100) Reads per interval) and logged at the Read's ServerTimestamp.

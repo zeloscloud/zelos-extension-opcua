@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import os
 import shutil
 import subprocess
@@ -184,6 +185,56 @@ async def test_subscriptions_deliver_fast_nodes_at_source_time(
     assert not [r for r in caplog.records if "could not be decoded" in r.getMessage()]
     assert all(source is not None and at == source for at, source in stamped)
     assert len({at for at, _ in stamped}) == len(stamped)
+
+
+async def test_lost_connection_resumes_the_session(opcplc, monkeypatch, caplog):
+    """A reset TCP connection: the .NET server re-activates the session on the new
+    channel, subscriptions kept, values resume."""
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
+    creates = 0
+    create_session = Client.create_session
+
+    async def counted(self):
+        nonlocal creates
+        creates += 1
+        return await create_session(self)
+
+    monkeypatch.setattr(Client, "create_session", counted)
+    client = OPCUAClient(endpoint=ENDPOINT, name="plc", node_map=FAST)
+    samples = 0
+    real = client._log_samples
+
+    def log_samples(batch, received_ns, refresh=False):
+        nonlocal samples
+        batch = list(batch)
+        samples += sum(node.name == "FastUInt1" for _, node, _ in batch)
+        real(batch, received_ns, refresh)
+
+    monkeypatch.setattr(client, "_log_samples", log_samples)
+
+    async def until(predicate, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.1)
+
+    client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
+    runner = OPCUARunner([client])
+    task = asyncio.create_task(runner._run_async())
+    try:
+        await until(lambda: samples >= 3, 20)
+        old, subs = client._client, set(client._subs)
+        old.uaclient.protocol.transport.abort()
+        await until(lambda: client._connected and client._client is not old, 20)
+        seen = samples
+        await until(lambda: samples >= seen + 3, 20)
+    finally:
+        runner.stop()
+        await asyncio.wait_for(task, 10.0)
+    assert creates == 1
+    assert set(client._subs) == subs
+    messages = [r.getMessage() for r in caplog.records]
+    assert "[plc] Reconnected; session and subscriptions kept" in messages
 
 
 async def test_auto_config_finds_it(opcplc):

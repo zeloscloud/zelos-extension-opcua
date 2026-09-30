@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import zelos_sdk
 from asyncua import ua
+from asyncua.client.ua_client import UaClient
 from zelos_sdk.extensions.actions import get_standalone_actions
 
 from zelos_extension_opcua import ACTION_PREFIX, actions, autoconfig
@@ -33,9 +34,9 @@ from zelos_extension_opcua.discovery import (
 from zelos_extension_opcua.node_map import NodeMap
 
 
-async def discovered(sim: Simulator) -> tuple[OPCUAClient, dict]:
+async def discovered(sim: Simulator, **kwargs) -> tuple[OPCUAClient, dict]:
     """A connected no-map client and its first poll."""
-    client = OPCUAClient(endpoint=sim.endpoint, name="plc")
+    client = OPCUAClient(endpoint=sim.endpoint, name="plc", **kwargs)
     client.start(SharedSource(zelos_sdk.TraceSource("OPC-UA")))
     assert await client.connect() is True
     return client, await client._poll_nodes()
@@ -61,6 +62,39 @@ async def test_gateway_discovery_and_health():
             client._log_values(values)
         finally:
             await client.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("include", "exclude", "events", "summary"),
+    [
+        (["ModbusTCP/PowerMeter/**"], [], {"ModbusTCP/PowerMeter": None}, "pruned "),
+        ([], ["**/Controller"], {"ModbusTCP/PowerMeter": None}, "pruned 1"),
+        (["ModbusTCP/**"], ["**/Voltage_*"], {"ModbusTCP/PowerMeter": 3}, "filtered 3"),
+    ],
+    ids=["include_one_device", "exclude_branch", "exclude_beats_include"],
+)
+async def test_discovery_filters(monkeypatch, caplog, include, exclude, events, summary):
+    """Filters narrow the map; a branch no pattern leaves is never browsed."""
+    browsed: list[str] = []
+    browse = UaClient.browse
+
+    async def spy(self, params):
+        browsed.extend(str(d.NodeId.Identifier) for d in params.NodesToBrowse)
+        return await browse(self, params)
+
+    monkeypatch.setattr(UaClient, "browse", spy)
+    async with Simulator("gateway", port=0) as sim:
+        with caplog.at_level(logging.INFO, logger="zelos_extension_opcua.client"):
+            client, _ = await discovered(sim, include=include, exclude=exclude)
+        await client.disconnect()
+    assert set(client.node_map.events) == set(events)
+    tags = {n.name for n in client.node_map.events["ModbusTCP/PowerMeter"]}
+    dropped = {t[0] for t in profiles.POWER_METER if t[0].startswith("Voltage_")}
+    expected = {t[0] for t in profiles.POWER_METER}
+    assert tags == (expected - dropped if events["ModbusTCP/PowerMeter"] else expected)
+    assert not [n for n in browsed if n.startswith("Genset.")]  # the device, nor its tags
+    [line] = [r.getMessage() for r in caplog.records if "Discovered" in r.getMessage()]
+    assert summary in line
 
 
 async def test_device_units_types_and_skip_summary(caplog):
@@ -216,7 +250,7 @@ async def test_undecodable_node_leaves_polling(monkeypatch):
     """Not re-read item by item every cycle: dropped until the next reconnect."""
     reads = []
 
-    async def fake_read_many(client, items, chunk):
+    async def fake_read_many(client, items, chunk, max_age=0.0):
         reads.append(len(items))
         return [ua.DataValue(StatusCode=ua.StatusCode(ua.StatusCodes.BadDecodingError))] + [
             ua.DataValue(ua.Variant(1.0)) for _ in items[1:]
@@ -227,7 +261,7 @@ async def test_undecodable_node_leaves_polling(monkeypatch):
     )
     client = OPCUAClient(node_map=node_map)
     client._client, client._connected = object(), True
-    client._poll_targets = [("e", n, type("N", (), {"nodeid": n.node_id})) for n in node_map.nodes]
+    client._poll_targets = [("e", n, n.node_id) for n in node_map.nodes]
     monkeypatch.setattr("zelos_extension_opcua.client.read_many", fake_read_many)
     await client._poll_nodes()
     await client._poll_nodes()
