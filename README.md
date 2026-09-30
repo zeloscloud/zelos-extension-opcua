@@ -41,8 +41,9 @@ uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: disco
 | `servers[].security_policy` | string | `default` | `default` (inherit), None, Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss |
 | `servers[].user_certificate_file` | string | `""` | User certificate; empty inherits the advanced pair |
 | `servers[].user_private_key_file` | string | `""` | Key for this server's user certificate |
-| `servers[].server_certificate` | string | `auto` | `auto` accepts the server's certificate; `strict` only `server_certificate_file` |
+| `servers[].server_certificate` | string | `trust_list` | `trust_list`: certificates in `pki/trusted/` (`auto`, the v0.1.1 value, means the same); `strict`: only `server_certificate_file` |
 | `servers[].server_certificate_file` | string | `""` | Pinned server certificate (DER/PEM) for `strict` |
+| `servers[].allow_expired_server_certificate` | boolean | `false` | Connect despite an expired (or not yet valid) server certificate, WARNING on every connect |
 | `advanced.prefix` | string | `OPC-UA` | Trace source every server publishes under; clear for one source per server |
 | `advanced.timeout` | number | `5.0` | Request timeout in seconds |
 | `advanced.log_level` | string | `INFO` | Logging verbosity; an unknown value falls back to INFO |
@@ -66,7 +67,7 @@ Startup errors: the pre-`servers[]` flat config; `username` / `password`, or cre
 
 1. Set `security_mode` / `security_policy` (per server or `advanced`). A server not offering that pair is refused with its offerings logged; never falls back to None. A server set to None under a secure default connects with a WARNING.
 2. On first connect a client certificate is generated in `$ZELOS_DATA_DIR/pki/` (`~/.zelos/opcua/pki/` for CLI runs); path, SHA-1 thumbprint and expiry are logged. **Trust it on the server.** Valid 2 years; WARNING from 30 days before expiry; an expired one is regenerated and must be trusted again.
-3. Optional: `server_certificate: strict` + `server_certificate_file` refuses any server certificate but the pinned one.
+3. **Trust the server's certificate here.** The trust list is `pki/trusted/` next to the client certificate. An unknown server certificate is saved to `pki/rejected/<SHA-1>.der` and refused: at start the extension stops with one ERROR naming it; once running, it retries. Trust it with the `trust_server_certificate` action (thumbprint, or empty when only one is rejected) or by moving the file into `trusted/`, then start again. A changed certificate is refused the same way. `list_server_certificates` shows both folders. `server_certificate: strict` + `server_certificate_file` pins one certificate instead. Either way the certificate must be within its validity period (`allow_expired_server_certificate` overrides, with a WARNING) and name the server's ApplicationUri; no chain or revocation check.
 4. Optional: X.509 user login with a certificate issued by the server admin. A server without a Certificate user token policy is refused; never falls back to Anonymous.
 
 ### Discovery
@@ -172,6 +173,8 @@ Names are sanitized at load (`. @ : ; =` and whitespace, and `/` in node names, 
 | `OPC-UA/browse_nodes` | Walk the address space from a starting node |
 | `OPC-UA/discovered_map` | The discovered nodes as node map json or csv text (`format`) |
 | `OPC-UA/auto_config` | Standalone: find servers for the config form (see Auto-configure) |
+| `OPC-UA/trust_server_certificate` | Standalone: move a rejected server certificate into `pki/trusted/` by `thumbprint` (empty: the only one rejected), or by `server` while running |
+| `OPC-UA/list_server_certificates` | Standalone: trusted and rejected server certificates (subject, ApplicationUri, thumbprint, validity) |
 
 Every action takes an optional `server`, required when several servers are configured. Write values are text: `true`/`false`/`1`/`0` for bools, a number for numeric nodes; unparseable input is rejected before sending. Actions use the live session (none while stopped) and raise on failure.
 

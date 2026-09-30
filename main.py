@@ -217,12 +217,18 @@ def demo_server(
 @click.option("--private-key-file", type=str, default="", help="Client private key (DER/PEM)")
 @click.option(
     "--server-certificate",
-    type=click.Choice(["auto", "strict"]),
-    default="auto",
-    help="auto accepts the server's certificate; strict requires --server-certificate-file",
+    type=click.Choice(["trust_list", "strict"]),
+    default="trust_list",
+    help="trust_list accepts certificates in ~/.zelos/opcua/pki/trusted; "
+    "strict only --server-certificate-file",
 )
 @click.option(
     "--server-certificate-file", type=str, default="", help="Pinned server certificate (DER/PEM)"
+)
+@click.option(
+    "--allow-expired-server-certificate",
+    is_flag=True,
+    help="Connect despite an expired server certificate, warning on every connect",
 )
 @click.option(
     "--user-certificate-file",
@@ -243,6 +249,7 @@ def trace(
     private_key_file: str,
     server_certificate: str,
     server_certificate_file: str,
+    allow_expired_server_certificate: bool,
     user_certificate_file: str,
     user_private_key_file: str,
 ) -> None:
@@ -273,6 +280,7 @@ def trace(
                     "user_private_key_file": user_private_key_file,
                     "server_certificate": server_certificate,
                     "server_certificate_file": server_certificate_file,
+                    "allow_expired_server_certificate": allow_expired_server_certificate,
                 }
             ],
             "advanced": {

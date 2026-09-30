@@ -137,12 +137,21 @@
           "server_certificate": {
             "type": "string",
             "title": "Server Certificate Policy",
-            "description": "How to treat the server's certificate. 'auto' accepts whatever certificate the server presents and logs its SHA-1 thumbprint, so a server that renews its certificate reconnects with no manual step. 'strict' accepts only the certificate in Server Certificate File: any other is reported and the connection refused.",
+            "description": "Which server certificates a Sign or SignAndEncrypt connection accepts. Trust list: those in the extension's pki/trusted folder; an unknown one is saved to pki/rejected and refused until you trust it (trust_server_certificate action, or move the file). Pinned file: only the certificate in Server Certificate File. Either way the certificate must be within its validity period and name the server's ApplicationUri.",
             "enum": [
-              "auto",
-              "strict"
+              "trust_list",
+              "strict",
+              "auto"
             ],
-            "default": "auto"
+            "ui:enumNames": [
+              "Trust list",
+              "Pinned file",
+              "Trust list (earlier name)"
+            ],
+            "ui:enumDisabled": [
+              "auto"
+            ],
+            "default": "trust_list"
           },
           "server_certificate_file": {
             "type": "string",
@@ -153,6 +162,12 @@
             "ui:options": {
               "accept": ".der,.pem,.crt,.cer"
             }
+          },
+          "allow_expired_server_certificate": {
+            "type": "boolean",
+            "title": "Allow Expired Server Certificate",
+            "description": "Connect even if the server's certificate has expired (or is not yet valid), with a warning on every connect. For a server whose certificate cannot be renewed yet.",
+            "default": false
           }
         },
         "required": [

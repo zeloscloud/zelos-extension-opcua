@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery types a vendor DataType deriving from a builtin integer as that integer (was float64): 64-bit values stay exact.
 - A server that cannot be reached or refuses the session at start (untrusted certificate, security not offered, user rejected) stops the extension with one ERROR naming it; once connected, drops are retried as before.
 - `get_status` reports `state` (`ok`, `connecting`, `disconnected`) and `last_error`.
+- Server certificates are checked against a trust list (`server_certificate: trust_list`, the new default; v0.1.1's `auto` means the same): an unknown or changed one is saved to `pki/rejected/` and refused with one ERROR saying how to trust it. `trust_server_certificate` and `list_server_certificates` standalone actions.
+- Every secure connect refuses a server certificate outside its validity period or not naming the server's ApplicationUri; `allow_expired_server_certificate` (per server) connects anyway with a WARNING.
 - `auto_config` checks the form's servers (unsaved edits, Advanced security included) and names each outcome: found, couldn't connect, no supported security; with none it looks on this machine as before.
 - Demo Mode toggle removed from the settings form; `main.py demo` / `just demo` remain.
 - Extension icon.
