@@ -359,24 +359,9 @@ def list_server_certificates() -> dict[str, Any]:
 @zelos_sdk.action.text(
     "thumbprint",
     title="Thumbprint",
-    required=False,
-    default="",
-    description="SHA-1 thumbprint from the error; empty when only one certificate was refused",
+    description="SHA-1 thumbprint from the error or List Server Certificates",
 )
-@zelos_sdk.action.text(
-    "server",
-    title="Server",
-    required=False,
-    default="",
-    description="Instead of a thumbprint: the server that refused it (while the extension runs)",
-)
-def trust_server_certificate(thumbprint: str = "", server: str = "") -> dict[str, Any]:
-    if server and not thumbprint:
-        if _runner is None:
-            raise ValueError("Server names work while the extension runs; set the thumbprint")
-        thumbprint = _get_client(server).rejected_thumbprint or ""
-        if not thumbprint:
-            raise ValueError(f"Server '{server}' has not refused a certificate")
+def trust_server_certificate(thumbprint: str = "") -> dict[str, Any]:
     path, der = _client.trust(_client.PKI_DIR, thumbprint)
     return {
         "message": f"Trusted {_client.certificate_name(der)}; saved to {path}",

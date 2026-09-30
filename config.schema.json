@@ -137,7 +137,7 @@
           "server_certificate": {
             "type": "string",
             "title": "Server Certificate Policy",
-            "description": "Which server certificates a Sign or SignAndEncrypt connection accepts. Trust list: those in the extension's pki/trusted folder; an unknown one is saved to pki/rejected and refused until you trust it (trust_server_certificate action, or move the file). Pinned file: only the certificate in Server Certificate File. Either way the certificate must be within its validity period and name the server's ApplicationUri.",
+            "description": "Which server certificates a Sign or SignAndEncrypt connection accepts. Trust list: those in the extension's pki/trusted folder; an unknown one is saved to pki/rejected and refused until you trust it (trust_server_certificate action with its thumbprint, or move the file). Pinned file: only the certificate in Server Certificate File. Either way the certificate must be within its validity period.",
             "enum": [
               "trust_list",
               "strict",
@@ -218,7 +218,7 @@
         "include": {
           "type": "array",
           "title": "Discovery Include",
-          "description": "Browse paths below Objects to trace, as globs over the BrowseNames sanitized as traced: `*` matches within one segment, `**` any number of segments (e.g. ModbusTCP/PowerMeter/**). Branches no pattern can reach are not browsed. Empty traces everything.",
+          "description": "Browse paths below Objects to trace, as globs over the BrowseNames sanitized as traced: `*` matches within one segment, `**` any number of segments (e.g. ModbusTCP/PowerMeter). A matching branch takes its subtree; branches no pattern can reach are not browsed. Empty traces everything.",
           "items": {
             "type": "string"
           },

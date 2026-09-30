@@ -65,15 +65,17 @@ async def test_gateway_discovery_and_health():
 
 
 @pytest.mark.parametrize(
-    ("include", "exclude", "events", "summary"),
+    ("include", "exclude", "voltages", "filtered"),
     [
-        (["ModbusTCP/PowerMeter/**"], [], {"ModbusTCP/PowerMeter": None}, "pruned "),
-        ([], ["**/Controller"], {"ModbusTCP/PowerMeter": None}, "pruned 1"),
-        (["ModbusTCP/**"], ["**/Voltage_*"], {"ModbusTCP/PowerMeter": 3}, "filtered 3"),
+        # A branch takes its subtree (Kepware's Add Branches). Filtered: Genset,
+        # asyncua's Aliases and Locations, and any Voltage_* tags.
+        (["ModbusTCP/PowerMeter"], [], True, 3),
+        ([], ["**/Controller"], True, 1),
+        (["ModbusTCP/**"], ["**/Voltage_*"], False, 6),
     ],
     ids=["include_one_device", "exclude_branch", "exclude_beats_include"],
 )
-async def test_discovery_filters(monkeypatch, caplog, include, exclude, events, summary):
+async def test_discovery_filters(monkeypatch, caplog, include, exclude, voltages, filtered):
     """Filters narrow the map; a branch no pattern leaves is never browsed."""
     browsed: list[str] = []
     browse = UaClient.browse
@@ -87,14 +89,30 @@ async def test_discovery_filters(monkeypatch, caplog, include, exclude, events, 
         with caplog.at_level(logging.INFO, logger="zelos_extension_opcua.client"):
             client, _ = await discovered(sim, include=include, exclude=exclude)
         await client.disconnect()
-    assert set(client.node_map.events) == set(events)
+    assert set(client.node_map.events) == {"ModbusTCP/PowerMeter"}
     tags = {n.name for n in client.node_map.events["ModbusTCP/PowerMeter"]}
-    dropped = {t[0] for t in profiles.POWER_METER if t[0].startswith("Voltage_")}
     expected = {t[0] for t in profiles.POWER_METER}
-    assert tags == (expected - dropped if events["ModbusTCP/PowerMeter"] else expected)
+    assert tags == (expected if voltages else {t for t in expected if "Voltage_" not in t})
     assert not [n for n in browsed if n.startswith("Genset.")]  # the device, nor its tags
     [line] = [r.getMessage() for r in caplog.records if "Discovered" in r.getMessage()]
-    assert summary in line
+    assert line.endswith(f"filtered {filtered}")
+
+
+async def test_filters_take_a_node_through_any_parent(caplog):
+    """A node under two parents is traced if either path passes; a filter that
+    leaves nothing is a WARNING."""
+    async with Simulator(port=0) as sim:
+        objects = sim.server.nodes.objects
+        machine = await objects.add_object(2, "M")
+        await machine.add_variable(2, "v", 1.0)
+        line = await objects.add_folder(2, "Line1")
+        await line.add_reference(machine.nodeid, ua.ObjectIds.Organizes)
+        for include, exclude in ((["Line1/**"], []), ([], ["M"]), (["Nope"], [])):
+            client, _ = await discovered(sim, include=include, exclude=exclude)
+            await client.disconnect()
+            nodes = {e: [n.name for n in ns] for e, ns in client.node_map.events.items()}
+            assert nodes.get("Line1/M") == (["v"] if include != ["Nope"] else None)
+    assert "Discovery include/exclude leave nothing to trace" in caplog.text
 
 
 async def test_device_units_types_and_skip_summary(caplog):
@@ -141,10 +159,11 @@ _VT = ua.VariantType
         (_ID.BaseDataType, (True, _VT.Boolean), "string"),  # value type may change
         (_ID.BaseDataType, (ua.LocalizedText("on"), _VT.LocalizedText), "string"),
         (_ID.Enumeration, (3, _VT.Int32), "float64"),  # other untyped: by kind
+        (_ID.BaseDataType, (1, _VT.Int32, ua.StatusCodes.UncertainLastUsableValue), "string"),
     ],
 )
 def test_field_datatype(dtype, sample, expected):
-    dv = ua.DataValue(ua.Variant(*sample)) if sample else None
+    dv = ua.DataValue(ua.Variant(*sample[:2]), ua.StatusCode(*sample[2:])) if sample else None
     assert field_datatype(ua.NodeId(dtype), dv) == (expected, "")
 
 
@@ -358,12 +377,15 @@ def test_vendor_ids(identifier, name, segments):
 
 
 async def test_auto_config_finds_local_servers(monkeypatch):
-    # Real well-known ports: auto_config probes nothing else on localhost.
     monkeypatch.setattr(autoconfig, "PROBE_TIMEOUT", 10.0)  # a loaded machine is slow
+    monkeypatch.setattr(autoconfig, "_mdns_urls", no_mdns)
     async with (
-        Simulator("gateway", port=4840),
-        Simulator("demo", port=48010, secure=True, secure_only=True),
+        Simulator("gateway", port=0) as gateway,
+        Simulator("demo", port=0, secure=True, secure_only=True) as secure,
     ):
+        ports = gateway.server.bserver.port, secure.server.bserver.port
+        monkeypatch.setattr(autoconfig, "WELL_KNOWN_PORTS", ports)
+        monkeypatch.setattr(autoconfig, "LDS_URL", f"opc.tcp://localhost:{ports[0]}")
         result = await asyncio.to_thread(actions.auto_config)
     assert result["status"] == "success"
     local = {
@@ -372,18 +394,22 @@ async def test_auto_config_finds_local_servers(monkeypatch):
         if s["endpoint"].startswith("opc.tcp://localhost:")
     }
     assert local == {
-        "opc.tcp://localhost:4840/freeopcua/server/": ("default", "default"),
-        "opc.tcp://localhost:48010/freeopcua/server/": ("SignAndEncrypt", "Basic256Sha256"),
+        f"opc.tcp://localhost:{ports[0]}/freeopcua/server/": ("default", "default"),
+        f"opc.tcp://localhost:{ports[1]}/freeopcua/server/": ("SignAndEncrypt", "Basic256Sha256"),
     }
     assert "trusted on the server" in result["message"]
     assert (
-        "at opc.tcp://localhost:4840/freeopcua/server/ (security default, added)"
+        f"at opc.tcp://localhost:{ports[0]}/freeopcua/server/ (security default, added)"
         in (result["message"])
     )
 
     schema = json.loads((Path(__file__).parents[1] / "config.schema.json").read_text())
     assert schema["ui:options"]["autoconfig"] == f"{ACTION_PREFIX}/auto_config"
     assert "auto_config" in get_standalone_actions()
+
+
+async def no_mdns() -> list[str]:
+    return []
 
 
 def closed_endpoint() -> str:
@@ -437,10 +463,6 @@ async def test_auto_config_empty_form_finds_nothing(monkeypatch):
     port = int(closed_endpoint().rsplit(":", 1)[1])
     monkeypatch.setattr(autoconfig, "WELL_KNOWN_PORTS", (port,))
     monkeypatch.setattr(autoconfig, "LDS_URL", f"opc.tcp://127.0.0.1:{port}")
-
-    async def no_mdns() -> list[str]:
-        return []
-
     monkeypatch.setattr(autoconfig, "_mdns_urls", no_mdns)
     result = await asyncio.to_thread(actions.auto_config, {"servers": []})
     assert result == {

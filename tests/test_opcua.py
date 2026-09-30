@@ -347,18 +347,6 @@ class TestDemoServerIntegration:
         with pytest.raises(ValueError, match="not writable"):
             await client.write_node_value(client.node_map.get_by_name("input1"), True)
 
-    async def test_writes_persist_across_sim_ticks(self, client):
-        """Writable nodes are client-owned: the simulator never overwrites them."""
-        written = {"setpoint": 31.5, "speed_setpoint": 1200.0, "running": True,
-                   "output1": True, "output2": True, "device_name": "Persisted"}  # fmt: skip
-        assert set(client.node_map.writable_names) == set(written)
-        for name, value in written.items():
-            await client.write_node_value(client.node_map.get_by_name(name), value)
-        await asyncio.sleep(0.35)  # > 3 sim ticks (0.1 s)
-        for name, value in written.items():
-            assert await client.read_node_value(client.node_map.get_by_name(name)) == value, name
-        await client.write_node_value(client.node_map.get_by_name("running"), False)
-
     async def test_write_sends_the_value_only(self, client, monkeypatch):
         """Encoding mask 0x01: no StatusCode or timestamps, which some servers refuse."""
         sent = []

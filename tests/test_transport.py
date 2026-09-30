@@ -13,6 +13,7 @@ import pytest
 import zelos_sdk
 from asyncua import ua
 from asyncua.client.ua_client import UaClient
+from asyncua.client.ua_session import UaSession
 from asyncua.ua.uaerrors import UaStructParsingError
 
 from zelos_extension_opcua import client as client_mod
@@ -89,6 +90,12 @@ async def wait_until(predicate, timeout: float) -> None:
     while not predicate():
         assert time.monotonic() < deadline, f"not met within {timeout}s"
         await asyncio.sleep(0.05)
+
+
+async def flowing(rows: Rows, *fields: str) -> None:
+    """Each field gets three more samples."""
+    seen = {f: len(rows.of(f)) for f in fields}
+    await wait_until(lambda: all(len(rows.of(f)) >= seen[f] + 3 for f in fields), 10.0)
 
 
 @pytest.fixture
@@ -209,15 +216,26 @@ async def test_static_node_is_refreshed_at_the_server_timestamp(reads):
 async def test_read_max_age_per_kind(monkeypatch):
     """Polled chunks accept a value one interval old, staleness refreshes one
     min_update_interval old; health and discovery read fresh."""
-    sent: list[tuple[float, set[ua.NodeId], set[int]]] = []  # MaxAge, nodes, attributes
-    read = UaClient.read
+    # MaxAge, nodes, attributes, during discovery
+    sent: list[tuple[float, set[ua.NodeId], set[int], bool]] = []
+    discovering = []
+    read, discover = UaClient.read, client_mod.discover
 
     async def spy(self, params):
         nodes = params.NodesToRead
-        sent.append((params.MaxAge, {r.NodeId for r in nodes}, {r.AttributeId for r in nodes}))
+        attributes = {r.AttributeId for r in nodes}
+        sent.append((params.MaxAge, {r.NodeId for r in nodes}, attributes, bool(discovering)))
         return await read(self, params)
 
+    async def discovery(*args):
+        discovering.append(True)
+        try:
+            return await discover(*args)
+        finally:
+            discovering.clear()
+
     monkeypatch.setattr(UaClient, "read", spy)
+    monkeypatch.setattr(client_mod, "discover", discovery)
     static = ua.NodeId("Static", 2)
     node_map = NodeMap.from_dict(
         {"events": {"e": [{"name": "static", "node_id": "ns=2;s=Static"}]}}
@@ -227,15 +245,17 @@ async def test_read_max_age_per_kind(monkeypatch):
             endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2, min_update_interval=0.5
         )
         async with running(subscribed):
-            await wait_until(lambda: any(static in n for a, n, _ in sent if a == 500), 10.0)
+            await wait_until(lambda: any(static in s[1] for s in sent if s[0] == 500), 10.0)
+    async with Simulator("device", port=0) as sim:  # Number and BaseDataType: Value reads
         discovered = OPCUAClient(endpoint=sim.endpoint, poll_interval=0.2, transport="poll")
         async with running(discovered):
-            await wait_until(lambda: any(static in n for a, n, _ in sent if a == 200), 10.0)
+            await wait_until(lambda: any(s[0] == 200 for s in sent), 10.0)
 
     health = ua.NodeId(ua.ObjectIds.Server_ServerStatus_State)
     value = {ua.AttributeIds.Value}
-    assert all(age == 0 for age, nodes, attrs in sent if health in nodes or attrs != value)
-    assert {age for age, _, _ in sent} == {0, 200, 500}
+    assert any(during and attrs == value for _, _, attrs, during in sent)
+    assert all(age == 0 for age, nodes, _, during in sent if during or health in nodes)
+    assert {s[0] for s in sent} == {0, 200, 500}
 
 
 async def test_poll_transport_never_subscribes():
@@ -322,24 +342,30 @@ async def test_shutdown_does_not_wait_out_a_hung_request(monkeypatch):
 
 async def drop_connections(sim: Simulator, client: OPCUAClient) -> None:
     """Reset every TCP connection, sessions left open as on a network loss; await the reconnect."""
-    old = client._client
+    old, polls = client._client, client._poll_count
     for transport in list(sim.server.iserver.asyncio_transports):
         transport.abort()
-    await wait_until(lambda: client._connected and client._client is not old, 20.0)
+    # A health Read on the new client: the reconnect is complete.
+    await wait_until(lambda: client._client is not old and client._poll_count > polls, 20.0)
 
 
-async def test_lost_connections_leave_no_session_behind():
-    """The s7 sim holds a lost connection's session, as a PLC does, and caps sessions at 4."""
+async def test_lost_connections_leave_no_session_behind(caplog):
+    """The s7 sim holds a lost connection's session, as a PLC does, and caps sessions at 4.
+    One WARNING per loss."""
+    caplog.set_level(logging.WARNING)
     async with Simulator("s7", port=0) as sim:
         client = OPCUAClient(endpoint=sim.endpoint, poll_interval=0.2)
         async with running(client):
-            await wait_until(lambda: client._connected, 10.0)
+            await wait_until(lambda: client._jobs, 10.0)
+            caplog.clear()
             for _ in range(4):  # unclosed, the fourth reconnect finds every slot held
                 await drop_connections(sim, client)
                 assert sim.held_sessions == 1
             (session,) = sim.server.iserver._external_sessions.values()
             assert session.session_timeout == SESSION_TIMEOUT_MS / 1000
     assert len(sim.sessions) == 1  # resumed every time
+    warnings = [r.getMessage() for r in caplog.records]
+    assert len(warnings) == 4 and all(" lost: " in w for w in warnings), warnings
 
 
 def gate(client: OPCUAClient) -> asyncio.Event:
@@ -362,9 +388,12 @@ def infos(caplog, text: str) -> list[str]:
     ]
 
 
-async def test_lost_connection_resumes_the_session_and_its_subscriptions(caplog):
+async def test_lost_connection_resumes_the_session_and_its_subscriptions(monkeypatch, caplog):
     """A 2 s outage: the session is re-activated, nothing re-created, a value
     written meanwhile is traced at its source timestamp."""
+    # Keep-alive lifetimes shorter than the outage: subscriptions last the session's.
+    monkeypatch.setattr(client_mod, "KEEPALIVE_SECONDS", 0.2)
+    monkeypatch.setattr(client_mod, "LIFETIME_KEEPALIVES", 3)
     caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
     node_map = NodeMap.from_file(get_demo_node_map_path())
     async with Simulator(port=0) as sim:
@@ -384,8 +413,7 @@ async def test_lost_connection_resumes_the_session_and_its_subscriptions(caplog)
             await asyncio.sleep(2.0)
             opened.set()
             await wait_until(lambda: (timestamp_ns(stamp), 42.5) in rows.of("setpoint"), 10.0)
-            seen = len(rows.of("temp_sensor1"))
-            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+            await flowing(rows, "temp_sensor1")
             assert sim.held_sessions == 1
     after = {svc for _, svc in sim.request_log[since:]}
     assert {"ActivateSession", "Republish"} <= after  # the response lost with the link
@@ -411,8 +439,7 @@ async def test_expired_session_falls_back_to_a_new_one(monkeypatch, caplog):
             await wait_until(lambda: not client._connected and not sim.held_sessions, 10.0)
             opened.set()
             await wait_until(lambda: client._connected, 10.0)
-            seen = len(rows.of("temp_sensor1"))
-            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+            await flowing(rows, "temp_sensor1")
             assert sim.held_sessions == 1
     assert infos(caplog, "not resumed") == [
         "[127_0_0_1] Previous session not resumed (BadSessionIdInvalid); creating a new one"
@@ -420,21 +447,65 @@ async def test_expired_session_falls_back_to_a_new_one(monkeypatch, caplog):
     assert len(sim.sessions) == 2
 
 
-async def test_restarted_server_gets_a_new_session(caplog):
+TWO_INTERVALS = {
+    "events": {
+        event: {"poll_interval": interval, "nodes": [{"name": name, "node_id": node_id}]}
+        for event, interval, name, node_id in (
+            ("fast", 0.2, "a", "ns=2;s=Temperature.Sensor1"),
+            ("slow", 0.5, "b", "ns=2;s=Pressure.Sensor1"),
+        )
+    }
+}
+
+
+async def test_setup_cut_by_a_lost_link_is_rebuilt_on_resume(monkeypatch, caplog):
+    """A new session's setup cut after its first subscription: resumed, it is rebuilt
+    whole rather than kept half-subscribed."""
     caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
-    node_map = NodeMap.from_file(get_demo_node_map_path())
+    real, creates = UaClient.create_subscription, []
+
+    async def create(self, params, callback):
+        creates.append(params)
+        if len(creates) == 4:  # the new session's second: the link dies
+            self.protocol.transport.abort()
+            await asyncio.sleep(0)
+        return await real(self, params, callback)
+
+    monkeypatch.setattr(UaClient, "create_subscription", create)
     async with Simulator(port=0) as sim:
-        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
-        port = sim.server.bserver.port
+        client = OPCUAClient(
+            endpoint=sim.endpoint, node_map=NodeMap.from_dict(TWO_INTERVALS), poll_interval=0.2
+        )
         async with running(client) as rows:
-            await wait_until(lambda: client._jobs, 10.0)
-            await sim.stop()
-            async with Simulator(port=port) as restarted:
-                await wait_until(lambda: restarted.held_sessions == 1, 15.0)
-                seen = len(rows.of("temp_sensor1"))
-                await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
-    assert len(infos(caplog, "Previous session not resumed (BadSessionIdInvalid)")) == 1
-    assert not infos(caplog, "session and subscriptions kept")
+            await wait_until(lambda: client._jobs and rows.of("b"), 10.0)
+            client._connected, client._fresh = False, True  # a deliberate reconnect
+            await wait_until(lambda: infos(caplog, "previous setup incomplete"), 20.0)
+            await flowing(rows, "a", "b")
+            assert client.status()["subscribed"] == 2
+
+
+async def test_recreate_cut_by_a_lost_link_is_rebuilt_on_resume(monkeypatch, caplog):
+    """The link lost between a recreate's delete and create: nothing is lost on resume."""
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
+    async with Simulator(port=0) as sim:
+        client = OPCUAClient(
+            endpoint=sim.endpoint, node_map=NodeMap.from_dict(TWO_INTERVALS), poll_interval=0.2
+        )
+        async with running(client) as rows:
+            await wait_until(lambda: client._jobs and rows.of("b"), 10.0)
+            delete = client._delete_subscriptions
+
+            async def cut(ua_client, ids):
+                client._delete_subscriptions = delete
+                await delete(ua_client, ids)
+                ua_client.uaclient.protocol.transport.abort()
+                await asyncio.sleep(0)
+
+            client._delete_subscriptions = cut
+            next(iter(client._subs.values())).stalled = "forced"
+            await wait_until(lambda: infos(caplog, "previous setup incomplete"), 20.0)
+            await flowing(rows, "a", "b")
+            assert client.status()["subscribed"] == len(client._subs) == 2
 
 
 async def test_bad_node_is_reported_again_on_a_new_connection(caplog):
@@ -466,18 +537,19 @@ async def test_revised_publishing_interval_is_honored(monkeypatch, caplog):
 
     monkeypatch.setattr(UaClient, "create_subscription", revise)
     caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
-    node_map = NodeMap.from_file(get_demo_node_map_path())
-    async with Simulator(port=0) as sim:
+    static = {"name": "static", "node_id": "ns=2;s=S", "writable": True}  # sim leaves it
+    node_map = NodeMap.from_dict({"events": {"e": [static]}})
+    async with Simulator(port=0, node_map=node_map) as sim:
         client = OPCUAClient(
             endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2, min_update_interval=1.0
         )
-        async with running(client):
-            await wait_until(lambda: client._jobs, 10.0)
-            assert client._stale_after == 2.0
-            subscriptions = len(client._subs)
-    revised = [r.getMessage() for r in caplog.records if "server revised" in r.getMessage()]
-    assert len(revised) == subscriptions >= 1  # one line per subscription
-    assert all(m.endswith(" -> 2000 ms") and "publishing" in m for m in revised)
+        async with running(client) as rows:
+            await wait_until(lambda: len(rows.of("static")) >= 3, 10.0)
+    (_, _), (second, _), (third, _) = rows.of("static")[:3]
+    # Re-read at the revised 2 s (+ one sweep step), not min_update_interval.
+    assert 2.0e9 <= third - second < 2.5e9 + 0.5e9
+    [revised] = [r.getMessage() for r in caplog.records if "server revised" in r.getMessage()]
+    assert revised.endswith("server revised publishing 200 -> 2000 ms")
 
 
 def test_revisions_report_sampling_and_queue_size():
@@ -488,12 +560,10 @@ def test_revisions_report_sampling_and_queue_size():
         ua.MonitoredItemCreateResult(good, RevisedSamplingInterval=250.0, RevisedQueueSize=5),
         ua.MonitoredItemCreateResult(refused, RevisedSamplingInterval=0.0),
     ]
-    subscription = ua.CreateSubscriptionResult(RevisedPublishingInterval=100.0)
-    assert revisions(100.0, subscription, items) == [
-        "sampling 100 ms -> 250 ms (2 items)",
-        "queue size 1 -> 5 (1 items)",
-    ]
-    assert revisions(100.0, subscription, items[:1]) == []
+    # Whole ms: a float round trip is no revision.
+    subscription = ua.CreateSubscriptionResult(RevisedPublishingInterval=100.00001)
+    assert revisions(100.0, subscription, items) == "sampling 100 -> 250 ms; queue size 1 -> 5"
+    assert revisions(100.0, subscription, items[:1]) == ""
 
 
 @pytest.mark.parametrize("transport", ["subscription", "poll"])
@@ -541,9 +611,21 @@ def subscription_warnings(caplog) -> list[str]:
     ]
 
 
-async def test_lost_notification_is_recovered_by_republish(caplog):
-    """A lost Publish response comes back via Republish at its own source timestamps."""
-    caplog.set_level(logging.WARNING, logger="zelos_extension_opcua.client")
+@pytest.mark.parametrize("cut", [False, True], ids=["live", "cut_by_a_lost_link"])
+async def test_lost_notification_is_recovered_by_republish(monkeypatch, caplog, cut):
+    """A lost Publish response comes back via Republish at its own source timestamps;
+    a Republish cut by a lost link is retried on the resumed session."""
+    real, republished = UaSession.republish, []
+
+    async def republish(self, subscription_id, seq):
+        republished.append(seq)
+        if cut and len(republished) == 1:
+            self._client.protocol.transport.abort()
+            await asyncio.sleep(0)
+        return await real(self, subscription_id, seq)
+
+    monkeypatch.setattr(UaSession, "republish", republish)
+    caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
     node_map = NodeMap.from_file(get_demo_node_map_path())
     async with Simulator(port=0) as sim:
         client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
@@ -551,11 +633,11 @@ async def test_lost_notification_is_recovered_by_republish(caplog):
             await wait_until(lambda: client._jobs, 10.0)
             subs = set(client._subs)
             sim.drop_notifications = 1
-            await wait_until(lambda: subscription_warnings(caplog), 10.0)
+            await wait_until(lambda: infos(caplog, "recovered by Republish"), 10.0)
             assert set(client._subs) == subs  # not recreated
     [lost] = sim.dropped
-    [warning] = subscription_warnings(caplog)
-    assert warning.endswith(f"notifications {lost.SequenceNumber} missed, recovered by Republish")
+    assert republished[: 1 + cut] == [lost.SequenceNumber] * (1 + cut)
+    assert not subscription_warnings(caplog)
     items = [i for n in lost.NotificationData for i in n.MonitoredItems]
     assert items
     for item in items:
@@ -575,21 +657,19 @@ async def test_subscription_deleted_by_the_server_is_recreated(monkeypatch, capl
             old = set(client._subs)
             deadline = max(s.deadline for s in client._subs.values())
             assert await sim.delete_subscriptions() == len(old)
-            deleted = time.monotonic()
+            # Found by the next watch tick past the deadline; recreated within a timeout.
             await wait_until(
-                lambda: len(client._subs) == len(old) and not old & set(client._subs), 10.0
+                lambda: len(client._subs) == len(old) and not old & set(client._subs),
+                deadline + client_mod.WATCH_SECONDS + client.timeout,
             )
-            latency = time.monotonic() - deleted
-            seen = len(rows.of("temp_sensor1"))
-            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
-    assert latency <= deadline + client_mod.WATCH_SECONDS + 0.5
+            await flowing(rows, "temp_sensor1")
     warnings = subscription_warnings(caplog)
     assert len(warnings) == len(old)
     assert all(w.endswith(f"no keep-alive in {deadline:g} s; recreating it") for w in warnings)
 
 
 async def test_unrecoverable_notification_recreates_the_subscription(caplog):
-    """Republish answering BadMessageNotAvailable falls back to recreating (one WARNING)."""
+    """A notification the server no longer holds is not asked for: recreated (one WARNING)."""
     caplog.set_level(logging.WARNING, logger="zelos_extension_opcua.client")
     node_map = NodeMap.from_file(get_demo_node_map_path())
     async with Simulator(port=0) as sim:
@@ -599,11 +679,10 @@ async def test_unrecoverable_notification_recreates_the_subscription(caplog):
             subs = set(client._subs)
             sim.retain_dropped, sim.drop_notifications = False, 1
             await wait_until(lambda: len(set(client._subs) - subs) == 1, 10.0)
-            seen = len(rows.of("temp_sensor1"))
-            await wait_until(lambda: len(rows.of("temp_sensor1")) >= seen + 3, 5.0)
+            await flowing(rows, "temp_sensor1")
     [lost] = sim.dropped
-    assert "Republish" in services(sim)
+    assert "Republish" not in services(sim)
     [warning] = subscription_warnings(caplog)
     assert warning.endswith(
-        f"notifications {lost.SequenceNumber} lost (BadMessageNotAvailable); recreating it"
+        f"notifications {lost.SequenceNumber} lost (not held by the server); recreating it"
     )

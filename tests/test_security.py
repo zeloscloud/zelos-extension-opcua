@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -220,12 +221,16 @@ async def test_server_trust_list(tmp_path, pki, caplog):
             f"Server '127_0_0_1' ({sim.endpoint}): cannot connect: server certificate "
             f"{name} is not trusted; "
             f"saved to {rejected}; move it into {pki / 'trusted'} or run the "
-            "trust_server_certificate action, then start the extension again"
+            f"trust_server_certificate action with thumbprint {thumbprint(der)}, then start "
+            "the extension again"
         ]
         listed = actions.list_server_certificates()
         assert [c["thumbprint"] for c in listed["rejected"]] == [thumbprint(der)]
 
-        result = actions.trust_server_certificate()  # the only one rejected
+        # Explicit selection, as Kepware and UaExpert: a missing one lists the candidates.
+        with pytest.raises(ValueError, match=f"Rejected: {re.escape(name)}$"):
+            actions.trust_server_certificate()
+        result = actions.trust_server_certificate(thumbprint(der).lower())
         assert result["thumbprint"] == thumbprint(der) and not rejected.exists()
         client = secure_client(sim)
         assert await client.connect() is True
@@ -241,28 +246,37 @@ async def test_server_trust_list(tmp_path, pki, caplog):
         assert len(sim.sessions) == 0
 
 
+MISMATCH = "names ApplicationUri urn:other, the server reports urn:plc"
+
+
 @pytest.mark.parametrize(
-    ("expired", "uri", "allow", "refusal"),
+    ("trusted", "expired", "uri", "allow", "logged"),
     [
-        (True, "urn:plc", False, "expired"),
-        (True, "urn:plc", True, None),
-        (False, "urn:other", False, "names ApplicationUri urn:other, the server reports urn:plc"),
+        (True, True, "urn:plc", False, "expired"),
+        (True, True, "urn:plc", True, "expired"),
+        # The exact certificate trusted: nothing a mismatch could add.
+        (True, False, "urn:other", False, MISMATCH),
+        # Untrusted: saved anyway, every problem named, one restart to fix.
+        (False, True, "urn:other", True, f"is not trusted; it {MISMATCH}; it expired"),
     ],
 )
-async def test_server_certificate_validation(tmp_path, pki, caplog, expired, uri, allow, refusal):
-    """Validity period and ApplicationUri, checked before any session; trust list or not."""
+async def test_server_certificate_checks(
+    tmp_path, pki, caplog, trusted, expired, uri, allow, logged
+):
+    """Trust first, then the validity period; checked before any session."""
     cert = server_cert(tmp_path / "server", uri, expired)
     async with Simulator(port=0, secure=True, certificate=cert, application_uri="urn:plc") as sim:
-        trust_sim(sim, pki)
+        der = trust_sim(sim, pki)
+        if not trusted:
+            shutil.rmtree(pki / "trusted")
         client = secure_client(sim, allow_expired_server_certificate=allow)
-        assert await client.connect() is (refusal is None)
+        connects = trusted and (allow or not expired)
+        assert await client.connect() is connects
         await client.disconnect()
-        assert len(sim.sessions) == (refusal is None)
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    if refusal:
-        assert any(refusal in e for e in errors(caplog))
-    else:
-        assert any("expired" in w and "connecting anyway" in w for w in warnings)
+        assert len(sim.sessions) == connects
+    level = logging.WARNING if connects else logging.ERROR
+    assert any(logged in r.getMessage() for r in caplog.records if r.levelno == level)
+    assert (pki / "rejected" / f"{thumbprint(der)}.der").is_file() is not trusted
 
 
 SECURE = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}

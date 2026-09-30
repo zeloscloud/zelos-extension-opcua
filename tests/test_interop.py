@@ -66,7 +66,8 @@ def opcplc(tmp_path_factory):
                 assert time.monotonic() < deadline, "OPC PLC did not come up within 60s"
                 time.sleep(1)
             assert not asyncio.run(OPCUAClient(endpoint=ENDPOINT, **SECURE).connect())
-            actions.trust_server_certificate()
+            [refused] = actions.list_server_certificates()["rejected"]
+            actions.trust_server_certificate(refused["thumbprint"])
             yield identity
     finally:
         subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)

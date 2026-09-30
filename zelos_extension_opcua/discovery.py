@@ -156,13 +156,14 @@ async def operation_limits(client: Client) -> tuple[int, int, int]:
     return browse, read, monitor
 
 
-def _good(dv: ua.DataValue) -> bool:
-    return dv.StatusCode is None or dv.StatusCode.is_good()
+def _usable(dv: ua.DataValue) -> bool:
+    """Good or Uncertain: Part 8 usable, traced as such."""
+    return dv.StatusCode is None or not dv.StatusCode.is_bad()
 
 
 def value_of(dv: ua.DataValue) -> Any:
-    """A Good DataValue's value, else None."""
-    return dv.Value.Value if dv.Value and _good(dv) else None
+    """A usable DataValue's value, else None."""
+    return dv.Value.Value if dv.Value and _usable(dv) else None
 
 
 async def read_many(
@@ -226,8 +227,9 @@ class PathFilter:
     each BrowseName sanitized as traced (`ModbusTCP/PowerMeter/Voltage_L1`).
 
     `*`, `?`, `[...]` match within one segment (fnmatch, case-sensitive); `**`
-    any number of segments. Empty include = everything. A node matching an
-    exclude is dropped with everything below it; exclude wins over include.
+    any number of segments. Empty include = everything; a branch matching one
+    takes its whole subtree (Kepware's Add Branches). A node matching an exclude
+    is dropped with everything below it; exclude wins over include.
     """
 
     include: tuple[tuple[str, ...], ...] = ()
@@ -253,7 +255,10 @@ class PathFilter:
         return any(_match(p, path) for p in self.exclude)
 
     def included(self, path: tuple[str, ...]) -> bool:
-        return not self.include or any(_match(p, path) for p in self.include)
+        """It, or a branch above it, matches an include."""
+        return not self.include or any(
+            _match(p, path[:n]) for p in self.include for n in range(1, len(path) + 1)
+        )
 
     def reachable(self, path: tuple[str, ...]) -> bool:
         """Worth browsing below: an include can still match there."""
@@ -393,24 +398,26 @@ async def _browse_batch(
 
 async def walk(
     rpc: _Counter, chunk: int, filters: PathFilter = PathFilter()
-) -> tuple[list[Found], list[str], Counter[str]]:
+) -> tuple[list[Found], list[str], int]:
     """Breadth-first from Objects over forward hierarchical references.
 
     Not followed: Server (i=2253), Objects named `_*` (Kepware's _System etc.),
     HasProperty (EngineeringUnits / EURange are recorded), and what `filters`
-    rules out (pruned: nothing below is browsed). Variables are browsed too:
-    struct members hang off them.
+    rules out (nothing below is browsed). Variables are browsed too: struct
+    members hang off them. A node filtered out on one path is still taken on
+    another (several parents).
 
     Returns:
         (Variables found, `path (status)` of each node whose browse failed,
-        filter counts: `filtered` variables, `pruned` branches)
+        nodes filtered out on every path)
     """
     objects = NodeId(_IDS.ObjectsFolder)
     visited = {objects, NodeId(_IDS.Server)}
     frontier: list[tuple[NodeId, tuple[str, ...], Found | None]] = [(objects, (), None)]
     found: list[Found] = []
     failed: list[str] = []
-    counts: Counter[str] = Counter()
+    filtered: set[NodeId] = set()
+    kept: set[NodeId] = set()
     while frontier:
         next_frontier: list[tuple[NodeId, tuple[str, ...], Found | None]] = []
         for start in range(0, len(frontier), chunk):
@@ -436,25 +443,23 @@ async def walk(
                     is_var = ref.NodeClass == ua.NodeClass.Variable
                     if not is_var and (ref.NodeClass != ua.NodeClass.Object or name[:1] == "_"):
                         continue
-                    visited.add(node_id)
                     browse, trace = True, True
                     if filters:
                         traced = tuple(sanitize_name(p, kind="field") for p in (*path, name))
-                        if filters.excluded(traced):
-                            browse = trace = False
-                        else:
-                            browse, trace = filters.reachable(traced), filters.included(traced)
-                        if is_var and not trace:
-                            counts["filtered"] += 1
-                        elif not browse:
-                            counts["pruned"] += 1
+                        excluded = filters.excluded(traced)
+                        trace = not excluded and filters.included(traced)
+                        browse = trace or (not excluded and filters.reachable(traced))
+                        (kept if (trace if is_var else browse) else filtered).add(node_id)
+                        if not browse:
+                            continue  # not visited: another parent may take it
+                    visited.add(node_id)
                     var = Found(node_id, name, path) if is_var else None
                     if var and trace:
                         found.append(var)
                     if browse:
                         next_frontier.append((node_id, (*path, name), var))
         frontier = next_frontier
-    return found, failed, counts
+    return found, failed, len(filtered - kept)
 
 
 def _local(node_id: Any) -> NodeId:
@@ -593,7 +598,7 @@ def field_datatype(
         return declared, ""
     if dv.StatusCode is not None and dv.StatusCode.value == _BAD_DECODING:
         return None, "undecodable"
-    variant = dv.Value if _good(dv) else None
+    variant = dv.Value if _usable(dv) else None
     if variant is None or variant.Value is None:
         return None, "no value"
     if isinstance(variant.Value, list):
@@ -700,9 +705,10 @@ async def discover(
     """Walk, describe and name the server's Variables; `name` names the map."""
     started = time.monotonic()
     rpc = _Counter(client)
-    found, browse_failed, counts = await walk(rpc, browse_chunk, filters)
+    found, browse_failed, filtered = await walk(rpc, browse_chunk, filters)
     described, skipped, variant = await describe(rpc, found, read_chunk, browse_chunk)
-    skipped.update(counts)
+    if filtered:
+        skipped["filtered"] = filtered
     events, renames = assign_names(described, namespaces, max_event_bytes)
     return Discovery(
         node_map=NodeMap(events=events, name=name, description="discovered"),
