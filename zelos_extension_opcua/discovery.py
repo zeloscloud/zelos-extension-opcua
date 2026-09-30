@@ -14,6 +14,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import Any
 
 from asyncua import Client, ua
@@ -165,9 +166,12 @@ def value_of(dv: ua.DataValue) -> Any:
 
 
 async def read_many(
-    client: Client, items: Sequence[tuple[NodeId, int | None]], chunk: int
+    client: Client, items: Sequence[tuple[NodeId, int | None]], chunk: int, max_age: float = 0.0
 ) -> list[ua.DataValue]:
     """Read (node, attribute) pairs, `chunk` per request; attribute None = Value.
+
+    max_age: ms; 0 asks the device for fresh values, more lets the server
+    answer from a cache that recent.
 
     asyncua fails a whole response on one value it cannot decode (a 2-D Variant
     array, some nested Variants); that chunk is re-read item by item and the
@@ -177,25 +181,83 @@ async def read_many(
     for start in range(0, len(items), chunk):
         batch = items[start : start + chunk]
         try:
-            out.extend(await _read(client, batch))
+            out.extend(await _read(client, batch, max_age))
         except _DECODE_ERRORS:
             for item in batch:
                 try:
-                    out.extend(await _read(client, [item]))
+                    out.extend(await _read(client, [item], max_age))
                 except _DECODE_ERRORS:
                     out.append(ua.DataValue(StatusCode=ua.StatusCode(_BAD_DECODING)))
     return out
 
 
-async def _read(client: Client, items: Sequence[tuple[NodeId, int | None]]) -> list[ua.DataValue]:
+async def _read(
+    client: Client, items: Sequence[tuple[NodeId, int | None]], max_age: float = 0.0
+) -> list[ua.DataValue]:
     # Default is Source only; the refresh sweep logs at ServerTimestamp.
-    params = ua.ReadParameters(TimestampsToReturn=ua.TimestampsToReturn.Both)
+    params = ua.ReadParameters(MaxAge=max_age, TimestampsToReturn=ua.TimestampsToReturn.Both)
     for node_id, attribute in items:
         rv = ua.ReadValueId()
         rv.NodeId = node_id
         rv.AttributeId = ua.AttributeIds.Value if attribute is None else attribute
         params.NodesToRead.append(rv)
     return await client.uaclient.read(params)
+
+
+def _match(pattern: tuple[str, ...], path: tuple[str, ...]) -> bool:
+    """`path` matches `pattern` whole: `**` any number of segments, else fnmatch per segment."""
+    if not pattern:
+        return not path
+    if pattern[0] == "**":
+        return any(_match(pattern[1:], path[i:]) for i in range(len(path) + 1))
+    return bool(path) and fnmatchcase(path[0], pattern[0]) and _match(pattern[1:], path[1:])
+
+
+def _below(pattern: tuple[str, ...], path: tuple[str, ...]) -> bool:
+    """Some path at or below `path` can match `pattern`."""
+    if not path or pattern[:1] == ("**",):
+        return True
+    return bool(pattern) and fnmatchcase(path[0], pattern[0]) and _below(pattern[1:], path[1:])
+
+
+@dataclass(frozen=True)
+class PathFilter:
+    """Discovery include / exclude globs over a node's browse path below Objects,
+    each BrowseName sanitized as traced (`ModbusTCP/PowerMeter/Voltage_L1`).
+
+    `*`, `?`, `[...]` match within one segment (fnmatch, case-sensitive); `**`
+    any number of segments. Empty include = everything. A node matching an
+    exclude is dropped with everything below it; exclude wins over include.
+    """
+
+    include: tuple[tuple[str, ...], ...] = ()
+    exclude: tuple[tuple[str, ...], ...] = ()
+
+    @classmethod
+    def parse(cls, include: Sequence[str] = (), exclude: Sequence[str] = ()) -> PathFilter:
+        """Raises ValueError on an empty pattern or segment."""
+
+        def split(patterns: Sequence[str]) -> tuple[tuple[str, ...], ...]:
+            out = tuple(tuple(p.strip().strip("/").split("/")) for p in patterns)
+            for pattern, raw in zip(out, patterns, strict=True):
+                if not all(pattern):
+                    raise ValueError(f"invalid discovery pattern '{raw}'")
+            return out
+
+        return cls(split(include), split(exclude))
+
+    def __bool__(self) -> bool:
+        return bool(self.include or self.exclude)
+
+    def excluded(self, path: tuple[str, ...]) -> bool:
+        return any(_match(p, path) for p in self.exclude)
+
+    def included(self, path: tuple[str, ...]) -> bool:
+        return not self.include or any(_match(p, path) for p in self.include)
+
+    def reachable(self, path: tuple[str, ...]) -> bool:
+        """Worth browsing below: an include can still match there."""
+        return not self.include or any(_below(p, path) for p in self.include)
 
 
 @dataclass
@@ -329,21 +391,26 @@ async def _browse_batch(
     return refs, failed
 
 
-async def walk(rpc: _Counter, chunk: int) -> tuple[list[Found], list[str]]:
+async def walk(
+    rpc: _Counter, chunk: int, filters: PathFilter = PathFilter()
+) -> tuple[list[Found], list[str], Counter[str]]:
     """Breadth-first from Objects over forward hierarchical references.
 
     Not followed: Server (i=2253), Objects named `_*` (Kepware's _System etc.),
-    HasProperty (EngineeringUnits / EURange are recorded). Variables are browsed
-    too: struct members hang off them.
+    HasProperty (EngineeringUnits / EURange are recorded), and what `filters`
+    rules out (pruned: nothing below is browsed). Variables are browsed too:
+    struct members hang off them.
 
     Returns:
-        (Variables found, `path (status)` of each node whose browse failed)
+        (Variables found, `path (status)` of each node whose browse failed,
+        filter counts: `filtered` variables, `pruned` branches)
     """
     objects = NodeId(_IDS.ObjectsFolder)
     visited = {objects, NodeId(_IDS.Server)}
     frontier: list[tuple[NodeId, tuple[str, ...], Found | None]] = [(objects, (), None)]
     found: list[Found] = []
     failed: list[str] = []
+    counts: Counter[str] = Counter()
     while frontier:
         next_frontier: list[tuple[NodeId, tuple[str, ...], Found | None]] = []
         for start in range(0, len(frontier), chunk):
@@ -366,18 +433,28 @@ async def walk(rpc: _Counter, chunk: int) -> tuple[list[Found], list[str]]:
                     node_id = _local(ref.NodeId)
                     if node_id in visited:
                         continue
-                    if ref.NodeClass == ua.NodeClass.Object:
-                        if name.startswith("_"):
-                            continue
-                        visited.add(node_id)
-                        next_frontier.append((node_id, (*path, name), None))
-                    elif ref.NodeClass == ua.NodeClass.Variable:
-                        visited.add(node_id)
-                        var = Found(node_id, name, path)
+                    is_var = ref.NodeClass == ua.NodeClass.Variable
+                    if not is_var and (ref.NodeClass != ua.NodeClass.Object or name[:1] == "_"):
+                        continue
+                    visited.add(node_id)
+                    browse, trace = True, True
+                    if filters:
+                        traced = tuple(sanitize_name(p, kind="field") for p in (*path, name))
+                        if filters.excluded(traced):
+                            browse = trace = False
+                        else:
+                            browse, trace = filters.reachable(traced), filters.included(traced)
+                        if is_var and not trace:
+                            counts["filtered"] += 1
+                        elif not browse:
+                            counts["pruned"] += 1
+                    var = Found(node_id, name, path) if is_var else None
+                    if var and trace:
                         found.append(var)
+                    if browse:
                         next_frontier.append((node_id, (*path, name), var))
         frontier = next_frontier
-    return found, failed
+    return found, failed, counts
 
 
 def _local(node_id: Any) -> NodeId:
@@ -618,12 +695,14 @@ async def discover(
     read_chunk: int,
     name: str,
     max_event_bytes: int = TRACE_NAME_BYTES,
+    filters: PathFilter = PathFilter(),
 ) -> Discovery:
     """Walk, describe and name the server's Variables; `name` names the map."""
     started = time.monotonic()
     rpc = _Counter(client)
-    found, browse_failed = await walk(rpc, browse_chunk)
+    found, browse_failed, counts = await walk(rpc, browse_chunk, filters)
     described, skipped, variant = await describe(rpc, found, read_chunk, browse_chunk)
+    skipped.update(counts)
     events, renames = assign_names(described, namespaces, max_event_bytes)
     return Discovery(
         node_map=NodeMap(events=events, name=name, description="discovered"),

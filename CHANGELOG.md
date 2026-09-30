@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - X.509 user identity (`user_certificate_file` / `user_private_key_file`) on Sign / SignAndEncrypt; a server without a Certificate user token policy is refused.
 - Reconnect with capped exponential backoff (3s doubling to 60s, reset on a completed request); connection loss detected from asyncua status codes, not message text.
 - Names are sanitized (`. @ : ; = /` and whitespace become `_`); duplicates after sanitization are a load error.
+- A lost connection resumes its session on the new channel (ActivateSession) and keeps its subscriptions; missed notifications are recovered by Republish. A session the server no longer holds (timed out, server restarted) is replaced, with one INFO saying why. Discovery still re-browses; subscriptions are rebuilt only if the discovered nodes changed.
 - Subscription recovery on a live connection: a missed notification (sequence-number gap) is fetched by Republish; a missed keep-alive, an unrecoverable gap or a server-ended subscription recreates that subscription and re-reads its items. One WARNING per event.
+- Read MaxAge: polled nodes accept a value up to one poll interval old, staleness re-reads up to `min_update_interval`; health and discovery reads stay fresh (0).
+- Discovery `include` / `exclude` globs (`advanced`, per-server override) over the browse path (`*` one segment, `**` any depth); exclude wins; branches no pattern can reach are not browsed; filtered and pruned counts in the discovery INFO line.
 - `get_status` reports transport and subscribed / polled counts.
 - `demo-server` / `just sim`: simulator with `gateway`, `s7` (enforced limits and session caps) and `device` profiles, `--secure`, `--secure-only`, trust lists, `--shuffle-namespaces`, `--map`, `--nodes N`, request log.
 

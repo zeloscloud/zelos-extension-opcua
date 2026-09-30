@@ -372,7 +372,7 @@ class TestDemoServerIntegration:
         await client.write_node_value(client.node_map.get_by_name("setpoint"), 31.0)
         (dv,) = [w.Value for w in sent]
         assert to_binary(ua.DataValue, dv)[0] == 0x01
-        node = client._ua_nodes["ns=2;s=Temperature.Setpoint"]
+        node = await client._ua_node("ns=2;s=Temperature.Setpoint")
         assert dv.Value.VariantType == (await node.read_data_value()).Value.VariantType
 
     async def test_poll_is_one_read_per_chunk(self, client, monkeypatch):
@@ -403,9 +403,7 @@ class TestNamespaceUriIds:
         )
         assert await nsu_client.connect() is True
         try:
-            assert [t[2].nodeid for t in nsu_client._poll_targets] == [
-                t[2].nodeid for t in client._poll_targets
-            ]
+            assert [t[2] for t in nsu_client._poll_targets] == [t[2] for t in client._poll_targets]
             ns_values, nsu_values = await client._poll_nodes(), await nsu_client._poll_nodes()
             assert {e: set(v) for e, v in nsu_values.items()} == {
                 e: set(v) for e, v in ns_values.items()

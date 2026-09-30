@@ -71,6 +71,24 @@
             "minimum": 1.0,
             "maximum": 3600
           },
+          "include": {
+            "type": "array",
+            "title": "Discovery Include",
+            "description": "Without a node map: browse paths to trace, as globs (`*` one segment, `**` any depth), e.g. ModbusTCP/PowerMeter/**. Branches no pattern can reach are not browsed. Empty uses Advanced > Discovery Include.",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "exclude": {
+            "type": "array",
+            "title": "Discovery Exclude",
+            "description": "Without a node map: browse paths not traced nor browsed below, as globs, e.g. **/Diagnostics. Wins over include. Empty uses Advanced > Discovery Exclude.",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
           "security_mode": {
             "type": "string",
             "title": "Security Mode",
@@ -181,6 +199,24 @@
           "title": "Discovery",
           "description": "For a server without a node map, browse it on every connect and trace every scalar variable found (read-only). Off: such a server polls nothing.",
           "default": true
+        },
+        "include": {
+          "type": "array",
+          "title": "Discovery Include",
+          "description": "Browse paths below Objects to trace, as globs over the BrowseNames sanitized as traced: `*` matches within one segment, `**` any number of segments (e.g. ModbusTCP/PowerMeter/**). Branches no pattern can reach are not browsed. Empty traces everything.",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "exclude": {
+          "type": "array",
+          "title": "Discovery Exclude",
+          "description": "Browse paths not traced, nor browsed below, as globs (e.g. **/Diagnostics). Wins over include.",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         },
         "transport": {
           "type": "string",

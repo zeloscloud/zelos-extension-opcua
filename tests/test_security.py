@@ -177,9 +177,9 @@ def resolve(config: dict) -> list[OPCUAClient]:
 @pytest.mark.parametrize(
     ("advanced", "server", "reason"),
     [
-        ({}, {"security_mode": "Sign", "security_policy": "None"}, "'plc': invalid security"),
+        ({}, {"security_mode": "Sign", "security_policy": "None"}, "'plc': invalid configuration"),
         ({"certificate_file": "c.der"}, {}, "set together"),
-        ({}, {"server_certificate": "strict"}, "'plc': invalid security configuration: server"),
+        ({}, {"server_certificate": "strict"}, "'plc': invalid configuration: server"),
         (
             {},
             {
@@ -219,7 +219,7 @@ def test_inherited_user_cert_on_downgraded_server_exits(tmp_path, caplog):
     with pytest.raises(SystemExit):
         resolve(config)
     assert errors(caplog) == [
-        "Server 'plc': invalid security configuration: "
+        "Server 'plc': invalid configuration: "
         "a user certificate needs security_mode Sign or SignAndEncrypt"
     ]
 

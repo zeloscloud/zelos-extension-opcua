@@ -49,6 +49,8 @@ ADVANCED_DEFAULTS: dict[str, Any] = {
     "discovery": True,
     "transport": "subscription",
     "min_update_interval": 60.0,
+    "include": [],
+    "exclude": [],
 }
 
 #: Defaults of one `servers[]` entry. "default" / "" inherit from `advanced`.
@@ -65,6 +67,8 @@ SERVER_DEFAULTS: dict[str, Any] = {
     "server_certificate_file": "",
     "transport": "default",
     "min_update_interval": None,
+    "include": [],
+    "exclude": [],
 }
 
 # `demo`: the removed Demo Mode toggle, still in older saved configs; ignored.
@@ -104,13 +108,20 @@ def trace_name(value: str) -> str:
 
 
 def _inherit(server: dict[str, Any], advanced: dict[str, Any]) -> dict[str, Any]:
-    """A server's effective settings: its own, else ("default" / "" / None) the advanced one.
+    """A server's effective settings: its own, else ("default" / "" / None / []) the advanced one.
 
     The user cert and key inherit as a pair: a mix would fail as a key mismatch.
     """
     effective = {
-        k: advanced[k] if server[k] in ("", "default", None) else server[k]
-        for k in ("security_mode", "security_policy", "transport", "min_update_interval")
+        k: advanced[k] if server[k] in ("", "default", None, []) else server[k]
+        for k in (
+            "security_mode",
+            "security_policy",
+            "transport",
+            "min_update_interval",
+            "include",
+            "exclude",
+        )
     }
     user = ("user_certificate_file", "user_private_key_file")
     source = advanced if not any(server[k] for k in user) else server
@@ -183,6 +194,8 @@ def demo_server_kwargs(advanced: dict[str, Any]) -> dict[str, Any]:
         **{k: advanced[k] for k in _SHARED},
         "transport": advanced["transport"],
         "min_update_interval": advanced["min_update_interval"],
+        "include": advanced["include"],
+        "exclude": advanced["exclude"],
         "name": "demo",
         "endpoint": f"opc.tcp://{DEMO_HOST}:{DEMO_PORT}/freeopcua/server/",
         "node_map_file": str(get_demo_node_map_path()),
@@ -199,7 +212,7 @@ def build_clients(servers: list[dict[str, Any]]) -> list[OPCUAClient]:
         try:
             clients.append(OPCUAClient(node_map=node_map, **kwargs))
         except ValueError as e:
-            logger.error("Server '%s': invalid security configuration: %s", name, e)
+            logger.error("Server '%s': invalid configuration: %s", name, e)
             sys.exit(1)
     return clients
 

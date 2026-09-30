@@ -43,6 +43,7 @@ from zelos_extension_opcua.discovery import (
     MAX_OPERATIONS,
     TRACE_NAME_BYTES,
     VARIANT_DATATYPES,
+    PathFilter,
     discover,
     operation_limits,
     read_many,
@@ -124,6 +125,15 @@ CONNECTION_STATUS_CODES = frozenset(
 # BadShutdown). Anything else, e.g. BadTimeout (lifetime expired), ends only that
 # subscription.
 LINK_LOST_CODES = CONNECTION_STATUS_CODES - {ua.StatusCodes.BadTimeout}
+# ActivateSession on a new channel: the server no longer holds the session
+# (timed out, closed, restarted). Other connection errors are the channel's.
+SESSION_GONE_CODES = frozenset(
+    (
+        ua.StatusCodes.BadSessionIdInvalid,
+        ua.StatusCodes.BadSessionClosed,
+        ua.StatusCodes.BadSessionNotActivated,
+    )
+)
 
 SDK_DATATYPES = {
     "bool": zelos_sdk.DataType.Boolean,
@@ -222,12 +232,13 @@ USER_REJECTED_CODES = frozenset(
 
 
 @dataclass
-class _Orphan:
-    """A session whose CloseSession could not be sent: what re-activating it takes."""
+class _Detached:
+    """A session whose channel is gone: what re-activating it on the next channel takes."""
 
     token: NodeId
     nonce: bytes | None
     policies: list[ua.UserTokenPolicy]
+    keep: bool  # resume it with its subscriptions; else close it before CreateSession
 
 
 class ConnectionSecurityError(Exception):
@@ -622,8 +633,8 @@ def _field(node: Node) -> tuple[str, zelos_sdk.DataType, str]:
     return node.name, SDK_DATATYPES.get(node.datatype, zelos_sdk.DataType.Float64), node.unit
 
 
-# (event name, node definition, asyncua node)
-Target = tuple[str, Node, UaNode]
+# (event, node, resolved id): no asyncua Node, which is bound to one connection's client.
+Target = tuple[str, Node, NodeId]
 
 
 @dataclass
@@ -673,6 +684,8 @@ class OPCUAClient:
         discovery: bool = True,
         transport: str = "subscription",
         min_update_interval: float = 60.0,
+        include: Sequence[str] = (),
+        exclude: Sequence[str] = (),
     ) -> None:
         """
         Args:
@@ -696,9 +709,12 @@ class OPCUAClient:
             transport: subscription (monitored items, polling what the server
                 refuses) or poll
             min_update_interval: A subscribed item silent this long is re-read
+            include: Discovery: browse path globs to trace; empty traces everything
+            exclude: Discovery: browse path globs not traced or browsed below; win
+                over include
 
         Raises:
-            ValueError: If the security or transport settings are invalid
+            ValueError: If the security, transport or filter settings are invalid
         """
         if transport not in TRANSPORTS:
             raise ValueError(f"transport must be one of {', '.join(TRANSPORTS)}, got '{transport}'")
@@ -724,6 +740,7 @@ class OPCUAClient:
         self.node_map = node_map
         # Replaces node_map on every connect; never written to disk.
         self.discovery = discovery and node_map is None
+        self.filters = PathFilter.parse(include, exclude)
         self.poll_interval = poll_interval
         self.transport = transport
         self.min_update_interval = min_update_interval
@@ -741,8 +758,11 @@ class OPCUAClient:
         self._server_thumbprint: str | None = None
 
         self._client: Client | None = None
-        # The last session, if its channel died before CloseSession (see _close_orphan).
-        self._orphan: _Orphan | None = None
+        # The last session, if its channel is gone (see _detach, _resume_on_open);
+        # whether the connect resumed it; whether the next connect must not.
+        self._detached: _Detached | None = None
+        self._resumed = False
+        self._fresh = False
         # The runner's, bound in _run_async.
         self._stop_event: asyncio.Event | None = None
         self._running = False
@@ -760,8 +780,8 @@ class OPCUAClient:
         # Resolved once per connection, in map order, plus a by-ID index for the
         # read/write actions.
         self._poll_targets: list[Target] = []
-        # Health fields still read this connection: (field, asyncua node).
-        self._health_targets: list[tuple[str, UaNode]] = []
+        # Health fields still read this connection: (field, node id).
+        self._health_targets: list[tuple[str, NodeId]] = []
         # Per connection: targets by interval; client handle -> subscribed
         # target; handles in last-update order, oldest first (see _sweep); live
         # subscriptions by id; Republished sequence numbers to acknowledge; polled
@@ -787,7 +807,7 @@ class OPCUAClient:
         self._polled_variant = 0
         # Nodes per Browse / Read / CreateMonitoredItems request, from OperationLimits.
         self._browse_chunk = self._read_chunk = self._monitor_chunk = MAX_OPERATIONS
-        self._ua_nodes: dict[str, UaNode] = {}
+        self._ua_nodes: dict[str, NodeId] = {}
         # Server NamespaceArray, read lazily once per connection: indexes are only
         # stable within a session, so nsu= IDs re-resolve after every reconnect.
         self._namespaces: list[str] | None = None
@@ -823,8 +843,8 @@ class OPCUAClient:
         client.session_timeout = SESSION_TIMEOUT_MS
         if self.security_mode != "None":
             await self._apply_security(client)
-        if self._orphan:
-            self._close_orphan_on_open(client)
+        if self._detached:
+            self._resume_on_open(client)
 
         if self.user_certificate_file:
             # asyncua's `load_client_certificate` is the USER identity; the app cert
@@ -1041,6 +1061,7 @@ class OPCUAClient:
             self._read_chunk,
             self.name,
             TRACE_NAME_BYTES - len(self._event_prefix.encode()),
+            self.filters,
         )
         added, changed = self._declare_events(result.node_map)
         self.node_map = result.node_map
@@ -1092,9 +1113,9 @@ class OPCUAClient:
                 if isinstance(ns, str) and ns not in namespaces:
                     missing.setdefault(ns, []).append(node.name)
                     continue
-                ua_node = self._client.get_node(parse_node_id_to_ua(node.node_id, namespaces))
-                self._poll_targets.append((event_name, node, ua_node))
-                self._ua_nodes[node.node_id] = ua_node
+                node_id = parse_node_id_to_ua(node.node_id, namespaces)
+                self._poll_targets.append((event_name, node, node_id))
+                self._ua_nodes[node.node_id] = node_id
         for uri, names in missing.items():
             self._log.error(
                 "Namespace URI '%s' not in the server's NamespaceArray; skipping nodes: %s",
@@ -1115,25 +1136,41 @@ class OPCUAClient:
                 self.downgrade_from,
             )
         try:
+            self._resumed = False
             self._client = await self._create_client()
             await self._client.connect()
             self._connected = True
-            self._namespaces = None
+            resumed = self._resumed
             self._failed_nodes, self._uncertain_nodes = set(), set()
-            (
-                self._browse_chunk,
-                self._read_chunk,
-                self._monitor_chunk,
-            ) = await operation_limits(self._client)
+            namespaces, self._namespaces = self._namespaces, None
+            rebuild = ""  # why a resumed session's subscriptions are rebuilt
+            if not resumed:
+                (
+                    self._browse_chunk,
+                    self._read_chunk,
+                    self._monitor_chunk,
+                ) = await operation_limits(self._client)
+            elif namespaces is not None and await self._namespace_array() != namespaces:
+                rebuild = "namespace array changed"  # resolved indexes are stale
             if self.discovery:
+                before = (self.node_map, self._variant)
                 await self._discover()
-            await self._resolve_nodes()
-            self._health_targets = [
-                (name, self._client.get_node(node_id)) for name, node_id in HEALTH_NODES
-            ]
-            # After discovery and any rotation: the events are declared.
-            await self._start_transport()
-            self._log.info("Connected to OPC-UA server: %s", self.endpoint)
+                if not rebuild and (self.node_map, self._variant) != before:
+                    rebuild = "discovered nodes changed"
+            if resumed and not rebuild:
+                self._rebind(self._client)
+                self._log.info("Reconnected; session and subscriptions kept")
+            else:
+                if self._subs and resumed:  # they hold server slots
+                    await self._delete_subscriptions(self._client, list(self._subs))
+                await self._resolve_nodes()
+                self._health_targets = [(name, ua.NodeId(i)) for name, i in HEALTH_NODES]
+                # After discovery and any rotation: the events are declared.
+                await self._start_transport()
+                if resumed:
+                    self._log.info("Reconnected; session kept, subscriptions rebuilt: %s", rebuild)
+                else:
+                    self._log.info("Connected to OPC-UA server: %s", self.endpoint)
             self.last_error, self.ever_connected = None, True
             return True
         except Exception as e:
@@ -1182,54 +1219,95 @@ class OPCUAClient:
         if self._connected and self._client:
             return True
         if self._client:
-            await self._close_session(self._client)
-        self._connected = False
+            await self._detach(self._client, keep=not self._fresh)
+        self._connected = self._fresh = False
         self._log.info("Connecting to %s...", self.endpoint)
         return await self.connect()
 
-    async def _close_session(self, client: Client) -> None:
-        """CloseSession on the old channel, else keep the session to close on the next one."""
+    async def _detach(self, client: Client, keep: bool) -> None:
+        """End `client`'s connection.
+
+        keep: the session stays on the server, subscriptions and all, to resume on
+        the next channel. Else CloseSession here, or on the next channel if this
+        one is dead.
+        """
         session, protocol = client.uaclient.session, client.uaclient.protocol
         held = session.has_session
-        orphan = _Orphan(session.authentication_token, client._server_nonce, client._policy_ids)
+        detached = _Detached(
+            session.authentication_token, client._server_nonce, client._policy_ids, keep
+        )
         closed = False
-        if held and protocol is not None and not protocol.is_closed:
+        if keep and protocol is not None and protocol.transport is not None:
+            # Dropped unsent: a black-holed link may still carry a CloseSession.
+            protocol.transport.abort()
+            await asyncio.sleep(0)  # abort schedules connection_lost first; this runs it
+        elif not keep and held and protocol is not None and not protocol.is_closed:
             with contextlib.suppress(Exception):
                 await client.uaclient.close_session(True)
                 closed = True
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception):  # sends nothing on a closed channel
             await client.disconnect()
         if held and not closed:
-            self._orphan = orphan
+            self._detached = detached
 
-    def _close_orphan_on_open(self, client: Client) -> None:
-        """Close the orphaned session once `client`'s channel opens, before CreateSession.
+    def _resume_on_open(self, client: Client) -> None:
+        """ActivateSession on the detached session once `client`'s channel opens.
 
-        A server keeps a session whose channel died (a slot on a PLC) until it times
-        out, and takes CloseSession only on the session's channel: ActivateSession
-        moves it there first (Part 4 5.6.3). Best effort, bounded by `timeout`.
+        Kept: resumed in place of CreateSession, subscriptions and all (Part 4
+        6.7). Otherwise closed: a server holds a session whose channel died (a
+        slot on a PLC) until it times out, and takes CloseSession only on the
+        session's channel, which ActivateSession moves it to (Part 4 5.6.3).
+        Hooks asyncua's persisted-session step, between OpenSecureChannel and
+        CreateSession; returning False lets it create a fresh session.
         """
-        open_channel = client.open_secure_channel
 
-        async def open_secure_channel(renew: bool = False) -> None:
-            await open_channel(renew)
-            orphan, self._orphan = self._orphan, None
-            if renew or orphan is None:
-                return
-            client.uaclient.session.restore_authentication_token(orphan.token)
-            client._server_nonce, client._policy_ids = orphan.nonce, orphan.policies
+        async def resume() -> bool:
+            detached, self._detached = self._detached, None
+            if detached is None:
+                return False
+            session = client.uaclient.session
+            session.restore_authentication_token(detached.token)
+            client._server_nonce, client._policy_ids = detached.nonce, detached.policies
             try:
-                await asyncio.wait_for(self._close_orphan(client), self.timeout)
-            except Exception as e:  # expired already, or refused: it times out anyway
-                self._log.debug("Old session not closed: %s", describe_error(e))
-            client.uaclient.session.reset_authentication_token()
+                await asyncio.wait_for(
+                    client.activate_session(certificate=client.user_certificate), self.timeout
+                )
+            except Exception as e:
+                code = e.code if isinstance(e, ua.UaStatusCodeError) else None
+                if detached.keep and is_connection_error(e) and code not in SESSION_GONE_CODES:
+                    self._detached = detached  # the channel failed, not the session
+                    raise
+                why = ua.StatusCode(code).name if code is not None else describe_error(e)
+                if detached.keep:
+                    self._log.info("Previous session not resumed (%s); creating a new one", why)
+                else:  # expired already, or refused: it times out anyway
+                    self._log.debug("Previous session not closed: %s", why)
+                session.reset_authentication_token()
+                return False
+            if detached.keep:
+                self._resumed = True
+                client._start_renew_loop()
+                return True
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(client.uaclient.close_session(True), self.timeout)
+                self._log.info("Closed the previous session, left open by the lost connection")
+            session.reset_authentication_token()
+            return False
 
-        client.open_secure_channel = open_secure_channel  # type: ignore[method-assign]
+        client._try_resume_persisted_session = resume  # type: ignore[method-assign]
 
-    async def _close_orphan(self, client: Client) -> None:
-        await client.activate_session(certificate=client.user_certificate)
-        await client.uaclient.close_session(True)
-        self._log.info("Closed the previous session, left open by the lost connection")
+    def _rebind(self, client: Client) -> None:
+        """Deliver the resumed session's subscriptions through `client`."""
+        on_publish = self._on_publish = self._publish_callback(client, self._monitored, self._stale)
+        if not self._subs:
+            return
+        self._guard_publish(client)
+        callbacks = client.uaclient.session._subscription_callbacks
+        now = time.monotonic()
+        for subscription_id, sub in self._subs.items():
+            callbacks[subscription_id] = on_publish
+            sub.heard = now  # silence while detached is no stall; a gap is Republished
+        client.uaclient.ensure_publish_loop()
 
     def _require_client(self) -> Client:
         if not self._client or not self._connected:
@@ -1247,7 +1325,7 @@ class OPCUAClient:
         client = self._require_client()
         cached = self._ua_nodes.get(node_id)
         if cached is not None:
-            return cached
+            return client.get_node(cached)
         namespaces = await self._namespace_array() if uses_nsu(node_id) else []
         return client.get_node(parse_node_id_to_ua(node_id, namespaces))
 
@@ -1472,7 +1550,7 @@ class OPCUAClient:
                 ItemsToCreate=[
                     ua.MonitoredItemCreateRequest(
                         ItemToMonitor=ua.ReadValueId(
-                            NodeId=target[2].nodeid, AttributeId=ua.AttributeIds.Value
+                            NodeId=target[2], AttributeId=ua.AttributeIds.Value
                         ),
                         MonitoringMode=ua.MonitoringMode.Reporting,
                         RequestedParameters=ua.MonitoringParameters(
@@ -1529,6 +1607,8 @@ class OPCUAClient:
         """Poll everything for the connection once a Publish fails to decode.
 
         asyncua drops the whole response without naming the item; polling isolates it.
+        On a closed channel the Publish loop parks until `_detach` or `disconnect`
+        cancels it: asyncua would log a traceback every second.
         """
         session = client.uaclient.session
         publish = session.publish
@@ -1538,6 +1618,11 @@ class OPCUAClient:
                 acks, self._acks = [*acks, *self._acks], []
             try:
                 return await publish(acks)
+            except ConnectionError:
+                protocol = client.uaclient.protocol
+                if protocol is not None and protocol.is_closed:  # close_session cancels it
+                    await asyncio.Event().wait()
+                raise
             except UaStructParsingError:
                 if client is self._client:
                     self._publish_failed = True
@@ -1676,14 +1761,8 @@ class OPCUAClient:
         client = self._require_client()
         assert self._on_publish is not None
         del self._subs[subscription_id]
-        # Raw: asyncua's delete_subscriptions WARNs, and keeps the callback, when the
-        # server already dropped it. A dead link fails the create below as well.
-        session = client.uaclient.session
-        request = ua.DeleteSubscriptionsRequest()
-        request.Parameters.SubscriptionIds = [subscription_id]
-        with contextlib.suppress(Exception):
-            await session._send_request(request)
-        session._subscription_callbacks.pop(subscription_id, None)
+        # A dead link fails the create below as well.
+        await self._delete_subscriptions(client, [subscription_id])
         refused, _ = await self._subscribe(client, sub.interval, sub.items, self._on_publish, None)
         if refused:
             # Reconnecting rebuilds the transport, polling what the server refuses.
@@ -1693,10 +1772,21 @@ class OPCUAClient:
                 len(sub.items),
                 sub.interval,
             )
-            self._connected = False
+            self._connected, self._fresh = False, True
             return
         targets = [t for _, t in sub.items]
         self._log_samples(await self._read_targets(targets), time.time_ns(), refresh=True)
+
+    async def _delete_subscriptions(self, client: Client, ids: list[int]) -> None:
+        """Best effort. Raw: asyncua's WARNs, and keeps the callback, when the
+        server already dropped one."""
+        session = client.uaclient.session
+        request = ua.DeleteSubscriptionsRequest()
+        request.Parameters.SubscriptionIds = ids
+        with contextlib.suppress(Exception):
+            await session._send_request(request)
+        for subscription_id in ids:
+            session._subscription_callbacks.pop(subscription_id, None)
 
     def _schedule(self, polled: dict[float, list[Target]]) -> list[_Job]:
         """This connection's periodic requests.
@@ -1712,7 +1802,7 @@ class OPCUAClient:
             ]
             step = interval / len(chunks)
             jobs += [
-                _Job(now + i * step, interval, lambda c=chunk: self._poll_chunk(c))
+                _Job(now + i * step, interval, lambda c=chunk, p=interval: self._poll_chunk(c, p))
                 for i, chunk in enumerate(chunks)
             ]
         if self._subs:
@@ -1727,8 +1817,10 @@ class OPCUAClient:
         self._log_values({HEALTH_EVENT: await self._read_health()})
         self._poll_count += 1
 
-    async def _poll_chunk(self, targets: list[Target]) -> None:
-        self._log_samples(await self._read_targets(targets), time.time_ns())
+    async def _poll_chunk(self, targets: list[Target], interval: float) -> None:
+        # A value up to one interval old is as good as a device read (Kepware's MaxAge).
+        samples = await self._read_targets(targets, max_age=interval * 1000)
+        self._log_samples(samples, time.time_ns())
 
     async def _sweep(self) -> None:
         """Re-read up to one Read of subscribed items silent for `_stale_after`.
@@ -1747,7 +1839,9 @@ class OPCUAClient:
         ]
         if not due:
             return
-        samples = await self._read_targets([self._monitored[h] for h in due])
+        samples = await self._read_targets(
+            [self._monitored[h] for h in due], max_age=self.min_update_interval * 1000
+        )
         received, now = time.time_ns(), time.monotonic()
         for handle in due:
             if handle in self._stale:  # not if everything moved to polling meanwhile
@@ -1760,18 +1854,21 @@ class OPCUAClient:
         if not self._health_targets:
             return {}
         sent = time.time()
-        items = [(n.nodeid, None) for _, n in self._health_targets]
+        items = [(n, None) for _, n in self._health_targets]
         data_values = await read_many(self._require_client(), items, self._read_chunk)
         return self._health_values(data_values, (sent + time.time()) / 2)
 
-    async def _read_targets(self, targets: list[Target]) -> list[tuple[str, Node, ua.DataValue]]:
-        """(event name, node, DataValue) per target, `_read_chunk` per request.
+    async def _read_targets(
+        self, targets: list[Target], max_age: float = 0.0
+    ) -> list[tuple[str, Node, ua.DataValue]]:
+        """(event name, node, DataValue) per target, `_read_chunk` per request, at
+        MaxAge `max_age` ms (0: fresh from the device).
 
         A BadDecodingError item is removed from `targets`, or its chunk would be
         re-read item by item every cycle.
         """
         data_values = await read_many(
-            self._require_client(), [(t[2].nodeid, None) for t in targets], self._read_chunk
+            self._require_client(), [(t[2], None) for t in targets], self._read_chunk, max_age
         )
         samples = [(t[0], t[1], dv) for t, dv in zip(targets, data_values, strict=True)]
         undecodable = {
@@ -1959,7 +2056,8 @@ class OPCUAClient:
                     failures += 1
                     if failures >= POLL_FAILURES_BEFORE_RECONNECT:
                         self._log.warning("%d poll failures in a row, reconnecting", failures)
-                        self._connected = False
+                        # A new session: this one may be what fails.
+                        self._connected, self._fresh = False, True
                         failures = 0
         finally:
             self._at_start = False
