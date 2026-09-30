@@ -11,8 +11,9 @@ Traces OPC-UA servers into Zelos trace events, by subscription or polling, and e
 | Security | None / Sign / SignAndEncrypt, with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss; X.509 user login |
 | Multiple servers | Any number in one extension; one unreachable server never stalls the others |
 | Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request |
+| Start | Every server must connect at start: one that cannot be reached or refuses the session (e.g. an untrusted certificate) stops the extension with one ERROR naming it (`Server 'plc' (opc.tcp://10.0.0.5:4840): cannot connect: connection refused`); fix it and start again. Once connected, drops are retried |
 | Data types | bool, int8-64, uint8-64, float32/64, string |
-| Demo mode | Built-in PLC simulator, no hardware |
+| Demo | `main.py demo`: built-in PLC simulator, no hardware |
 
 ## Quick Start
 
@@ -28,8 +29,7 @@ uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: disco
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `demo` | boolean | `false` | Run the built-in PLC simulator as the only server, `demo` |
-| `servers[]` | array | `[]` | One entry per server; at least one unless `demo` |
+| `servers[]` | array | `[]` | One entry per server; at least one |
 | `servers[].name` | string | endpoint host | Trace and action name (`plc01`, `192_168_1_10`); must be unique |
 | `servers[].endpoint` | string | `opc.tcp://localhost:4840` | Server endpoint URL |
 | `servers[].node_map_file` | string | `""` | Path to the JSON node map; empty discovers the address space |
@@ -98,7 +98,11 @@ A response with an array length past the bytes left in the message is rejected (
 
 ### Auto-configure
 
-The config form's button runs `auto_config` (extension stopped); it replaces `servers` only.
+The config form's button runs `auto_config` (extension stopped) on the form as it is, unsaved edits included (older apps: the saved config); it replaces `servers` only.
+
+With servers in the form, each is checked at its endpoint and kept as entered; one at security `default` whose server does not offer the Advanced security gets the server's strongest supported pair. The message names each one: found (security, already in the form), `Couldn't connect to <endpoint>.` (refused, no route, unknown host, timed out), answered without a security policy this extension supports, or does not offer the configured security.
+
+With none, it looks on this machine and adds what it finds:
 
 | Source | What |
 |---|---|
@@ -106,7 +110,7 @@ The config form's button runs `auto_config` (extension stopped); it replaces `se
 | Local Discovery Server | FindServers on `opc.tcp://localhost:4840` |
 | mDNS | 2s passive browse for `_opcua-tcp._tcp.local.` |
 
-Deduplicated by ApplicationUri, named by ApplicationName. Security: `default` if the server accepts None, else its strongest policy with SignAndEncrypt (then Sign); trust the client certificate on the server.
+Deduplicated by ApplicationUri, named by ApplicationName. Security: `default` if the server offers the Advanced security, else its strongest policy with SignAndEncrypt (then Sign); trust the client certificate on the server.
 
 ## Node Map Format
 
@@ -149,7 +153,7 @@ Names are sanitized at load (`. @ : ; =` and whitespace, and `/` in node names, 
 
 | Action | Description |
 |--------|-------------|
-| `OPC-UA/get_status` | Connection state, transport with subscribed / polled counts, poll and error counts, process `peak_rss_mb`; every server's when `server` is omitted |
+| `OPC-UA/get_status` | Connection `state` (`ok`, `connecting` at start, `disconnected` while retrying) and `last_error`, transport with subscribed / polled counts, poll and error counts, process `peak_rss_mb`; every server's when `server` is omitted |
 | `OPC-UA/read_node` | Read by node ID |
 | `OPC-UA/write_node` | Write by node ID; value is text, coerced to the server's type |
 | `OPC-UA/read_named_node` | Read by node map name |

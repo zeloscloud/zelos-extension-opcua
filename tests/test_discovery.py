@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import socket
 import struct
 import time
 from collections.abc import Sequence
@@ -16,7 +17,7 @@ import zelos_sdk
 from asyncua import ua
 from zelos_sdk.extensions.actions import get_standalone_actions
 
-from zelos_extension_opcua import ACTION_PREFIX, actions
+from zelos_extension_opcua import ACTION_PREFIX, actions, autoconfig
 from zelos_extension_opcua.cli import app
 from zelos_extension_opcua.client import SECURITY_POLICIES, OPCUAClient, OPCUARunner, SharedSource
 from zelos_extension_opcua.demo import profiles
@@ -301,8 +302,9 @@ def test_vendor_ids(identifier, name, segments):
     assert vendor_segments(ua.NodeId(identifier, 2), name) == segments
 
 
-async def test_auto_config_finds_local_servers():
+async def test_auto_config_finds_local_servers(monkeypatch):
     # Real well-known ports: auto_config probes nothing else on localhost.
+    monkeypatch.setattr(autoconfig, "PROBE_TIMEOUT", 10.0)  # a loaded machine is slow
     async with (
         Simulator("gateway", port=4840),
         Simulator("demo", port=48010, secure=True, secure_only=True),
@@ -319,10 +321,78 @@ async def test_auto_config_finds_local_servers():
         "opc.tcp://localhost:48010/freeopcua/server/": ("SignAndEncrypt", "Basic256Sha256"),
     }
     assert "trusted on the server" in result["message"]
+    assert (
+        "at opc.tcp://localhost:4840/freeopcua/server/ (security default, added)"
+        in (result["message"])
+    )
 
     schema = json.loads((Path(__file__).parents[1] / "config.schema.json").read_text())
     assert schema["ui:options"]["autoconfig"] == f"{ACTION_PREFIX}/auto_config"
     assert "auto_config" in get_standalone_actions()
+
+
+def closed_endpoint() -> str:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"opc.tcp://127.0.0.1:{s.getsockname()[1]}"
+
+
+async def test_auto_config_checks_the_forms_servers():
+    """Found, and never opened, each named; a refused port never reads as found."""
+    gone = closed_endpoint()
+    async with Simulator("gateway", port=0) as sim:
+        form = [{"name": "gw", "endpoint": sim.endpoint}, {"name": "gone", "endpoint": gone}]
+        result = await asyncio.to_thread(actions.auto_config, {"servers": form})
+        assert result["config"]["servers"] == form
+        assert result["message"] == (
+            f"Found Zelos Sim Gateway at {sim.endpoint} (security default, already in the "
+            f"form). Couldn't connect to {gone}."
+        )
+        result = await asyncio.to_thread(actions.auto_config, {"servers": form[1:]})
+        assert result == {"status": "error", "message": f"Couldn't connect to {gone}."}
+
+
+async def test_auto_config_secure_only_server(monkeypatch):
+    async with Simulator(port=0, secure=True, secure_only=True) as sim:
+        form = {"servers": [{"endpoint": sim.endpoint}]}
+        result = await asyncio.to_thread(actions.auto_config, form)
+        assert result["config"]["servers"] == [
+            {
+                "endpoint": sim.endpoint,
+                "security_mode": "SignAndEncrypt",
+                "security_policy": "Basic256Sha256",
+            }
+        ]
+        assert "(SignAndEncrypt/Basic256Sha256, already in the form)" in result["message"]
+        # The form's Advanced default is offered: the entry keeps following it.
+        advanced = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}
+        result = await asyncio.to_thread(actions.auto_config, {**form, "advanced": advanced})
+        assert result["config"]["servers"] == form["servers"]
+        assert "(security default, already in the form)" in result["message"]
+
+        monkeypatch.setattr(autoconfig, "POLICY_RANK", ("Aes256Sha256RsaPss",))
+        result = await asyncio.to_thread(actions.auto_config, form)
+    assert result == {
+        "status": "error",
+        "message": f"{sim.endpoint} offers no security policy this extension supports.",
+    }
+
+
+async def test_auto_config_empty_form_finds_nothing(monkeypatch):
+    port = int(closed_endpoint().rsplit(":", 1)[1])
+    monkeypatch.setattr(autoconfig, "WELL_KNOWN_PORTS", (port,))
+    monkeypatch.setattr(autoconfig, "LDS_URL", f"opc.tcp://127.0.0.1:{port}")
+
+    async def no_mdns() -> list[str]:
+        return []
+
+    monkeypatch.setattr(autoconfig, "_mdns_urls", no_mdns)
+    result = await asyncio.to_thread(actions.auto_config, {"servers": []})
+    assert result == {
+        "status": "error",
+        "message": f"No OPC UA server answered on this machine's usual ports ({port}) or "
+        "over mDNS. Add a server with its endpoint.",
+    }
 
 
 def test_auto_config_never_downgrades():

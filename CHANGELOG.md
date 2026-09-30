@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `demo-server` / `just sim`: simulator with `gateway`, `s7` (enforced limits and session caps) and `device` profiles, `--secure`, `--secure-only`, trust lists, `--shuffle-namespaces`, `--map`, `--nodes N`, request log.
 
 ### Changed
+- A server that cannot be reached or refuses the session at start (untrusted certificate, security not offered, user rejected) stops the extension with one ERROR naming it; once connected, drops are retried as before.
+- `get_status` reports `state` (`ok`, `connecting`, `disconnected`) and `last_error`.
+- `auto_config` checks the form's servers (unsaved edits, Advanced security included) and names each outcome: found, couldn't connect, no supported security; with none it looks on this machine as before.
+- Demo Mode toggle removed from the settings form; `main.py demo` / `just demo` remain.
+- Extension icon.
 - **Breaking** config: servers under `servers[]` (name, endpoint, node map, poll interval, transport, security, certificate pin), shared settings and security defaults under `advanced`; `default` / empty per-server security inherits. The old flat config is a startup error.
 - **Breaking** trace paths: `OPC-UA/<server>/<event>` (source `advanced.prefix`, default `OPC-UA`; cleared, one source per server). The node map `name` no longer names the source.
 - **Breaking** actions: registered under `OPC-UA/` (was `zelos_extension_opcua/`), reuse the live connection, and raise on failure instead of returning `success: false`. Every action takes an optional `server`; `get_status` / `list_*` cover all servers when omitted.

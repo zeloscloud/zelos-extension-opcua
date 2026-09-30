@@ -58,6 +58,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 - Free functions in `actions.py`, bound via `set_runner`. Optional `server`: `ValueError` listing names when omitted with several; `get_status` / `list_*` cover all.
 - Failure convention: **raise**. The protocol reads the verdict from the exception, so `{"success": False}` reports success. Input errors `ValueError`; unknown errors become `RuntimeError` after `logger.exception`.
+- `auto_config(config)`: the app passes the live form; none = saved config; no servers = probe localhost/LDS/mDNS. Keeps entries as entered; fills `default` security only when the server lacks the form's Advanced one.
 - `auto_config` is the one standalone action (own `asyncio.run`, safe off the loop thread); the schema's `ui:options.autoconfig` names it, keep in step.
 - Everything else dispatches via `OPCUARunner._run_coro` into the polling loop. No connect-per-action, no ad-hoc `asyncio.run` fallback (mutating client state from a foreign loop silently lost every later sample); no loop = `RuntimeError("extension is not running")`.
 - A dispatch timeout cancels the coroutine, stopping an unsent write. After a Write is `sent` it cannot be recalled: raise a TimeoutError saying the server may have applied it.
@@ -93,6 +94,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 ### Shutdown
 
 - `OPCUARunner` owns the one loop; each client is a task, all share one stop event. Signals via `loop.add_signal_handler` only set it; never `signal.signal` + `sys.exit` (drops sessions uncleanly).
+- First contact is required: the runner waits for every client's first connect; any failure logs one ERROR per server and `serve()` exits 1. After a server has connected, drops use the backoff. `mark_unreachable` wraps asyncua's socket open so "never opened" (refused, no route, DNS, timeout) is typed, not guessed from a later timeout.
 - `_run_async` races connect against stop: a black-holed `connect()` parks for minutes, past the manifest's 10s grace.
 - Disconnects run concurrently under `wait_for(..., 3.0)`: ~3s total. A crashing client task sets stop. `runner.stop()` is thread-safe.
 

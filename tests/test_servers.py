@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import socket
 import time
 
 import pytest
@@ -30,17 +32,23 @@ async def wait_until(predicate, timeout: float) -> None:
         await asyncio.sleep(0.05)
 
 
-def clients_for(sims: dict[str, Simulator], prefix: str) -> list[OPCUAClient]:
+def closed_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def clients_for(endpoints: dict[str, str], prefix: str) -> list[OPCUAClient]:
     """Clients through the app's own resolution, started on the prefix's layout."""
     config = {
         "servers": [
             {
                 "name": name,
-                "endpoint": sim.endpoint,
+                "endpoint": endpoint,
                 "node_map_file": DEMO_MAP,
                 "poll_interval": 0.1,
             }
-            for name, sim in sims.items()
+            for name, endpoint in endpoints.items()
         ],
         "advanced": {"timeout": 2.0},
     }
@@ -58,7 +66,7 @@ async def test_one_dead_server_does_not_stall_the_other():
     await press.start()
     await oven.start()
     oven_port = oven.server.bserver.port
-    runner = OPCUARunner(clients_for({"press": press, "oven": oven}, "OPC-UA"))
+    runner = OPCUARunner(clients_for({"press": press.endpoint, "oven": oven.endpoint}, "OPC-UA"))
     task = asyncio.create_task(runner._run_async())
     a, b = runner.clients["press"], runner.clients["oven"]
     try:
@@ -78,7 +86,7 @@ async def test_one_dead_server_does_not_stall_the_other():
         dead_polls, live_polls = b._poll_count, a._poll_count
         await asyncio.sleep(2.0)  # inside oven's backoff
         assert a._poll_count >= live_polls + 10
-        assert b._poll_count == dead_polls and not b._connected
+        assert b._poll_count == dead_polls and b.status()["state"] == "disconnected"
 
         oven = Simulator(node_map=demo_map, port=oven_port)
         await oven.start()
@@ -96,6 +104,23 @@ async def test_one_dead_server_does_not_stall_the_other():
     assert not a._connected and not b._connected
 
 
+async def test_unreachable_at_start_stops_the_extension(caplog):
+    """First contact is required: a closed port stops every server with one ERROR."""
+    gone = f"opc.tcp://127.0.0.1:{closed_port()}"
+    async with Simulator(port=0) as press:
+        runner = OPCUARunner(clients_for({"press": press.endpoint, "gone": gone}, "OPC-UA"))
+        await asyncio.wait_for(runner._run_async(), 10.0)
+    errors = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name.startswith("zelos_extension_opcua")
+    ]
+    assert errors == [f"Server 'gone' ({gone}): cannot connect: connection refused"]
+    assert runner.failed_at_start == [runner.clients["gone"]]
+    assert not runner.clients["press"]._connected
+    assert runner.clients["gone"].status()["last_error"] == "connection refused"
+
+
 def actions_read(runner: OPCUARunner, name: str, server: str) -> dict:
     actions.set_runner(runner)
     return actions.read_named_node(name, server)
@@ -107,7 +132,7 @@ async def test_cleared_prefix_gives_each_server_its_own_source():
         Simulator(node_map=demo_map, port=0) as s1,
         Simulator(node_map=demo_map, port=0) as s2,
     ):
-        runner = OPCUARunner(clients_for({"press": s1, "oven": s2}, ""))
+        runner = OPCUARunner(clients_for({"press": s1.endpoint, "oven": s2.endpoint}, ""))
         task = asyncio.create_task(runner._run_async())
         try:
             await wait_until(lambda: all(c._poll_count >= 1 for c in runner.clients.values()), 15.0)

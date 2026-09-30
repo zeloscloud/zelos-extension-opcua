@@ -299,35 +299,42 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
 
 @zelos_sdk.action(
     "Auto-configure",
-    "Find OPC UA servers on this machine (well-known ports, the local discovery "
-    "server) and announced over mDNS, for the config form's Auto-configure button. "
-    "Review, then save and start.",
+    "Check each server in the form at its endpoint (unsaved edits included; older apps: "
+    "the saved config) and fill in security left at default. With none, find servers on "
+    "this machine (well-known ports, the local discovery server) and announced over "
+    "mDNS. Review, then save and start.",
     # Read-only and session-less, and the form wants it before a first start.
     standalone=True,
 )
-def auto_config() -> dict[str, Any]:
+@zelos_sdk.action.object(
+    "config",
+    properties={},
+    title="Config",
+    description="The config form's current (possibly unsaved) data. Empty: the saved config",
+    required=False,
+)
+def auto_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     """`config` keys replace the form's: only `servers`, so Advanced survives.
 
     Its own asyncio.run: called from the actions thread, never the polling loop.
     """
-    from .autoconfig import find_servers
+    from .autoconfig import check_servers, probe
 
-    servers, notes = asyncio.run(find_servers())
-    if not servers:
-        return {
-            "status": "error",
-            "message": " ".join(
-                [
-                    "No OPC UA server found on this machine's well-known ports, its local "
-                    "discovery server or mDNS. Add a server and enter its endpoint.",
-                    *notes,
-                ]
-            ),
-        }
-    result: dict[str, Any] = {"status": "success", "config": {"servers": servers}}
-    if notes:
-        result["message"] = " ".join(notes)
-    return result
+    if config is None:
+        config = _saved_config()
+    servers = [s for s in config.get("servers") or [] if isinstance(s, dict)]
+    advanced = config.get("advanced") or {}
+    return asyncio.run(check_servers(servers, advanced) if servers else probe(advanced))
+
+
+def _saved_config() -> dict[str, Any]:
+    """The saved config, or {} when there is none."""
+    try:
+        from zelos_sdk.extensions import load_config
+
+        return load_config() or {}
+    except Exception:  # no config yet, or it does not validate
+        return {}
 
 
 # ─── Registration helper ────────────────────────────────────────────────────

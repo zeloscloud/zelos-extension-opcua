@@ -66,6 +66,7 @@ SERVER_DEFAULTS: dict[str, Any] = {
     "min_update_interval": None,
 }
 
+# `demo`: the removed Demo Mode toggle, still in older saved configs; ignored.
 TOP_LEVEL_KEYS = frozenset({"demo", "servers", "advanced"})
 
 #: Shared client settings every OPCUAClient takes from `advanced`.
@@ -121,7 +122,7 @@ def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[di
     reject_legacy_shape(config)
     servers = config.get("servers") or []
     if not servers:
-        logger.error("No servers configured: add one under servers, or enable demo")
+        logger.error("No servers configured: add one under Servers")
         sys.exit(1)
 
     resolved: list[dict[str, Any]] = []
@@ -276,15 +277,18 @@ def serve(clients: list[OPCUAClient], prefix: str) -> None:
     for client in clients:
         client.start(shared)
     runner.run()
+    if runner.failed_at_start:
+        sys.exit(1)
 
 
 def run_config(config: dict[str, Any], demo: bool = False) -> None:
-    """Resolve an app-shaped config (demo, servers[], advanced) and serve it."""
+    """Resolve an app-shaped config (servers[], advanced) and serve it; `demo` (the CLI's
+    `demo` / `--demo`) replaces the servers with the built-in simulator."""
     advanced = resolve_advanced(config)
     apply_log_level(advanced["log_level"])
     prefix = trace_name(str(advanced["prefix"]))
 
-    if demo or config.get("demo", False):
+    if demo:
         logger.info("Demo mode: using built-in PLC simulator")
         start_demo_server()
         servers = [demo_server_kwargs(advanced)]
