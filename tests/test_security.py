@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from asyncua.crypto.cert_gen import (
     generate_self_signed_app_certificate,
 )
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -35,6 +37,37 @@ def pki(tmp_path, monkeypatch) -> Path:
     pki_dir = tmp_path / "pki"
     monkeypatch.setattr(client_mod, "PKI_DIR", pki_dir)
     return pki_dir
+
+
+def trust_sim(sim: Simulator, pki: Path) -> bytes:
+    """Put the simulator's certificate in the trust list; returns its DER."""
+    der = sim.server.iserver.certificate.public_bytes(Encoding.DER)
+    (pki / client_mod.TRUSTED_DIR).mkdir(parents=True, exist_ok=True)
+    (pki / client_mod.TRUSTED_DIR / f"{thumbprint(der)}.der").write_bytes(der)
+    return der
+
+
+def server_cert(directory: Path, uri: str, expired: bool = False) -> tuple[Path, Path]:
+    """A simulator certificate and key naming `uri`; `expired`: valid only last year."""
+    directory.mkdir(parents=True, exist_ok=True)
+    key = generate_private_key()
+    name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, "PLC")])
+    start = datetime.now(UTC) - timedelta(days=400 if expired else 1)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(start)
+        .not_valid_after(start + timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(uri)]), False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path, key_path = directory / "server.der", directory / "server.pem"
+    cert_path.write_bytes(cert.public_bytes(Encoding.DER))
+    key_path.write_bytes(dump_private_key_as_pem(key))
+    return cert_path, key_path
 
 
 def secure_client(sim: Simulator, mode: str = "SignAndEncrypt", **kwargs) -> OPCUAClient:
@@ -70,6 +103,7 @@ async def test_generated_cert_session_and_reuse(pki, mode):
     node_map = NodeMap.from_file(app.get_demo_node_map_path())
     thumbprints = []
     async with Simulator(port=0, secure=True) as sim:
+        trust_sim(sim, pki)
         for _ in range(2):
             client = secure_client(sim, mode, node_map=node_map)
             assert await client.connect() is True
@@ -110,7 +144,7 @@ async def test_unoffered_security_is_refused_not_downgraded(caplog, secure, poli
 async def test_strict_server_certificate(tmp_path, caplog):
     async with Simulator(port=0, secure=True) as sim:
         # Pinned as PEM: the server hands out DER, so this also covers format handling.
-        server_der = (sim._pki / "server_cert.der").read_bytes()
+        server_der = sim.server.iserver.certificate.public_bytes(Encoding.DER)
         pinned = tmp_path / "server.pem"
         pinned.write_bytes(x509.load_der_x509_certificate(server_der).public_bytes(Encoding.PEM))
         client = secure_client(
@@ -137,6 +171,7 @@ async def test_untrusted_cert_stops_the_start(tmp_path, pki, caplog):
     trust = tmp_path / "trusted"
     trust.mkdir()
     async with Simulator(port=0, secure=True, trust_dir=trust) as sim:
+        trust_sim(sim, pki)
         client = secure_client(sim)
         client.start()
         runner = OPCUARunner([client])
@@ -164,6 +199,70 @@ async def test_untrusted_cert_stops_the_start(tmp_path, pki, caplog):
             runner.stop()
             await asyncio.wait_for(task, 10.0)
     assert list(sim.sessions.values()) == [("SignAndEncrypt", "Basic256Sha256")]
+
+
+async def test_server_trust_list(tmp_path, pki, caplog):
+    """Unknown certificate: refused at start and saved; trusted, connects; replaced, refused."""
+    async with Simulator(port=0, secure=True) as sim:
+        # v0.1.1's `auto` is the trust list.
+        client = secure_client(sim, server_certificate="auto")
+        client.start()
+        runner = OPCUARunner([client])
+        await asyncio.wait_for(runner._run_async(), 10.0)
+        assert runner.failed_at_start == [client]
+        assert not sim.sessions
+        der = sim.server.iserver.certificate.public_bytes(Encoding.DER)
+        rejected = pki / "rejected" / f"{thumbprint(der)}.der"
+        assert rejected.read_bytes() == der
+        name = client_mod.certificate_name(der)
+        assert sim.server.get_application_uri() in name
+        assert [e for e in errors(caplog) if e.startswith("Server")] == [
+            f"Server '127_0_0_1' ({sim.endpoint}): cannot connect: server certificate "
+            f"{name} is not trusted; "
+            f"saved to {rejected}; move it into {pki / 'trusted'} or run the "
+            "trust_server_certificate action, then start the extension again"
+        ]
+        listed = actions.list_server_certificates()
+        assert [c["thumbprint"] for c in listed["rejected"]] == [thumbprint(der)]
+
+        result = actions.trust_server_certificate()  # the only one rejected
+        assert result["thumbprint"] == thumbprint(der) and not rejected.exists()
+        client = secure_client(sim)
+        assert await client.connect() is True
+        await client.disconnect()
+        port = sim.server.bserver.port
+
+    caplog.clear()
+    async with Simulator(port=port, secure=True) as sim:  # same endpoint, new certificate
+        assert await client.connect() is False
+        new = sim.server.iserver.certificate.public_bytes(Encoding.DER)
+        assert (pki / "rejected" / f"{thumbprint(new)}.der").is_file()
+        assert any("is not trusted" in e and thumbprint(new) in e for e in errors(caplog))
+        assert len(sim.sessions) == 0
+
+
+@pytest.mark.parametrize(
+    ("expired", "uri", "allow", "refusal"),
+    [
+        (True, "urn:plc", False, "expired"),
+        (True, "urn:plc", True, None),
+        (False, "urn:other", False, "names ApplicationUri urn:other, the server reports urn:plc"),
+    ],
+)
+async def test_server_certificate_validation(tmp_path, pki, caplog, expired, uri, allow, refusal):
+    """Validity period and ApplicationUri, checked before any session; trust list or not."""
+    cert = server_cert(tmp_path / "server", uri, expired)
+    async with Simulator(port=0, secure=True, certificate=cert, application_uri="urn:plc") as sim:
+        trust_sim(sim, pki)
+        client = secure_client(sim, allow_expired_server_certificate=allow)
+        assert await client.connect() is (refusal is None)
+        await client.disconnect()
+        assert len(sim.sessions) == (refusal is None)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    if refusal:
+        assert any(refusal in e for e in errors(caplog))
+    else:
+        assert any("expired" in w and "connecting anyway" in w for w in warnings)
 
 
 SECURE = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}
@@ -278,13 +377,14 @@ def test_cert_expiry_is_announced(monkeypatch, caplog, days, warns):
 
 
 @pytest.mark.parametrize("trusted", [True, False])
-async def test_user_certificate_identity(tmp_path, caplog, trusted):
+async def test_user_certificate_identity(tmp_path, pki, caplog, trusted):
     users = tmp_path / "users"
     users.mkdir()
     identity = user_cert(users if trusted else tmp_path / "other")
     user_der = Path(identity["user_certificate_file"]).read_bytes()
     node_map = NodeMap.from_file(app.get_demo_node_map_path())
     async with Simulator(port=0, secure=True, user_cert_dir=users) as sim:
+        trust_sim(sim, pki)
         client = secure_client(sim, node_map=node_map, **identity)
         assert await client.connect() is trusted
         if trusted:
@@ -315,10 +415,11 @@ async def test_user_certificate_refused_without_server_policy(tmp_path, caplog):
     )
 
 
-async def test_per_server_security_inherits_or_overrides(caplog):
+async def test_per_server_security_inherits_or_overrides(pki, caplog):
     """Secure default inherited by one server, explicitly downgraded on the other."""
     demo_map = str(app.get_demo_node_map_path())
     async with Simulator(port=0, secure=True) as sec, Simulator(port=0) as plain:
+        trust_sim(sec, pki)
         config = {
             "advanced": SECURE,
             "servers": [

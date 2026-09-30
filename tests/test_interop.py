@@ -35,6 +35,9 @@ CONTAINER = "zelos-opcua-interop"
 ENDPOINT = "opc.tcp://localhost:4840"
 
 
+SECURE = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}
+
+
 def b64(path: str | Path) -> str:
     return base64.b64encode(Path(path).read_bytes()).decode()
 
@@ -42,7 +45,8 @@ def b64(path: str | Path) -> str:
 @pytest.fixture(scope="module")
 def opcplc(tmp_path_factory):
     """OPC PLC on localhost:4840 trusting the generated client cert and one user
-    cert, no auto-accept; yields that user identity."""
+    cert, no auto-accept; its certificate trusted here as a user would (first
+    connect refused, then the trust action). Yields that user identity."""
     assert shutil.which("docker"), "docker not on PATH"
     pki = tmp_path_factory.mktemp("pki")
     app_cert, _ = client_mod.ensure_client_certificate(pki)
@@ -61,6 +65,8 @@ def opcplc(tmp_path_factory):
             while not asyncio.run(_answers()):
                 assert time.monotonic() < deadline, "OPC PLC did not come up within 60s"
                 time.sleep(1)
+            assert not asyncio.run(OPCUAClient(endpoint=ENDPOINT, **SECURE).connect())
+            actions.trust_server_certificate()
             yield identity
     finally:
         subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
@@ -106,15 +112,14 @@ async def test_none_discovers_and_polls(opcplc):
 
 
 async def test_sign_and_encrypt_with_generated_cert(opcplc):
-    ok, polls = await polled(security_mode="SignAndEncrypt", security_policy="Basic256Sha256")
+    ok, polls = await polled(**SECURE)
     assert ok
     assert_telemetry(polls)
 
 
 async def test_user_certificate_login(opcplc, tmp_path):
-    secure = {"security_mode": "SignAndEncrypt", "security_policy": "Basic256Sha256"}
-    assert (await polled(**secure, **opcplc))[0] is True
-    assert (await polled(**secure, **user_cert(tmp_path / "stranger", "stranger")))[0] is False
+    assert (await polled(**SECURE, **opcplc))[0] is True
+    assert (await polled(**SECURE, **user_cert(tmp_path / "stranger", "stranger")))[0] is False
 
 
 FAST = NodeMap.from_dict(

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import zelos_sdk
 
+from . import client as _client
 from .client import coerce_text, describe_error
 
 if TYPE_CHECKING:
@@ -335,6 +336,52 @@ def _saved_config() -> dict[str, Any]:
         return load_config() or {}
     except Exception:  # no config yet, or it does not validate
         return {}
+
+
+# ─── Server certificate trust list (standalone: files only) ─────────────────
+
+
+@zelos_sdk.action(
+    "List Server Certificates",
+    "Server certificates this extension trusts, and those it refused (pki/rejected)",
+    standalone=True,
+)
+def list_server_certificates() -> dict[str, Any]:
+    return _client.server_certificates(_client.PKI_DIR)
+
+
+@zelos_sdk.action(
+    "Trust Server Certificate",
+    "Trust a refused server certificate: moves it from pki/rejected to pki/trusted",
+    # The first connect refuses an unknown certificate and stops the extension.
+    standalone=True,
+)
+@zelos_sdk.action.text(
+    "thumbprint",
+    title="Thumbprint",
+    required=False,
+    default="",
+    description="SHA-1 thumbprint from the error; empty when only one certificate was refused",
+)
+@zelos_sdk.action.text(
+    "server",
+    title="Server",
+    required=False,
+    default="",
+    description="Instead of a thumbprint: the server that refused it (while the extension runs)",
+)
+def trust_server_certificate(thumbprint: str = "", server: str = "") -> dict[str, Any]:
+    if server and not thumbprint:
+        if _runner is None:
+            raise ValueError("Server names work while the extension runs; set the thumbprint")
+        thumbprint = _get_client(server).rejected_thumbprint or ""
+        if not thumbprint:
+            raise ValueError(f"Server '{server}' has not refused a certificate")
+    path, der = _client.trust(_client.PKI_DIR, thumbprint)
+    return {
+        "message": f"Trusted {_client.certificate_name(der)}; saved to {path}",
+        **_client.describe_certificate(der),
+    }
 
 
 # ─── Registration helper ────────────────────────────────────────────────────

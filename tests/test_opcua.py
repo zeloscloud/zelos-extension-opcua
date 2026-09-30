@@ -652,9 +652,11 @@ class TestActionsUnit:
             "discovered_map",
             "get_status",
             "list_nodes",
+            "list_server_certificates",
             "list_writable_nodes",
             "read_named_node",
             "read_node",
+            "trust_server_certificate",
             "write_named_node",
             "write_node",
         ]

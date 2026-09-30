@@ -63,8 +63,9 @@ SERVER_DEFAULTS: dict[str, Any] = {
     "security_policy": "default",
     "user_certificate_file": "",
     "user_private_key_file": "",
-    "server_certificate": "auto",
+    "server_certificate": "trust_list",
     "server_certificate_file": "",
+    "allow_expired_server_certificate": False,
     "transport": "default",
     "min_update_interval": None,
     "include": [],
@@ -177,6 +178,7 @@ def resolve_servers(config: dict[str, Any], advanced: dict[str, Any]) -> list[di
                 "poll_interval": server["poll_interval"],
                 "server_certificate": server["server_certificate"],
                 "server_certificate_file": server["server_certificate_file"],
+                "allow_expired_server_certificate": server["allow_expired_server_certificate"],
                 **effective,
                 **{k: advanced[k] for k in _SHARED},
                 # Explicit per-server None under a secure default: allowed, but loud.

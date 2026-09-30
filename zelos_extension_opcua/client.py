@@ -23,12 +23,14 @@ from urllib.parse import urlparse
 import zelos_sdk
 from asyncua import Client, ua
 from asyncua.common.node import Node as UaNode
+from asyncua.common.utils import ServiceError
 from asyncua.crypto import security_policies, uacrypto
 from asyncua.crypto.cert_gen import (
     dump_private_key_as_pem,
     generate_private_key,
     generate_self_signed_app_certificate,
 )
+from asyncua.crypto.validator import CertificateValidator, CertificateValidatorOptions
 from asyncua.ua.uaerrors import UaStructParsingError
 from asyncua.ua.uatypes import NodeId
 from cryptography import x509
@@ -199,7 +201,9 @@ SECURITY_POLICIES = {
     "Aes128Sha256RsaOaep": security_policies.SecurityPolicyAes128Sha256RsaOaep,
     "Aes256Sha256RsaPss": security_policies.SecurityPolicyAes256Sha256RsaPss,
 }
-SERVER_CERTIFICATE_POLICIES = ("auto", "strict")
+SERVER_CERTIFICATE_POLICIES = ("trust_list", "strict")
+# v0.1.1's name for the default, which then accepted any certificate.
+LEGACY_TRUST_LIST = "auto"
 
 # Generated client identity, reused: servers trust by thumbprint, so regenerating
 # revokes that trust. ZELOS_DATA_DIR survives updates; outside the agent, home.
@@ -210,6 +214,9 @@ PKI_DIR = (
 )
 CLIENT_CERT_FILE = "client_cert.der"
 CLIENT_KEY_FILE = "client_key.pem"
+# Server certificates, `<SHA-1>.der`: trusted ones, and those refused for the user to review.
+TRUSTED_DIR = "trusted"
+REJECTED_DIR = "rejected"
 # Must equal the URI in the certificate's SubjectAltName; servers reject a mismatch.
 APPLICATION_URI = "urn:zelos:opcua:client"
 # Expiry forces a re-trust on every server, so it is announced ahead of time.
@@ -243,6 +250,10 @@ class _Detached:
 
 class ConnectionSecurityError(Exception):
     """A secure connect refused on security grounds. Never retried insecurely."""
+
+    def __init__(self, message: str, fix: str = "") -> None:
+        super().__init__(message)
+        self.fix = fix  # what the user does about it
 
 
 class Unreachable(Exception):
@@ -289,6 +300,134 @@ def thumbprint(der: bytes) -> str:
     return hashlib.sha1(der).hexdigest().upper()
 
 
+def describe_certificate(der: bytes) -> dict[str, str]:
+    """Subject, ApplicationUri, SHA-1 thumbprint and validity of a certificate."""
+    cert = x509.load_der_x509_certificate(der)
+    return {
+        "subject": cert.subject.rfc4514_string(),
+        "application_uri": ", ".join(_san_uris(cert)),
+        "thumbprint": thumbprint(der),
+        "not_before": cert.not_valid_before_utc.isoformat(),
+        "not_after": cert.not_valid_after_utc.isoformat(),
+    }
+
+
+def _san_uris(cert: x509.Certificate) -> list[str]:
+    with contextlib.suppress(x509.ExtensionNotFound):
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        return san.value.get_values_for_type(x509.UniformResourceIdentifier)
+    return []
+
+
+def certificate_name(der: bytes) -> str:
+    """`CN=plc, urn:plc (SHA-1 AB12...)`: a certificate as messages name it."""
+    info = describe_certificate(der)
+    uri = f", {info['application_uri']}" if info["application_uri"] else ""
+    return f"{info['subject']}{uri} (SHA-1 {info['thumbprint']})"
+
+
+def is_trusted(der: bytes, pki_dir: Path) -> bool:
+    """Whether `der` is in the trust list: any DER/PEM file in trusted/, by content."""
+    trusted = pki_dir / TRUSTED_DIR
+    for path in trusted.iterdir() if trusted.is_dir() else ():
+        with contextlib.suppress(Exception):  # a stray non-certificate file
+            if path.is_file() and load_cert_der(path) == der:
+                return True
+    return False
+
+
+def reject(der: bytes, pki_dir: Path) -> Path:
+    """Save a refused server certificate to rejected/ for review; trusted/ made alongside."""
+    for name in (TRUSTED_DIR, REJECTED_DIR):
+        (pki_dir / name).mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = pki_dir / REJECTED_DIR / f"{thumbprint(der)}.der"
+    path.write_bytes(der)
+    return path
+
+
+def server_certificates(pki_dir: Path) -> dict[str, list[dict[str, str]]]:
+    """Trusted and rejected server certificates, each described."""
+    listed: dict[str, list[dict[str, str]]] = {}
+    for name in (TRUSTED_DIR, REJECTED_DIR):
+        directory = pki_dir / name
+        certs = []
+        for path in sorted(directory.iterdir()) if directory.is_dir() else ():
+            with contextlib.suppress(Exception):
+                certs.append({**describe_certificate(load_cert_der(path)), "file": str(path)})
+        listed[name] = certs
+    return listed
+
+
+def trust(pki_dir: Path, sha1: str = "") -> tuple[Path, bytes]:
+    """Move a rejected certificate into trusted/: by thumbprint, or the only one rejected.
+
+    Returns:
+        (its new path, its DER)
+
+    Raises:
+        ValueError: If no such certificate, or several rejected and none named
+    """
+    rejected = {p.stem.upper(): p for p in (pki_dir / REJECTED_DIR).glob("*.der")}
+    wanted = sha1.replace(":", "").replace(" ", "").upper()
+    if not wanted:
+        if len(rejected) != 1:
+            listing = ", ".join(sorted(rejected)) or "none"
+            raise ValueError(f"Set the thumbprint of the certificate to trust. Rejected: {listing}")
+        wanted = next(iter(rejected))
+    if wanted not in rejected:
+        raise ValueError(
+            f"No rejected certificate {wanted}. Rejected: {', '.join(sorted(rejected)) or 'none'}"
+        )
+    der = load_cert_der(rejected[wanted])
+    target = pki_dir / TRUSTED_DIR / f"{wanted}.der"
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    rejected[wanted].replace(target)
+    return target, der
+
+
+async def check_server_certificate(
+    der: bytes, server: ua.ApplicationDescription, allow_expired: bool
+) -> str:
+    """Refuse a certificate outside its validity period, or not naming the server's
+    ApplicationUri (Part 4 6.1.3). No chain or revocation check.
+
+    Returns:
+        A warning when `allow_expired` let an out-of-date certificate through, else ""
+
+    Raises:
+        ConnectionSecurityError: With the reason
+    """
+    cert = x509.load_der_x509_certificate(der)
+    try:
+        await CertificateValidator(CertificateValidatorOptions.URI).validate(cert, server)
+    except ServiceError:
+        uris = ", ".join(_san_uris(cert)) or "none"
+        raise ConnectionSecurityError(
+            f"server certificate {certificate_name(der)} does not match the server: it names "
+            f"ApplicationUri {uris}, the server reports {server.ApplicationUri or 'none'}",
+            "the server needs a certificate issued for its ApplicationUri",
+        ) from None
+    try:
+        await CertificateValidator(CertificateValidatorOptions.TIME_RANGE).validate(cert, server)
+    except ServiceError:
+        now = datetime.now(UTC)
+        period = (
+            f"expired {cert.not_valid_after_utc.date().isoformat()}"
+            if cert.not_valid_after_utc < now
+            else f"is not valid until {cert.not_valid_before_utc.date().isoformat()}"
+        )
+        if allow_expired:
+            return (
+                f"Server certificate {certificate_name(der)} {period}; connecting anyway "
+                "(allow_expired_server_certificate)"
+            )
+        raise ConnectionSecurityError(
+            f"server certificate {certificate_name(der)} {period}",
+            "renew it on the server, or set allow_expired_server_certificate on this server",
+        ) from None
+    return ""
+
+
 def _is_pem(data: bytes) -> bool:
     return data.lstrip().startswith(b"-----BEGIN")
 
@@ -319,12 +458,9 @@ def _load_private_key(path: str | Path) -> uacrypto.CertProperties:
 
 def _application_uri(cert_der: bytes) -> str:
     """The SubjectAltName URI the session must present, or the default."""
-    cert = x509.load_der_x509_certificate(cert_der)
-    with contextlib.suppress(x509.ExtensionNotFound):
-        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-        uris = san.value.get_values_for_type(x509.UniformResourceIdentifier)
-        if uris:
-            return uris[0]
+    uris = _san_uris(x509.load_der_x509_certificate(cert_der))
+    if uris:
+        return uris[0]
     logger.warning("Client certificate has no application URI; servers may reject it")
     return APPLICATION_URI
 
@@ -394,7 +530,9 @@ def validate_security(
     if user_certificate_file and not secure:
         raise ValueError("a user certificate needs security_mode Sign or SignAndEncrypt")
     if server_certificate not in SERVER_CERTIFICATE_POLICIES:
-        raise ValueError(f"server_certificate must be auto or strict, got '{server_certificate}'")
+        raise ValueError(
+            f"server_certificate must be trust_list or strict, got '{server_certificate}'"
+        )
     strict = server_certificate == "strict"
     if strict:
         if not secure:
@@ -676,8 +814,9 @@ class OPCUAClient:
         poll_interval: float = 1.0,
         certificate_file: str = "",
         private_key_file: str = "",
-        server_certificate: str = "auto",
+        server_certificate: str = "trust_list",
         server_certificate_file: str = "",
+        allow_expired_server_certificate: bool = False,
         user_certificate_file: str = "",
         user_private_key_file: str = "",
         downgrade_from: str = "",
@@ -698,8 +837,11 @@ class OPCUAClient:
             poll_interval: Polling interval in seconds
             certificate_file: Client certificate (DER or PEM); empty to generate one
             private_key_file: Client private key (DER or PEM), unencrypted
-            server_certificate: auto accepts the server's certificate, strict pins it
+            server_certificate: trust_list accepts a certificate in PKI_DIR/trusted
+                (`auto`, its v0.1.1 name, too); strict only server_certificate_file
             server_certificate_file: With strict, the only server certificate accepted
+            allow_expired_server_certificate: Connect to a server whose certificate is
+                outside its validity period, warning on every connect
             user_certificate_file: X.509 user identity certificate; empty for Anonymous
             user_private_key_file: Private key for the user certificate
             downgrade_from: The secure default this server's None mode overrides;
@@ -720,6 +862,8 @@ class OPCUAClient:
             raise ValueError(f"transport must be one of {', '.join(TRANSPORTS)}, got '{transport}'")
         if min_update_interval <= 0:
             raise ValueError(f"min_update_interval must be positive, got {min_update_interval}")
+        if server_certificate == LEGACY_TRUST_LIST:
+            server_certificate = "trust_list"
         validate_security(
             security_mode,
             security_policy,
@@ -747,6 +891,7 @@ class OPCUAClient:
         self.certificate_file = certificate_file
         self.private_key_file = private_key_file
         self.server_certificate_file = server_certificate_file
+        self.allow_expired_server_certificate = allow_expired_server_certificate
         self.user_certificate_file = user_certificate_file
         self.user_private_key_file = user_private_key_file
         self._pinned_server_cert = (
@@ -756,6 +901,8 @@ class OPCUAClient:
         self._identity: tuple[bytes, uacrypto.CertProperties, str] | None = None
         self._cert_path: Path | None = None
         self._server_thumbprint: str | None = None
+        # Thumbprint of the last server certificate refused as untrusted.
+        self.rejected_thumbprint: str | None = None
 
         self._client: Client | None = None
         # The last session, if its channel is gone (see _detach, _resume_on_open);
@@ -767,9 +914,9 @@ class OPCUAClient:
         self._stop_event: asyncio.Event | None = None
         self._running = False
         self._connected = False
-        # Why the last connect failed; whether it was the server refusing our certificate.
+        # Why the last connect failed, and what the user can do about it.
         self.last_error: str | None = None
-        self._cert_rejected = False
+        self.fix = ""
         self.ever_connected = False
         # In the runner's first connect: the runner reports a failure. Set when it is over.
         self._at_start = False
@@ -889,9 +1036,9 @@ class OPCUAClient:
     async def _apply_security(self, client: Client) -> None:
         """Configure `client` for exactly the configured mode and policy, or raise.
 
-        GetEndpoints is unauthenticated, so the pin compare is only the readable
-        refusal; the real check is OPN encrypted to the certificate passed to
-        set_security. With server_certificate=None asyncua would downgrade to None.
+        GetEndpoints is unauthenticated: the certificate checked here is the one
+        OPN is encrypted to, so a substitute cannot complete the handshake. With
+        server_certificate=None asyncua would downgrade to None.
         """
         mode = SECURITY_MODES[self.security_mode]
         policy = SECURITY_POLICIES[self.security_policy]
@@ -927,10 +1074,24 @@ class OPCUAClient:
         # A chained ServerCertificate is trimmed to the leaf.
         server_cert = uacrypto.der_from_x509(uacrypto.x509_from_der(endpoint.ServerCertificate))
         actual = thumbprint(server_cert)
-        if self._pinned_server_cert is not None and server_cert != self._pinned_server_cert:
+        warning = await check_server_certificate(
+            server_cert, endpoint.Server, self.allow_expired_server_certificate
+        )
+        if warning:
+            self._log.warning("%s", warning)
+        if self._pinned_server_cert is not None:
+            if server_cert != self._pinned_server_cert:
+                raise ConnectionSecurityError(
+                    f"server certificate SHA-1 {actual} does not match pinned "
+                    f"{thumbprint(self._pinned_server_cert)} ({self.server_certificate_file})"
+                )
+        elif not is_trusted(server_cert, PKI_DIR):
+            saved = reject(server_cert, PKI_DIR)
+            self.rejected_thumbprint = actual
             raise ConnectionSecurityError(
-                f"server certificate SHA-1 {actual} does not match pinned "
-                f"{thumbprint(self._pinned_server_cert)} ({self.server_certificate_file})"
+                f"server certificate {certificate_name(server_cert)} is not trusted; "
+                f"saved to {saved}",
+                f"move it into {PKI_DIR / TRUSTED_DIR} or run the trust_server_certificate action",
             )
         if actual != self._server_thumbprint:
             self._server_thumbprint = actual
@@ -1177,7 +1338,7 @@ class OPCUAClient:
             self._connected = False
             self.last_error, level = self._connect_failure(e)
             if not self._at_start:  # at start the runner reports it
-                hint = "; trust it on the server" if self._cert_rejected else ""
+                hint = f"; {self.fix}" if self.fix else ""
                 self._log.log(
                     level, "Connection to %s failed: %s%s", self.endpoint, self.last_error, hint
                 )
@@ -1185,14 +1346,15 @@ class OPCUAClient:
 
     def _connect_failure(self, error: Exception) -> tuple[str, int]:
         """Why a connect failed, and the level to log it at: a security refusal is an ERROR."""
-        self._cert_rejected = False
+        self.fix = ""
         if isinstance(error, Unreachable):
             return str(error), logging.WARNING
         if isinstance(error, ConnectionSecurityError):
+            self.fix = error.fix
             return str(error), logging.ERROR
         code = error.code if isinstance(error, ua.UaStatusCodeError) else None
         if code in CERT_REJECTED_CODES and self._identity is not None:
-            self._cert_rejected = True
+            self.fix = "trust it on the server"
             return (
                 f"server rejected this extension's client certificate {self._cert_path} "
                 f"(SHA-1 {thumbprint(self._identity[0])})"
@@ -2194,11 +2356,7 @@ class OPCUARunner:
             return False
         self.failed_at_start = [c for c in self.clients.values() if not c._connected]
         for c in self.failed_at_start:
-            hint = (
-                "; trust it on the server, then start the extension again"
-                if c._cert_rejected
-                else ""
-            )
+            hint = f"; {c.fix}, then start the extension again" if c.fix else ""
             logger.error(
                 "Server '%s' (%s): cannot connect: %s%s", c.name, c.endpoint, c.last_error, hint
             )

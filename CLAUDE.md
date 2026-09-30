@@ -32,7 +32,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 | `zelos_extension_opcua/demo/profiles.py` | gateway / s7 / device address spaces, `--map` serving |
 | `tests/test_opcua.py` | Extension tests |
 | `tests/test_sim.py` | Simulator profile and flag tests |
-| `tests/test_security.py` | Secure sessions, cert trust and pinning, config errors, per-server security inheritance |
+| `tests/test_security.py` | Secure sessions, client and server cert trust, pinning, validity/ApplicationUri checks, config errors, per-server security inheritance |
 | `tests/test_transport.py` | Subscriptions and source timestamps, refusal fallback on the `s7` caps, staleness refresh, `poll` transport |
 | `tests/test_servers.py` | Several servers in one runner: layout, isolation, recovery, action selection |
 | `tests/test_discovery.py` | Discovery per profile, limits, health, `discovered_map`, naming, `auto_config` |
@@ -59,7 +59,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 - Free functions in `actions.py`, bound via `set_runner`. Optional `server`: `ValueError` listing names when omitted with several; `get_status` / `list_*` cover all.
 - Failure convention: **raise**. The protocol reads the verdict from the exception, so `{"success": False}` reports success. Input errors `ValueError`; unknown errors become `RuntimeError` after `logger.exception`.
 - `auto_config(config)`: the app passes the live form; none = saved config; no servers = probe localhost/LDS/mDNS. Keeps entries as entered; fills `default` security only when the server lacks the form's Advanced one.
-- `auto_config` is the one standalone action (own `asyncio.run`, safe off the loop thread); the schema's `ui:options.autoconfig` names it, keep in step.
+- Standalone: `auto_config` (own `asyncio.run`, safe off the loop thread; the schema's `ui:options.autoconfig` names it, keep in step) and the server certificate trust actions.
 - Everything else dispatches via `OPCUARunner._run_coro` into the polling loop. No connect-per-action, no ad-hoc `asyncio.run` fallback (mutating client state from a foreign loop silently lost every later sample); no loop = `RuntimeError("extension is not running")`.
 - A dispatch timeout cancels the coroutine, stopping an unsent write. After a Write is `sent` it cannot be recalled: raise a TimeoutError saying the server may have applied it.
 
@@ -117,7 +117,11 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 ### Security
 
-- `_apply_security` reads GetEndpoints, refuses a missing mode/policy pair, then passes the server certificate explicitly: with `server_certificate=None` asyncua silently switches to a None channel. `strict` compares the pin first for a readable error; the real check is OPN encryption.
+- `_apply_security` reads GetEndpoints, refuses a missing mode/policy pair, then passes the server certificate explicitly: with `server_certificate=None` asyncua silently switches to a None channel. The certificate checked is the one OPN is encrypted to, so a substitute cannot complete the handshake.
+- Server certificate, before any session: `check_server_certificate` (asyncua `CertificateValidator`, URI then TIME_RANGE; `allow_expired_server_certificate` turns the time refusal into a WARNING), then `strict` pin or `trust_list`: DER match against any file in `PKI_DIR/trusted` (read per connect); a miss is written to `rejected/<SHA-1>.der` and raised with `fix`. No chain/CRL check.
+- `auto` (v0.1.1) is accepted as `trust_list`: kept in the schema enum (`ui:enumDisabled`) so saved configs validate.
+- `ConnectionSecurityError.fix` / `OPCUAClient.fix`: what the user does, appended to the ERROR (at start: ", then start the extension again").
+- `trust_server_certificate` / `list_server_certificates` are standalone (files only): at start an untrusted server stops the extension. `server` resolves only while running (`rejected_thumbprint`).
 - Generated client cert in `PKI_DIR` is never rotated early (servers trust by thumbprint); `application_uri` comes from its SAN.
 - No secrets in config. User cert: `load_client_certificate` / `load_private_key` set the USER identity (app cert goes to `set_security`). Needs a secure mode and a Certificate token policy, checked before connect because asyncua otherwise invents one.
 
@@ -125,7 +129,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 - asyncua has no `UaProcessor` hook, so `_SimServer.start` re-implements `Server.start` (asyncua 2.0.1) to install `_SimProcessor`, which adds enforced limits, session/subscription/item/continuation caps, BrowseNext, ServerTimestamp on Read, diagnostics counts.
 - Session cap counts `iserver._external_sessions` (a lost connection's session with subscriptions stays until timeout, as on a PLC). On an asyncua bump recheck `Server.start`, `OPCUAProtocol.connection_made`, and `UaProcessor._process_message` around a request (`_browse` mirrors its session checks and activity stamps).
-- Unique ApplicationUri per start (`auto_config` dedupes on it). `--nodes` uses one AddNodes per folder with read-time callbacks (node-by-node costs ~1.3 ms each).
+- Unique ApplicationUri and server certificate per start (`auto_config` dedupes on the URI); `Simulator(certificate=, application_uri=)` fixes them for certificate tests. `--nodes` uses one AddNodes per folder with read-time callbacks (node-by-node costs ~1.3 ms each).
 
 ## Node ID Format
 

@@ -241,7 +241,9 @@ class _Report:
         if self.secure:
             notes.append(
                 "Secure servers need this extension's client certificate trusted on the "
-                "server; it is generated on the first connect and its thumbprint logged."
+                "server; it is generated on the first connect and its thumbprint logged. "
+                "Each server's certificate must also be trusted here: the first start saves "
+                "it and says how."
             )
         return {"status": "success", "message": " ".join(notes), "config": config}
 

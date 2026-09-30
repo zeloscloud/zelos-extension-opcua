@@ -421,6 +421,8 @@ class Simulator:
         node_map: NodeMap | None = None,
         nodes: int = 0,
         secure_only: bool = False,
+        certificate: tuple[Path, Path] | None = None,
+        application_uri: str = "",
     ) -> None:
         """Configure; nothing binds until `start`.
 
@@ -436,6 +438,8 @@ class Simulator:
             node_map: Serve this map instead of a profile
             nodes: Add this many Float variables under `Bulk` (see `profiles.build_bulk`)
             secure_only: With `secure`, offer no None endpoint
+            certificate: With `secure`, this (DER cert, PEM key) instead of a new one
+            application_uri: Instead of a unique one per start
         """
         self.profile = PROFILES[profile]
         self.host = host
@@ -447,6 +451,8 @@ class Simulator:
         self.node_map = node_map
         self.nodes = nodes
         self.secure_only = secure_only
+        self.certificate = certificate
+        self.application_uri = application_uri
         self.limits = None if node_map else self.profile.limits
         #: (session id or None before CreateSession, service name) per request
         self.request_log: list[tuple[str | None, str]] = []
@@ -483,7 +489,9 @@ class Simulator:
         server.set_endpoint(f"opc.tcp://{self.host}:{self.port}/freeopcua/server/")
         server.set_server_name(self.profile.server_name)
         # Unique per instance, as a real server's is: discovery dedupes on it.
-        await server.set_application_uri(f"urn:zelos:sim:{uuid.uuid4().hex[:12]}")
+        await server.set_application_uri(
+            self.application_uri or f"urn:zelos:sim:{uuid.uuid4().hex[:12]}"
+        )
         await self._setup_security(server)
 
         shift = namespace_shift() if self.shuffle_namespaces else 0
@@ -519,16 +527,19 @@ class Simulator:
         if not self.secure:
             server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
             return
-        self._pki = Path(tempfile.mkdtemp(prefix="zelos-opcua-sim-"))
-        key, cert = self._pki / "server_key.pem", self._pki / "server_cert.der"
-        await setup_self_signed_certificate(
-            key,
-            cert,
-            server.get_application_uri(),
-            socket.gethostname(),
-            [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
-            {"commonName": "Zelos OPC-UA Simulator"},
-        )
+        if self.certificate:
+            cert, key = self.certificate
+        else:
+            self._pki = Path(tempfile.mkdtemp(prefix="zelos-opcua-sim-"))
+            key, cert = self._pki / "server_key.pem", self._pki / "server_cert.der"
+            await setup_self_signed_certificate(
+                key,
+                cert,
+                server.get_application_uri(),
+                socket.gethostname(),
+                [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH],
+                {"commonName": "Zelos OPC-UA Simulator"},
+            )
         await server.load_certificate(str(cert))
         await server.load_private_key(str(key))
         server.set_security_policy(
