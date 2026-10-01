@@ -360,6 +360,7 @@ def list_server_certificates() -> dict[str, Any]:
     "thumbprint",
     title="Thumbprint",
     description="SHA-1 thumbprint from the error or List Server Certificates",
+    required=False,
 )
 def trust_server_certificate(thumbprint: str = "") -> dict[str, Any]:
     path, der = _client.trust(_client.PKI_DIR, thumbprint)
