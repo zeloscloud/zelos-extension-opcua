@@ -121,7 +121,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 - Server certificate, before any session: first `strict` pin or `trust_list` (DER match against any file in `PKI_DIR/trusted`, read per connect); a miss is written to `rejected/<SHA-1>.der`, even if expired, and raised naming every problem, so one fix suffices. Then validity (`allow_expired_server_certificate` turns the refusal into a WARNING). ApplicationUri mismatch on a trusted certificate: WARNING (GetEndpoints is unauthenticated; the exact DER is trusted). `certificate_problems` compares directly, no asyncua validator. No chain/CRL check.
 - `auto` (v0.1.1) is accepted as `trust_list`: kept in the schema enum (`ui:enumDisabled`) so saved configs validate.
 - `ConnectionSecurityError.fix` / `OPCUAClient.fix`: what the user does, appended to the ERROR (at start: ", then start the extension again").
-- `trust_server_certificate` (explicit thumbprint; missing or unknown lists the rejected, as Kepware/UaExpert require a selection) / `list_server_certificates` are standalone (files only): at start an untrusted server stops the extension.
+- `trust_server_certificate` (explicit thumbprint; missing or unknown lists the rejected, as other OPC UA tools require a selection) / `list_server_certificates` are standalone (files only): at start an untrusted server stops the extension.
 - Generated client cert in `PKI_DIR` is never rotated early (servers trust by thumbprint); `application_uri` comes from its SAN.
 - No secrets in config. User cert: `load_client_certificate` / `load_private_key` set the USER identity (app cert goes to `set_security`). Needs a secure mode and a Certificate token policy, checked before connect because asyncua otherwise invents one.
 

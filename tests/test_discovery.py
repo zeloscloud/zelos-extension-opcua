@@ -46,7 +46,7 @@ async def test_gateway_discovery_and_health():
     async with Simulator("gateway", port=0) as sim:
         client, values = await discovered(sim)
         try:
-            # Kepware Channel.Device.Tag; _System/_Statistics and Server not followed.
+            # Gateway Channel.Device.Tag; _System/_Statistics and Server not followed.
             assert set(client.node_map.events) == {"Genset/Controller", "ModbusTCP/PowerMeter"}
             meter = client.node_map.events["ModbusTCP/PowerMeter"]
             assert {n.name for n in meter} == {t[0] for t in profiles.POWER_METER}
@@ -67,7 +67,7 @@ async def test_gateway_discovery_and_health():
 @pytest.mark.parametrize(
     ("include", "exclude", "voltages", "filtered"),
     [
-        # A branch takes its subtree (Kepware's Add Branches). Filtered: Genset,
+        # A branch takes its subtree (as OPC UA gateways add branches). Filtered: Genset,
         # asyncua's Aliases and Locations, and any Voltage_* tags.
         (["ModbusTCP/PowerMeter"], [], True, 3),
         ([], ["**/Controller"], True, 1),

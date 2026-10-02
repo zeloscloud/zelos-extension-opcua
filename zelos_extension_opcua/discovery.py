@@ -107,7 +107,7 @@ VENDOR_IDS: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], list[str]]], 
     (re.compile(r"^\|var\|[^.]+\.(.+)$"), lambda m: m[1].split(".")),
     # B&R: ::Task:Var, ::AsGlobalPV:Var
     (re.compile(r"^::([^:]+):(.+)$"), lambda m: [m[1], *m[2].split(".")]),
-    # Kepware Channel.Device.Tag, TwinCAT MAIN.var
+    # Gateway Channel.Device.Tag, TwinCAT MAIN.var
     (re.compile(r'^[^"|:]+\.[^"|:]+$'), lambda m: m[0].split(".")),
 )
 
@@ -228,7 +228,7 @@ class PathFilter:
 
     `*`, `?`, `[...]` match within one segment (fnmatch, case-sensitive); `**`
     any number of segments. Empty include = everything; a branch matching one
-    takes its whole subtree (Kepware's Add Branches). A node matching an exclude
+    takes its whole subtree (as OPC UA gateways add branches). A node matching an exclude
     is dropped with everything below it; exclude wins over include.
     """
 
@@ -401,7 +401,7 @@ async def walk(
 ) -> tuple[list[Found], list[str], int]:
     """Breadth-first from Objects over forward hierarchical references.
 
-    Not followed: Server (i=2253), Objects named `_*` (Kepware's _System etc.),
+    Not followed: Server (i=2253), Objects named `_*` (a gateway's _System etc.),
     HasProperty (EngineeringUnits / EURange are recorded), and what `filters`
     rules out (nothing below is browsed). Variables are browsed too: struct
     members hang off them. A node filtered out on one path is still taken on

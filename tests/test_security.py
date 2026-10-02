@@ -227,7 +227,7 @@ async def test_server_trust_list(tmp_path, pki, caplog):
         listed = actions.list_server_certificates()
         assert [c["thumbprint"] for c in listed["rejected"]] == [thumbprint(der)]
 
-        # Explicit selection, as Kepware and UaExpert: a missing one lists the candidates.
+        # Explicit selection, as other OPC UA tools: a missing one lists the candidates.
         with pytest.raises(ValueError, match=f"Rejected: {re.escape(name)}$"):
             actions.trust_server_certificate()
         result = actions.trust_server_certificate(thumbprint(der).lower())
