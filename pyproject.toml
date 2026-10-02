@@ -22,7 +22,7 @@ dependencies = [
     # 0.0.12a1 floor: standalone actions (auto_config runs with the extension
     # stopped). A prerelease floor on the direct dep is what lets uv resolve it.
     "zelos-sdk>=0.0.12a1",
-    # 2.0.1 floor: 1.x sends a ServerUri that .NET-stack and Unified Automation
+    # 2.0.1 floor: 1.x sends a ServerUri that .NET-stack and C++ SDK
     # servers reject (BadServerUriInvalid); the sim re-implements 2.0.1 internals
     "asyncua>=2.0.1",
     "rich-click>=1.8.0",

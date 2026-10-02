@@ -105,7 +105,7 @@ async def _add_tags(
     return nodes
 
 
-# -- gateway: Kepware-shaped `Channel.Device.Tag` -----------------------------
+# -- gateway: OPC UA gateway-shaped `Channel.Device.Tag` ----------------------
 
 POWER_METER: list[Tag] = [
     ("Voltage_L1", VT.Float, 230.0, _wave(230.0, 2.0, 60, 0.3)),
@@ -146,7 +146,7 @@ GATEWAY_CHANNELS: dict[str, dict[str, list[Tag]]] = {
 
 
 async def build_gateway(server: Server, ns: dict[str, int]) -> Drifter:
-    """Kepware-shaped gateway: `_System` / `_Statistics` noise around real tags."""
+    """OPC UA gateway: `_System` / `_Statistics` noise around real tags."""
     idx = ns[GATEWAY_URI]
     points: list[tuple[UaNode, VT, Drift]] = []
     objects = server.nodes.objects

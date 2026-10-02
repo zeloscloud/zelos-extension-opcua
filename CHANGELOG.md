@@ -55,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shutdown is bounded (~3s): SIGTERM/SIGINT close sessions cleanly and cancel an in-flight connect.
 - A missing or unparseable `node_map_file` is a startup error.
 - Demo node map: `sensor1`/`sensor2` renamed to `temp_sensor*` / `pressure_sensor*`.
-- asyncua 2.0.1 (was 1.1.8): fixes BadServerUriInvalid against .NET-stack (Microsoft OPC PLC) and Unified Automation servers.
+- asyncua 2.0.1 (was 1.1.8): fixes BadServerUriInvalid against .NET-stack and C++ SDK servers.
 - zelos-sdk floor 0.0.12a1; `zelos` app floor `>=26.0.4`.
 - Manifest uses `[host] type = "agent"` + `[host.agent]` and `[package]`; `name` is `OPC-UA` (archive slug `opc-ua`); packaging runs `zelos extensions package`.
 - CI checks `uv lock --locked`; `just check` enforces `ruff format --check`.
