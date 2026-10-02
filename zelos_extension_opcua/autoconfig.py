@@ -32,10 +32,10 @@ logger = logging.getLogger(__name__)
 WELL_KNOWN_PORTS = (
     4840,  # IANA OPC UA, most servers and Local Discovery Servers
     4841,  # a second server beside one on 4840
-    48010,  # Unified Automation demo / C++ SDK
-    49320,  # Kepware KEPServerEX
+    48010,  # a C++ SDK demo server
+    49320,  # a common OPC UA gateway
     62541,  # OPC Foundation .NET reference server
-    53530,  # Prosys Simulation Server
+    53530,  # a common simulation server
 )
 LDS_URL = "opc.tcp://localhost:4840"
 MDNS_SERVICE = "_opcua-tcp._tcp.local."
