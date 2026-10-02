@@ -568,7 +568,7 @@ def test_revisions_report_sampling_and_queue_size():
 
 @pytest.mark.parametrize("transport", ["subscription", "poll"])
 async def test_uncertain_values_are_traced_bad_are_not(transport, caplog):
-    """Uncertain is usable (Part 8, as Kepware keeps it); Bad is a gap."""
+    """Uncertain is usable (Part 8, as OPC UA gateways keep it); Bad is a gap."""
     node_map = NodeMap.from_dict(
         {
             "events": {

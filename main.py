@@ -131,7 +131,7 @@ def demo_server(
     \b
     Profiles:
         demo     the DemoPLC used by demo mode
-        gateway  Kepware-shaped Channel.Device.Tag with _System/_Statistics noise
+        gateway  OPC UA gateway-shaped Channel.Device.Tag with _System/_Statistics noise
         s7       S7-1500-shaped "DB"."tag", small OperationLimits, 4-session cap
         device   DI DeviceSet, EU/EURange, array, struct, Bad node, cycle, depth
 

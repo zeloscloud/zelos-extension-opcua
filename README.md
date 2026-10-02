@@ -76,11 +76,11 @@ A server without a `node_map_file` is browsed on every connect (read-only, nothi
 
 | Aspect | Behavior |
 |---|---|
-| Walk | Forward hierarchical references from `Objects`; skips `Server`, Objects named `_*` (Kepware `_System`, ...), properties |
+| Walk | Forward hierarchical references from `Objects`; skips `Server`, Objects named `_*` (gateway `_System`, ...), properties |
 | Filters | `include` / `exclude` globs over the browse path below `Objects`, each BrowseName sanitized as traced (`ModbusTCP/PowerMeter/Voltage_L1`): `*` `?` `[..]` within one segment (fnmatch, case-sensitive), `**` any number of segments. Empty include = everything; an included branch takes its whole subtree (`ModbusTCP/PowerMeter`); a node matching an exclude is dropped with everything below it; exclude wins. Branches no include can reach are not browsed; a node under several parents is taken if any path passes. The path equals the trace name except on vendor-id servers (Siemens, CODESYS, B&R, TwinCAT), where the trace name comes from the node id (an S7 `"DB"."tag"` traces as `DB/tag` whatever folders hold it). `filtered N` (variables and branches) in the discovery INFO line; a WARNING when nothing is left |
 | Traced | Every scalar variable of a supported type; arrays, structs, other types skipped (one INFO count per connect) |
 | Vendor DataTypes | A subtype (HasSubtype) of a builtin integer is typed as it: a vendor Int64 keeps all 64 bits |
-| Event / field | Event = parent path below `Objects` (`Line1/Motor`), field = BrowseName; vendor string ids (Kepware/TwinCAT dots, Siemens `"DB"."tag"`, CODESYS, B&R `::Task:Var`) name the event from the id |
+| Event / field | Event = parent path below `Objects` (`Line1/Motor`), field = BrowseName; vendor string ids (gateway/TwinCAT dots, Siemens `"DB"."tag"`, CODESYS, B&R `::Task:Var`) name the event from the id |
 | Collisions | Every collider is named `<field>_<hash>` (6 hex of SHA-1 of its `nsu=` id, stable); one WARNING per connect; a name never moves to another node |
 | Changes on reconnect | New event: traced. New field: new trace segment (joined by the app). Changed datatype: skipped with one WARNING until restart |
 | Browse errors | BadNoContinuationPoints: re-browsed alone; other Bad: one WARNING per connect |
@@ -116,7 +116,7 @@ With none, it looks on this machine and adds what it finds:
 
 | Source | What |
 |---|---|
-| localhost ports | GetEndpoints on 4840, 4841, 48010, 49320 (Kepware), 62541, 53530 (Prosys), 2s each, in parallel |
+| localhost ports | GetEndpoints on 4840, 4841, 48010, 49320, 62541, 53530 (common server defaults), 2s each, in parallel |
 | Local Discovery Server | FindServers on `opc.tcp://localhost:4840` |
 | mDNS | 2s passive browse for `_opcua-tcp._tcp.local.` |
 
@@ -200,7 +200,7 @@ just sim          # standalone simulator (see Simulator)
 | Profile | Exercises |
 |---|---|
 | `demo` | The demo-mode PLC (`ns=2;s=Temperature.Sensor1`, ...) |
-| `gateway` | Kepware-shaped `ns=2;s=Channel.Device.Tag` (power meter, genset) with `_System` / `_Statistics` noise |
+| `gateway` | OPC UA gateway-shaped `ns=2;s=Channel.Device.Tag` (power meter, genset) with `_System` / `_Statistics` noise |
 | `s7` | S7-1500-shaped `ns=3;s="DB"."tag"`; enforced MaxNodesPerBrowse 10, MaxNodesPerRead 20, 10 references per node (BrowseNext), 3 continuation points, 4 sessions (a lost connection's counts until it times out), 5 subscriptions and 10 monitored items per session |
 | `device` | DI `DeviceSet` identity, EngineeringUnits + EURange, a Double[4] array, a vendor struct, an abstract Number node, a Bad-status node, a reference cycle, a 14-level branch |
 

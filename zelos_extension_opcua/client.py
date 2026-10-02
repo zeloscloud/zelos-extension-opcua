@@ -68,7 +68,7 @@ RECONNECT_MAX = 60.0
 # Ceiling on the disconnect at shutdown: a wedged session must not make the process unkillable.
 SHUTDOWN_TIMEOUT = 3.0
 
-# Requested session timeout, ms (Ignition's default; asyncua asks 1 h). A session
+# Requested session timeout, ms (a common client default; asyncua asks 1 h). A session
 # whose connection died holds one of a PLC's few slots until it expires.
 SESSION_TIMEOUT_MS = 120_000
 
@@ -2004,7 +2004,7 @@ class OPCUAClient:
         self._poll_count += 1
 
     async def _poll_chunk(self, targets: list[Target], interval: float) -> None:
-        # A value up to one interval old is as good as a device read (Kepware's MaxAge).
+        # A value up to one interval old is as good as a device read (MaxAge, as gateways do).
         samples = await self._read_targets(targets, max_age=interval * 1000)
         self._log_samples(samples, time.time_ns())
 
@@ -2084,7 +2084,7 @@ class OPCUAClient:
     def _decode(self, node: Node, dv: ua.DataValue) -> Any:
         """A sample's value in its node's datatype; None if Bad, empty or undecodable.
 
-        Uncertain is traced: usable per Part 8, as Kepware keeps it.
+        Uncertain is traced: usable per Part 8, as OPC UA gateways keep it.
         """
         status = dv.StatusCode
         if status is not None and status.is_uncertain():
