@@ -5,13 +5,11 @@ A Zelos extension for OPC-UA. Trace PLCs, gateways, and other OPC-UA servers by 
 ## Features
 
 - 📡 **Subscriptions or polling**: Server-pushed changes by default; refused items are polled in batched Reads
-- 🔍 **Discovery**: A server without a node map is browsed on every connect and every scalar variable traced (read-only)
+- 🔍 **Discovery**: No node map needed; every scalar variable is found and traced
 - 📄 **Node map files**: Pin node ids, names, units, and scaling in a simple JSON file
-- 🔒 **Secure connections**: None / Sign / SignAndEncrypt with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss; X.509 user login
+- 🔒 **Secure connections**: Signed and encrypted sessions, X.509 user login
 - 🏭 **Multiple servers**: Any number in one extension; one unreachable server never stalls the others
-- 🔄 **Reconnection**: Sessions resume across drops with subscriptions kept, so flaps never exhaust a PLC's few session slots
 - ✏️ **Read, write & browse actions**: Interactive node access from the Zelos App
-- 🔢 **Data types**: bool, int8-64, uint8-64, float32/64, string
 - 🧪 **Demo mode**: Built-in PLC simulator for testing without hardware
 
 ## Quick Start
@@ -63,13 +61,11 @@ Every server must connect at start, or the extension stops with an error naming 
 
 ### Secure connections
 
-1. Set Security Mode / Policy (e.g. `SignAndEncrypt` / `Basic256Sha256`). A server that does not offer it is refused; there is no fallback to None.
-2. On first connect the extension generates a client certificate and logs its path. **Trust it on the server.**
-3. **Trust the server's certificate here** with the `trust_server_certificate` action, then start again.
+Set Security Mode / Policy, then trust the client certificate (path logged on first connect) on the server, and the server's certificate here with `trust_server_certificate`.
 
 ### Discovery
 
-A server without a node map is browsed on every connect and every scalar variable is traced, read-only. Events are named from the browse path (`Line1/Motor`), fields from the node. Narrow it with `include` / `exclude`; `discovered_map` exports what was found as a node map to pin or edit.
+A server without a node map is browsed on connect and every scalar variable traced. `include` / `exclude` narrow it; `discovered_map` exports the result as a node map.
 
 ### Auto-configure
 
