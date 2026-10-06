@@ -33,111 +33,52 @@ In the app:
 
 ## Configuration
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `servers[]` | array | `[]` | One entry per server; at least one |
-| `servers[].name` | string | endpoint host | Trace and action name (`plc01`, `192_168_1_10`); must be unique |
-| `servers[].endpoint` | string | `opc.tcp://localhost:4840` | Server endpoint URL |
-| `servers[].node_map_file` | string | `""` | Path to the JSON node map; empty discovers the address space |
-| `servers[].poll_interval` | number | `1.0` | Seconds: subscription sampling/publishing interval, poll period, `_server` period |
-| `servers[].transport` | string | `default` | `default` (inherit), `subscription`, `poll` |
-| `servers[].min_update_interval` | number \| null | `null` | Seconds; empty inherits the advanced value |
-| `servers[].include` / `exclude` | string[] | `[]` | Discovery path globs; empty inherits the advanced list |
-| `servers[].security_mode` | string | `default` | `default` (inherit), None, Sign, SignAndEncrypt |
-| `servers[].security_policy` | string | `default` | `default` (inherit), None, Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss |
-| `servers[].user_certificate_file` | string | `""` | User certificate; empty inherits the advanced pair |
-| `servers[].user_private_key_file` | string | `""` | Key for this server's user certificate |
-| `servers[].server_certificate` | string | `trust_list` | `trust_list`: certificates in `pki/trusted/` (`auto`, the v0.1.1 value, means the same); `strict`: only `server_certificate_file` |
-| `servers[].server_certificate_file` | string | `""` | Pinned server certificate (DER/PEM) for `strict` |
-| `servers[].allow_expired_server_certificate` | boolean | `false` | Connect despite an expired (or not yet valid) server certificate, WARNING on every connect |
-| `advanced.prefix` | string | `OPC-UA` | Trace source every server publishes under; clear for one source per server |
-| `advanced.timeout` | number | `5.0` | Request timeout in seconds |
-| `advanced.log_level` | string | `INFO` | Logging verbosity; an unknown value falls back to INFO |
-| `advanced.discovery` | boolean | `true` | Browse servers without a node map; off, such a server polls only its health |
-| `advanced.include` | string[] | `[]` | Discovery: path globs to trace (see Discovery); empty traces everything |
-| `advanced.exclude` | string[] | `[]` | Discovery: path globs not traced nor browsed below; wins over include |
-| `advanced.transport` | string | `subscription` | `subscription`: server-pushed changes, polling what is refused; `poll`: batched Reads only |
-| `advanced.min_update_interval` | number | `60` | Seconds a subscribed node may stay silent before it is re-read |
-| `advanced.certificate_file` | string | `""` | Client certificate (DER/PEM), shared by every server; empty generates one |
-| `advanced.private_key_file` | string | `""` | Unencrypted client key (DER/PEM); set with `certificate_file` |
-| `advanced.security_mode` | string | `None` | Default for servers set to `default` |
-| `advanced.security_policy` | string | `None` | Default for servers set to `default` |
-| `advanced.user_certificate_file` | string | `""` | Default X.509 user certificate (DER/PEM); empty for Anonymous; needs Sign or SignAndEncrypt |
-| `advanced.user_private_key_file` | string | `""` | Unencrypted user key (DER/PEM); set with `user_certificate_file` |
+### Servers
 
-Trace layout: `OPC-UA/<server>/<event>` (e.g. `OPC-UA/plc01/temperature`); with `advanced.prefix` cleared, one source per server (`plc01/temperature`). Logs go to `OPC-UA/log` (cleared: `opcua_log`); `log` is not a valid server name.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Name | endpoint host | Trace name (`plc01`); unique |
+| Server Endpoint | `opc.tcp://localhost:4840` | Server endpoint URL |
+| Node Map File | | JSON [node map](#node-map); empty = [discovery](#discovery) |
+| Poll Interval | `1.0` | Seconds between updates |
+| Transport | `subscription` | `subscription` (server pushes changes) or `poll` |
+| Security Mode / Policy | `None` | See [Secure connections](#secure-connections) |
 
-Startup errors: the pre-`servers[]` flat config; `username` / `password`, or credentials in the endpoint URL (`opc.tcp://user:pw@host`; no secret is stored in config, use a user certificate); a missing or unparseable `node_map_file`.
+### Advanced
 
-### Connections
+Applies to every server unless the server overrides it.
 
-- **Start**: Every server must connect at start: one that cannot be reached or refuses the session (e.g. an untrusted certificate) stops the extension with one ERROR naming it (`Server 'plc' (opc.tcp://10.0.0.5:4840): cannot connect: connection refused`); fix it and start again. Once connected, drops are retried
-- **Reconnection**: Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request. Session timeout 120 s requested. A lost connection resumes its session on the new one, subscriptions kept and notifications missed meanwhile recovered by Republish; a session the server no longer holds (timed out, server restarted) is replaced by a new one. Either way one session per server, so flaps never exhaust a PLC's few session slots
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `prefix` | `OPC-UA` | Trace source: `OPC-UA/plc01/temperature`; cleared = one source per server |
+| `timeout` | `5.0` | Request timeout (s) |
+| `log_level` | `INFO` | Logging verbosity |
+| `discovery` | on | Browse servers without a node map |
+| `include` / `exclude` | | Discovery path globs (`Line1/**`) |
+| `min_update_interval` | `60` | Re-read a subscribed node silent this long (s) |
+| `certificate_file` / `private_key_file` | | Client certificate; empty generates one |
+| `user_certificate_file` / `user_private_key_file` | | X.509 user login; empty = Anonymous |
+
+Every server must connect at start, or the extension stops with an error naming it. Once running, a dropped connection is retried with backoff and its session resumed.
 
 ### Secure connections
 
-1. Set `security_mode` / `security_policy` (per server or `advanced`). A server not offering that pair is refused with its offerings logged; never falls back to None. A server set to None under a secure default connects with a WARNING.
-2. On first connect a client certificate is generated in `$ZELOS_DATA_DIR/pki/` (`~/.zelos/opcua/pki/` for CLI runs); path, SHA-1 thumbprint and expiry are logged. **Trust it on the server.** Valid 2 years; WARNING from 30 days before expiry; an expired one is regenerated and must be trusted again.
-3. **Trust the server's certificate here.** The trust list is `pki/trusted/` next to the client certificate. An unknown server certificate is saved to `pki/rejected/<SHA-1>.der` and refused: at start the extension stops with one ERROR naming it; once running, it retries. Trust it with the `trust_server_certificate` action (its thumbprint, from the error or `list_server_certificates`) or by moving the file into `trusted/`, then start again. A changed certificate is refused the same way. `server_certificate: strict` + `server_certificate_file` pins one certificate instead. Either way the certificate must be within its validity period (`allow_expired_server_certificate` overrides, with a WARNING); one not naming the server's ApplicationUri is a WARNING. No chain or revocation check.
-4. Optional: X.509 user login with a certificate issued by the server admin. A server without a Certificate user token policy is refused; never falls back to Anonymous.
+1. Set Security Mode / Policy (e.g. `SignAndEncrypt` / `Basic256Sha256`). A server that does not offer it is refused; there is no fallback to None.
+2. On first connect the extension generates a client certificate and logs its path. **Trust it on the server.**
+3. **Trust the server's certificate here** with the `trust_server_certificate` action, then start again.
 
 ### Discovery
 
-A server without a `node_map_file` is browsed on every connect (read-only, nothing written to disk), so program changes appear after a reconnect.
-
-| Aspect | Behavior |
-|---|---|
-| Walk | Forward hierarchical references from `Objects`; skips `Server`, Objects named `_*` (Kepware `_System`, ...), properties |
-| Filters | `include` / `exclude` globs over the browse path below `Objects`, each BrowseName sanitized as traced (`ModbusTCP/PowerMeter/Voltage_L1`): `*` `?` `[..]` within one segment (fnmatch, case-sensitive), `**` any number of segments. Empty include = everything; an included branch takes its whole subtree (`ModbusTCP/PowerMeter`); a node matching an exclude is dropped with everything below it; exclude wins. Branches no include can reach are not browsed; a node under several parents is taken if any path passes. The path equals the trace name except on vendor-id servers (Siemens, CODESYS, B&R, TwinCAT), where the trace name comes from the node id (an S7 `"DB"."tag"` traces as `DB/tag` whatever folders hold it). `filtered N` (variables and branches) in the discovery INFO line; a WARNING when nothing is left |
-| Traced | Every scalar variable of a supported type; arrays, structs, other types skipped (one INFO count per connect) |
-| Vendor DataTypes | A subtype (HasSubtype) of a builtin integer is typed as it: a vendor Int64 keeps all 64 bits |
-| Event / field | Event = parent path below `Objects` (`Line1/Motor`), field = BrowseName; vendor string ids (Kepware/TwinCAT dots, Siemens `"DB"."tag"`, CODESYS, B&R `::Task:Var`) name the event from the id |
-| Collisions | Every collider is named `<field>_<hash>` (6 hex of SHA-1 of its `nsu=` id, stable); one WARNING per connect; a name never moves to another node |
-| Changes on reconnect | New event: traced. New field: new trace segment (joined by the app). Changed datatype: skipped with one WARNING until restart |
-| Browse errors | BadNoContinuationPoints: re-browsed alone; other Bad: one WARNING per connect |
-
-`discovered_map` returns the discovered set as node map json (save as `node_map_file` to pin or edit) or csv.
-
-### Transport and timestamps
-
-- `subscription`: one subscription per distinct interval (event `poll_interval`, else server's), queue size 1, change of value or status, no deadband. Refused items (e.g. BadTooManyMonitoredItems) and an undecodable Publish fall back to polling for the connection, one WARNING per connect.
-- A stalled subscription on a live connection is recovered: a sequence-number gap the server still holds is filled by Republish (INFO, at most 10 per gap); a keep-alive missed by 1 s past (revised MaxKeepAliveCount + 1) publishing intervals, a gap Republish cannot fill, or a server-ended subscription (e.g. BadTimeout) recreates it and reads its items once (one WARNING).
-- `poll`: batched Reads of min(MaxNodesPerRead, 100) nodes, spread evenly across the interval.
-- Read MaxAge: polled nodes their poll interval, staleness re-reads `min_update_interval` (the server may answer from a cache that recent); health and discovery 0 (from the device).
-- Values the server revises (publishing / sampling interval, queue size) are logged once per subscription (INFO); a revised publishing interval slower than `min_update_interval` becomes the staleness threshold.
-- A Bad value is a gap, logged once per node per connection (ERROR). An Uncertain value is traced (usable per Part 8), with one INFO per node per connection naming the status.
-- A subscribed node silent for `min_update_interval` is re-read (worst case ceil(nodes / 100) Reads per interval) and logged at the Read's ServerTimestamp.
-- Samples are logged at SourceTimestamp, else ServerTimestamp, else receipt. No clock-skew correction (see `_server.clock_skew_ms`). Fields with different timestamps are separate rows.
-
-### Server health
-
-Event `_server`, every poll interval, at host time: `state`, `state_name`, `current_time`, `clock_skew_ms` (server minus host), `start_time`, `service_level`, `current_session_count`, `cumulated_session_count`, `rejected_requests_count`, `security_rejected_requests_count`, `current_subscription_count`. Fields the server does not publish are dropped for the connection.
-
-### Diagnostics
-
-A response with an array length past the bytes left in the message is rejected (one WARNING per server); an event loop blocked > 10s dumps every thread's stack to the extension log; peak RSS over 2 GB (then each doubling) logs one WARNING with per-server node and subscription counts.
+A server without a node map is browsed on every connect and every scalar variable is traced, read-only. Events are named from the browse path (`Line1/Motor`), fields from the node. Narrow it with `include` / `exclude`; `discovered_map` exports what was found as a node map to pin or edit.
 
 ### Auto-configure
 
-The config form's button runs `auto_config` (extension stopped) on the form as it is, unsaved edits included (older apps: the saved config); it replaces `servers` only.
+The config form's Auto-configure button checks the servers in the form, or with none, finds servers on this machine (common ports, Local Discovery Server, mDNS) and adds them.
 
-With servers in the form, each is checked at its endpoint and kept as entered; one at security `default` whose server does not offer the Advanced security gets the server's strongest supported pair. The message names each one: found (security, already in the form), `Couldn't connect to <endpoint>.` (refused, no route, unknown host, timed out), answered without a security policy this extension supports, or does not offer the configured security.
-
-With none, it looks on this machine and adds what it finds:
-
-| Source | What |
-|---|---|
-| localhost ports | GetEndpoints on 4840, 4841, 48010, 49320 (Kepware), 62541, 53530 (Prosys), 2s each, in parallel |
-| Local Discovery Server | FindServers on `opc.tcp://localhost:4840` |
-| mDNS | 2s passive browse for `_opcua-tcp._tcp.local.` |
-
-Deduplicated by ApplicationUri, named by ApplicationName. Security: `default` if the server offers the Advanced security, else its strongest policy with SignAndEncrypt (then Sign); trust the client certificate on the server.
-
-## Node Map Format
+## Node Map
 
 ```json
 {
-  "name": "my_device",
   "events": {
     "temperature": [
       {"name": "sensor1", "node_id": "ns=2;s=Temperature.Sensor1", "datatype": "float32", "unit": "°C"},
@@ -153,44 +94,34 @@ Deduplicated by ApplicationUri, named by ApplicationName. Security: `default` if
 }
 ```
 
-Event keys are trace events, node names their fields; the map `name` is optional and not part of trace paths. An event is a node list or `{"poll_interval": s, "nodes": [...]}` (seconds, >= 0.1).
-
-### Node Fields
+Event keys become trace events, node names their fields. An event may set its own `poll_interval`.
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `node_id` | Yes | - | `ns=<n>;[s\|i\|g\|b]=<identifier>`, or `nsu=<uri>;...` to pin the namespace by URI (stable across server restarts; `;` in the URI as `%3B`) |
-| `name` | Yes | - | Field name in the Zelos event |
-| `datatype` | No | `float32` | bool, uint8-64, int8-64, float32, float64, string |
-| `unit` | No | `""` | Unit string for display |
-| `scale` | No | `1.0` | Read value x scale; write value / scale |
-| `writable` | No | `null` | `null` auto-detects from AccessLevel |
-
-### Naming Rules
-
-Names are sanitized at load (`. @ : ; =` and whitespace, and `/` in node names, become `_`). A duplicate event name, or node name within one event, is a load error; a node name in several events is addressed as `<event>/<name>`.
+| `node_id` | Yes | | `ns=2;s=Tag`, or `nsu=<uri>;s=Tag` to pin the namespace by URI |
+| `name` | Yes | | Field name |
+| `datatype` | No | `float32` | bool, int8-64, uint8-64, float32, float64, string |
+| `unit` | No | | Display unit |
+| `scale` | No | `1.0` | Read value x scale |
+| `writable` | No | auto | Detected from the server's access level |
 
 ## Actions
 
 | Action | Description |
 |--------|-------------|
-| `OPC-UA/get_status` | Connection `state` (`ok`, `connecting` at start, `disconnected` while retrying) and `last_error`, transport with subscribed / polled counts, poll and error counts, process `peak_rss_mb`; every server's when `server` is omitted |
-| `OPC-UA/read_node` | Read by node ID |
-| `OPC-UA/write_node` | Write by node ID; value is text, coerced to the server's type; only the Value is sent (no StatusCode or timestamps) |
-| `OPC-UA/read_named_node` | Read by node map name |
-| `OPC-UA/write_named_node` | Write by node map name; value is text, coerced to the map's datatype (checks writability); discovered nodes are rejected, use `write_node` |
-| `OPC-UA/list_nodes` | Mapped or discovered nodes, each with its `server` and `event`; every server's when omitted |
-| `OPC-UA/list_writable_nodes` | Only writable nodes; every server's when omitted |
-| `OPC-UA/browse_nodes` | Walk the address space from a starting node |
-| `OPC-UA/discovered_map` | The discovered nodes as node map json or csv text (`format`) |
-| `OPC-UA/auto_config` | Standalone: find servers for the config form (see Auto-configure) |
-| `OPC-UA/trust_server_certificate` | Standalone: move the rejected server certificate with this `thumbprint` into `pki/trusted/`; a missing or unknown one lists the rejected |
-| `OPC-UA/list_server_certificates` | Standalone: trusted and rejected server certificates (subject, ApplicationUri, thumbprint, validity) |
+| `get_status` | Connection state, transport, counters |
+| `read_node` / `write_node` | Read or write by node id |
+| `read_named_node` / `write_named_node` | Read or write by node map name |
+| `list_nodes` / `list_writable_nodes` | Mapped or discovered nodes |
+| `browse_nodes` | Walk the address space from a node |
+| `discovered_map` | Discovered nodes as a node map (json or csv) |
+| `auto_config` | Find servers for the config form |
+| `trust_server_certificate` / `list_server_certificates` | Manage trusted server certificates |
 
-Every action takes an optional `server`, required when several servers are configured. Write values are text: `true`/`false`/`1`/`0` for bools, a number for numeric nodes; unparseable input is rejected before sending. Actions use the live session (none while stopped) and raise on failure.
+With several servers, pass `server` to pick one.
 
 ```bash
-zelos actions execute OPC-UA/read_named_node --params '{"name":"temp_sensor1","server":"plc01"}'
+zelos actions execute OPC-UA/read_named_node --params '{"name":"sensor1","server":"plc01"}'
 ```
 
 ## Development
@@ -201,32 +132,8 @@ just format       # ruff format + fix
 just check        # ruff lint + format check
 just test         # pytest
 just dev          # run app mode locally
-just sim          # standalone simulator (see Simulator)
+just sim          # standalone simulator: --profile demo|gateway|s7|device, --secure
 ```
-
-## Simulator
-
-`just sim [ARGS]`: standalone server on `opc.tcp://127.0.0.1:4840/freeopcua/server/` until Ctrl-C.
-
-| Profile | Exercises |
-|---|---|
-| `demo` | The demo-mode PLC (`ns=2;s=Temperature.Sensor1`, ...) |
-| `gateway` | Kepware-shaped `ns=2;s=Channel.Device.Tag` (power meter, genset) with `_System` / `_Statistics` noise |
-| `s7` | S7-1500-shaped `ns=3;s="DB"."tag"`; enforced MaxNodesPerBrowse 10, MaxNodesPerRead 20, 10 references per node (BrowseNext), 3 continuation points, 4 sessions (a lost connection's counts until it times out), 5 subscriptions and 10 monitored items per session |
-| `device` | DI `DeviceSet` identity, EngineeringUnits + EURange, a Double[4] array, a vendor struct, an abstract Number node, a Bad-status node, a reference cycle, a 14-level branch |
-
-| Flag | Effect |
-|---|---|
-| `--secure` | Adds Basic256Sha256 Sign and SignAndEncrypt endpoints (self-signed server cert per start) |
-| `--trust-dir DIR` | With `--secure`: client certs not in `DIR` are rejected (`BadCertificateUntrusted`) |
-| `--user-cert-dir DIR` | With `--secure`: offer Certificate user tokens; user certs not in `DIR` are rejected (`BadUserAccessDenied`) |
-| `--shuffle-namespaces` | Registers 1-4 placeholder namespaces first, so indices move between starts; `ZELOS_SIM_NS_SHIFT=<n>` pins it |
-| `--map FILE` | Serves any node map at its exact node ids; read-only values drift, writes persist |
-| `--secure-only` | With `--secure`: no None endpoint |
-| `--nodes N` | Adds N Float variables `Bulk.GroupNNNN.ValueNNN` (100 per folder), computed on read |
-| `--log-requests` | Logs request counts by service at shutdown |
-
-Example: `just sim --profile s7 --secure --trust-dir ./trusted --log-requests`.
 
 ## Links
 
