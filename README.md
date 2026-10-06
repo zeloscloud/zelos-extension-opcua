@@ -1,29 +1,35 @@
-# Zelos OPC-UA Extension
+# Zelos OPC-UA
 
-Traces OPC-UA servers into Zelos trace events, by subscription or polling, and exposes read/write/browse as Zelos actions.
+A Zelos extension for OPC-UA. Trace PLCs, gateways, and other OPC-UA servers by subscription or polling, and read, write, and browse nodes from the Zelos App.
 
 ## Features
 
-| Feature | Detail |
-|---------|--------|
-| Transport | Subscriptions by default; refused items are polled in batched Reads |
-| Discovery | A server without a node map is browsed on every connect and every scalar variable traced (read-only) |
-| Security | None / Sign / SignAndEncrypt, with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss; X.509 user login |
-| Multiple servers | Any number in one extension; one unreachable server never stalls the others |
-| Reconnection | Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request. Session timeout 120 s requested. A lost connection resumes its session on the new one, subscriptions kept and notifications missed meanwhile recovered by Republish; a session the server no longer holds (timed out, server restarted) is replaced by a new one. Either way one session per server, so flaps never exhaust a PLC's few session slots |
-| Start | Every server must connect at start: one that cannot be reached or refuses the session (e.g. an untrusted certificate) stops the extension with one ERROR naming it (`Server 'plc' (opc.tcp://10.0.0.5:4840): cannot connect: connection refused`); fix it and start again. Once connected, drops are retried |
-| Data types | bool, int8-64, uint8-64, float32/64, string |
-| Demo | `main.py demo`: built-in PLC simulator, no hardware |
+- 📡 **Subscriptions or polling**: Server-pushed changes by default; refused items are polled in batched Reads
+- 🔍 **Discovery**: A server without a node map is browsed on every connect and every scalar variable traced (read-only)
+- 📄 **Node map files**: Pin node ids, names, units, and scaling in a simple JSON file
+- 🔒 **Secure connections**: None / Sign / SignAndEncrypt with Basic256Sha256, Aes128Sha256RsaOaep, Aes256Sha256RsaPss; X.509 user login
+- 🏭 **Multiple servers**: Any number in one extension; one unreachable server never stalls the others
+- 🔄 **Reconnection**: Sessions resume across drops with subscriptions kept, so flaps never exhaust a PLC's few session slots
+- ✏️ **Read, write & browse actions**: Interactive node access from the Zelos App
+- 🔢 **Data types**: bool, int8-64, uint8-64, float32/64, string
+- 🧪 **Demo mode**: Built-in PLC simulator for testing without hardware
 
 ## Quick Start
 
+From the CLI, on the agent that can reach the server:
+
 ```bash
-uv run main.py                                                   # app mode (Zelos App config)
-uv run main.py demo                                              # built-in simulator
-uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json     # one server: endpoint + map
-uv run main.py trace opc.tcp://server:4840 nodes.json -s SignAndEncrypt -p Basic256Sha256
-uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: discover and trace everything
+zelos extensions install zeloscloud/zelos-extension-opcua
+zelos extensions start zeloscloud.zelos-extension-opcua \
+  --config '{"servers": [{"endpoint": "opc.tcp://192.168.1.100:4840"}]}'
 ```
+
+In the app:
+
+1. **Install** the extension from the Zelos App
+2. **Configure** your servers (endpoint, and a node map file or nothing: discovery), or press Auto-configure
+3. **Start** the extension to begin streaming data
+4. **View** real-time node values in your Zelos App
 
 ## Configuration
 
@@ -62,6 +68,11 @@ uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: disco
 Trace layout: `OPC-UA/<server>/<event>` (e.g. `OPC-UA/plc01/temperature`); with `advanced.prefix` cleared, one source per server (`plc01/temperature`). Logs go to `OPC-UA/log` (cleared: `opcua_log`); `log` is not a valid server name.
 
 Startup errors: the pre-`servers[]` flat config; `username` / `password`, or credentials in the endpoint URL (`opc.tcp://user:pw@host`; no secret is stored in config, use a user certificate); a missing or unparseable `node_map_file`.
+
+### Connections
+
+- **Start**: Every server must connect at start: one that cannot be reached or refuses the session (e.g. an untrusted certificate) stops the extension with one ERROR naming it (`Server 'plc' (opc.tcp://10.0.0.5:4840): cannot connect: connection refused`); fix it and start again. Once connected, drops are retried
+- **Reconnection**: Capped exponential backoff (3s, doubling, 60s ceiling), reset on a completed request. Session timeout 120 s requested. A lost connection resumes its session on the new one, subscriptions kept and notifications missed meanwhile recovered by Republish; a session the server no longer holds (timed out, server restarted) is replaced by a new one. Either way one session per server, so flaps never exhaust a PLC's few session slots
 
 ### Secure connections
 
@@ -224,6 +235,29 @@ Example: `just sim --profile s7 --secure --trust-dir ./trusted --log-requests`.
 - [asyncua Documentation](https://python-opcua.readthedocs.io/)
 - [GitHub Issues](https://github.com/zeloscloud/zelos-extension-opcua/issues)
 
+## CLI Usage
+
+The extension includes a command-line interface for tracing without the Zelos App. No installation required, just use `uv run`:
+
+```bash
+uv run main.py                                                   # app mode (Zelos App config)
+uv run main.py demo                                              # built-in simulator
+uv run main.py trace opc.tcp://192.168.1.100:4840 nodes.json     # one server: endpoint + map
+uv run main.py trace opc.tcp://server:4840 nodes.json -s SignAndEncrypt -p Basic256Sha256
+uv run main.py trace opc.tcp://192.168.1.100:4840                # no map: discover and trace everything
+```
+
+## Support
+
+For help and support:
+- 📖 [Zelos Documentation](https://docs.zeloscloud.io)
+- 🐛 [GitHub Issues](https://github.com/zeloscloud/zelos-extension-opcua/issues)
+- 📧 help@zeloscloud.io
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+---
+
+**Built with [Zelos](https://zeloscloud.io)**
