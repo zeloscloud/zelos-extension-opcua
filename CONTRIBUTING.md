@@ -49,7 +49,7 @@ zelos-extension-opcua/
 ├── scripts/
 │   └── bump_version.py             # Updates version numbers
 ├── assets/
-│   └── icon.svg                    # Marketplace icon
+│   └── icon.png                    # Marketplace icon
 ├── .github/
 │   ├── workflows/
 │   │   ├── CI.yml
