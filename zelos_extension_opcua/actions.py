@@ -306,6 +306,7 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
     "mDNS. Review, then save and start.",
     # Read-only and session-less, and the form wants it before a first start.
     standalone=True,
+    hidden=True,
 )
 @zelos_sdk.action.object(
     "config",
