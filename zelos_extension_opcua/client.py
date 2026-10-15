@@ -41,7 +41,6 @@ from zelos_extension_opcua.diagnostics import SERVER, peak_rss_bytes, watch_loop
 from zelos_extension_opcua.discovery import (
     HEALTH_EVENT,
     MAX_OPERATIONS,
-    TRACE_NAME_BYTES,
     VARIANT_DATATYPES,
     PathFilter,
     discover,
@@ -1214,7 +1213,6 @@ class OPCUAClient:
             self._browse_chunk,
             self._read_chunk,
             self.name,
-            TRACE_NAME_BYTES - len(self._event_prefix.encode()),
             self.filters,
         )
         added, changed = self._declare_events(result.node_map)

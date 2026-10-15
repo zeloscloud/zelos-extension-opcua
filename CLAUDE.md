@@ -111,7 +111,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 ### Node map
 
-- Names via `sanitize_name` (event names keep `/`); trace names capped at 128 bytes including `<server>/` (discovery keeps trailing segments).
+- Names via `sanitize_name` (event names keep `/`); no length cap (the SDK validates the character grammar only).
 - Duplicates after sanitization are hard `ValueError`s (warn-and-clobber drops data). Repeats across events are allowed; `get_by_name` takes `<event>/<name>` and raises on an ambiguous bare name.
 - Health event `_server` cannot collide: sanitized names never start with `_`.
 
