@@ -349,16 +349,15 @@ def test_collision_names_never_move():
     assert both["nsu=urn:a;i=5"] == "Speed" + suffix("nsu=urn:a;i=5")
 
 
-def test_truncation_collisions_are_hashed():
-    long = "f" * 200  # both truncate to the same 128 bytes
+def test_long_names_kept_whole():
+    long = "f" * 200
     rows = [found(1, long + "1", path=("A",)), found(2, long + "2", path=("A",))]
-    got = names(rows)["A"]
-    for nsu, name in got.items():
-        assert name == "f" * (128 - 7) + suffix(nsu)
-    # Events cut to their trailing segment: A/B/E and C/B/E both become B/E.
-    rows = [found(1, "x", path=("A", "B", "E")), found(2, "x", path=("C", "B", "E"))]
-    events, _ = assign_names(rows, NAMESPACES, max_event_bytes=4)
-    assert [n.name for n in events["B/E"]] == ["x" + suffix(f"nsu=urn:a;i={i}") for i in (1, 2)]
+    assert names(rows)["A"] == {"nsu=urn:a;i=1": long + "1", "nsu=urn:a;i=2": long + "2"}
+    # A genuine collision still hashes both.
+    rows = [found(1, long, path=("A",)), found(2, long, path=("A",))]
+    assert names(rows)["A"] == {
+        nsu: long + suffix(nsu) for nsu in ("nsu=urn:a;i=1", "nsu=urn:a;i=2")
+    }
 
 
 @pytest.mark.parametrize(

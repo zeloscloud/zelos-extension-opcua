@@ -31,9 +31,6 @@ MAX_OPERATIONS = 100
 #: with `_`, so neither can take it.
 HEALTH_EVENT = "_server"
 
-# Longest trace event name, including a `<server>/` prefix (zelos-trace grammar).
-TRACE_NAME_BYTES = 128
-
 _IDS = ua.ObjectIds
 
 # Concrete builtin DataType -> node map datatype, kept exactly.
@@ -629,34 +626,19 @@ def vendor_segments(node_id: NodeId, browse_name: str) -> list[str] | None:
     return None
 
 
-def _fit(parts: list[str], max_bytes: int) -> str:
-    """Segments joined by `/`, dropping leading ones past `max_bytes`: the tail
-    is the specific part, the head the shared one."""
-    event = ""
-    for part in reversed(parts):
-        joined = f"{part}/{event}" if event else part
-        if len(joined.encode()) > max_bytes:
-            break
-        event = joined
-    return event or parts[-1].encode()[:max_bytes].decode(errors="ignore")
-
-
 def _hashed(name: str, node_id: str, digits: int) -> str:
-    """`name_<hash>`, the base trimmed so the whole fits TRACE_NAME_BYTES."""
-    suffix = "_" + hashlib.sha1(node_id.encode()).hexdigest()[:digits]
-    base = name.encode()[: TRACE_NAME_BYTES - len(suffix)].decode(errors="ignore")
-    return base + suffix
+    """`name_<hash>` of the node id."""
+    return name + "_" + hashlib.sha1(node_id.encode()).hexdigest()[:digits]
 
 
 def assign_names(
     described: list[tuple[Found, str, str, str]],
     namespaces: Sequence[str],
-    max_event_bytes: int = TRACE_NAME_BYTES,
 ) -> tuple[dict[str, list[Node]], list[str]]:
     """Events and fields for the described Variables, and the renames made.
 
     Event = the vendor id's leading segments, else the parent path; field =
-    BrowseName. An event over `max_event_bytes` keeps its trailing segments.
+    BrowseName.
 
     Every collider is `<field>_<hash>` of its nsu= id (10 digits where 6 still
     collide), none keeps the plain name: a trace name never re-points to another node.
@@ -665,7 +647,7 @@ def assign_names(
     for var, datatype, unit, desc in described:
         segments = vendor_segments(var.node_id, var.name)
         parts = segments[:-1] if segments else list(var.path) or ["Objects"]
-        event = _fit([sanitize_name(p, kind="field") for p in parts], max_event_bytes)
+        event = "/".join(sanitize_name(p, kind="field") for p in parts)
         node = Node(
             node_id=node_id_string(var.node_id, namespaces),
             name=sanitize_name(var.name, kind="field"),
@@ -699,7 +681,6 @@ async def discover(
     browse_chunk: int,
     read_chunk: int,
     name: str,
-    max_event_bytes: int = TRACE_NAME_BYTES,
     filters: PathFilter = PathFilter(),
 ) -> Discovery:
     """Walk, describe and name the server's Variables; `name` names the map."""
@@ -709,7 +690,7 @@ async def discover(
     described, skipped, variant = await describe(rpc, found, read_chunk, browse_chunk)
     if filtered:
         skipped["filtered"] = filtered
-    events, renames = assign_names(described, namespaces, max_event_bytes)
+    events, renames = assign_names(described, namespaces)
     return Discovery(
         node_map=NodeMap(events=events, name=name, description="discovered"),
         skipped=skipped,
