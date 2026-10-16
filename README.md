@@ -14,6 +14,8 @@ A Zelos extension for OPC-UA. Trace PLCs, gateways, and other OPC-UA servers by 
 
 ## Quick Start
 
+[![Install the OPC-UA extension, add a server by its address, start it and plot a node](assets/howto/quickstart/quickstart.avif)](assets/howto/quickstart/quickstart.mp4)
+
 From the CLI, on the agent that can reach the server:
 
 ```bash
