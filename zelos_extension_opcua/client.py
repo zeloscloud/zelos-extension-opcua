@@ -942,6 +942,8 @@ class OPCUAClient:
         self._failed_nodes: set[str] = set()
         # Node IDs that have reported an Uncertain value this connection (one INFO each).
         self._uncertain_nodes: set[str] = set()
+        # Event name -> field -> last value this session; every row carries them all.
+        self._last: dict[str, dict[str, Any]] = {}
 
         self._shared: SharedSource | None = None
         # Map event name -> trace event, captured from add_event. Never getattr on
@@ -1303,6 +1305,7 @@ class OPCUAClient:
             rebuild = ""  # why a resumed session's subscriptions are rebuilt
             if not resumed:
                 self._subs = {}  # the new session holds none
+                self._last = {}  # its values start unknown
                 (
                     self._browse_chunk,
                     self._read_chunk,
@@ -2112,18 +2115,23 @@ class OPCUAClient:
         received_ns: int,
         refresh: bool = False,
     ) -> None:
-        """Log samples at `sample_time_ns`, one row per event and time: merged, all
-        but one field would be logged at a time it was not sampled."""
+        """Log samples at `sample_time_ns`, one row per event and time, every field
+        carried: the sampled ones, the rest at their last value this session. A
+        node Bad, empty or undecodable leaves its field null until it reads again."""
         rows: dict[tuple[str, int], dict[str, Any]] = {}
         for event_name, node, dv in samples:
             value = self._decode(node, dv)
-            if value is not None:
-                key = (event_name, sample_time_ns(dv, received_ns, refresh))
-                rows.setdefault(key, {})[node.name] = value
+            if value is None:
+                self._last.get(event_name, {}).pop(node.name, None)
+                continue
+            key = (event_name, sample_time_ns(dv, received_ns, refresh))
+            rows.setdefault(key, {})[node.name] = value
         for (event_name, stamp), fields in sorted(rows.items(), key=lambda row: row[0][1]):
             event = self._events.get(event_name)
             if event is not None:
-                event.log_at(stamp, **fields)
+                last = self._last.setdefault(event_name, {})
+                last.update(fields)
+                event.log_at(stamp, **last)
 
     def _health_values(self, data_values: list[ua.DataValue], host_time: float) -> dict[str, Any]:
         """Health fields; a node Bad or empty is dropped for the connection (one DEBUG)."""

@@ -130,9 +130,11 @@ async def test_subscription_samples_carry_the_source_timestamp(reads):
             ).read_data_value()
             status = client.status()
 
-    stamp, value = rows.of("temp_sensor1")[-1]
-    assert stamp == timestamp_ns(written.SourceTimestamp)
-    assert value == pytest.approx(written.Value.Value, rel=1e-6)
+    # Its own row is the first carrying the value; later rows carry it as last value.
+    samples = rows.of("temp_sensor1")
+    first = next(t for t, v in samples if v == pytest.approx(written.Value.Value, rel=1e-6))
+    assert first == timestamp_ns(written.SourceTimestamp)
+    assert samples[-1][1] == pytest.approx(written.Value.Value, rel=1e-6)
     assert (status["subscribed"], status["polled"]) == (len(node_map.nodes), 0)
     assert services(sim) >= SUBSCRIPTION_SERVICES
     mapped = {t[2] for t in client._poll_targets}
@@ -187,11 +189,9 @@ async def test_static_node_is_refreshed_at_the_server_timestamp(reads):
     node_map = NodeMap.from_dict(
         {
             "name": "m",
-            "events": {
-                "e": [
-                    {"name": "static", "node_id": "ns=2;s=Static", "writable": True},
-                    {"name": "moving", "node_id": "ns=2;s=Moving"},
-                ]
+            "events": {  # apart: a row of one carries the other at its last value
+                "e": [{"name": "static", "node_id": "ns=2;s=Static", "writable": True}],
+                "e2": [{"name": "moving", "node_id": "ns=2;s=Moving"}],
             },
         }
     )
@@ -433,6 +433,7 @@ async def test_expired_session_falls_back_to_a_new_one(monkeypatch, caplog):
         opened = gate(client)
         async with running(client) as rows:
             await wait_until(lambda: client._jobs, 10.0)
+            client._last["temperature"]["stale"] = 1  # would ride every row if kept
             opened.clear()
             for transport in list(sim.server.iserver.asyncio_transports):
                 transport.abort()
@@ -441,6 +442,7 @@ async def test_expired_session_falls_back_to_a_new_one(monkeypatch, caplog):
             await wait_until(lambda: client._connected, 10.0)
             await flowing(rows, "temp_sensor1")
             assert sim.held_sessions == 1
+            assert "stale" not in client._last["temperature"]  # a new session starts unknown
     assert infos(caplog, "not resumed") == [
         "[127_0_0_1] Previous session not resumed (BadSessionIdInvalid); creating a new one"
     ]
@@ -601,6 +603,49 @@ async def test_uncertain_values_are_traced_bad_are_not(transport, caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert sum("'uncertain'" in m and "UncertainLastUsableValue" in m for m in messages) == 1
     assert sum("'bad'" in m and "BadSensorFailure" in m for m in messages) == 1
+
+
+async def test_rows_carry_every_field_at_its_last_value():
+    """A row logs the sampled fields and the rest at their last value; a Bad node
+    leaves its field null until it reads again."""
+    node_map = NodeMap.from_dict(
+        {
+            "events": {
+                "e": [
+                    {"name": name, "node_id": f"ns=2;s={name}", "writable": True}
+                    for name in ("fast", "slow")
+                ]
+            }
+        }
+    )
+    async with Simulator(port=0, node_map=node_map) as sim:
+        fast, slow = (sim.server.get_node(ua.NodeId(n, 2)) for n in ("fast", "slow"))
+        vtype = (await slow.read_data_value()).Value.VariantType
+
+        async def write(node, value, code=ua.StatusCodes.Good):
+            dv = ua.DataValue(ua.Variant(value, vtype), ua.StatusCode(code))
+            await sim.server.write_attribute_value(node.nodeid, dv)
+            await asyncio.sleep(0.5)  # past the sampling interval
+
+        def rows_where(field: str, value: float) -> list[dict]:
+            return [f for _, _, f in rows.rows if f.get(field) == value]
+
+        await write(slow, 1.5)
+        client = OPCUAClient(endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2)
+        async with running(client) as rows:
+            await wait_until(lambda: rows.of("slow"), 10.0)
+            await write(fast, 2.5)
+            await wait_until(lambda: rows_where("fast", 2.5), 10.0)
+            await write(slow, 9.5, ua.StatusCodes.BadSensorFailure)
+            await write(fast, 3.5)
+            await wait_until(lambda: rows_where("fast", 3.5), 10.0)
+            while_bad = rows_where("fast", 3.5)
+            await write(slow, 4.5)
+            await wait_until(lambda: rows_where("slow", 4.5), 10.0)
+
+    assert all(f["slow"] == 1.5 for f in rows_where("fast", 2.5))
+    assert all("slow" not in f for f in while_bad)
+    assert all(f["fast"] == 3.5 for f in rows_where("slow", 4.5))
 
 
 def subscription_warnings(caplog) -> list[str]:
