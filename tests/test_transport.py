@@ -433,7 +433,14 @@ async def test_expired_session_falls_back_to_a_new_one(monkeypatch, caplog):
         opened = gate(client)
         async with running(client) as rows:
             await wait_until(lambda: client._jobs, 10.0)
-            client._last["temperature"]["stale"] = 1  # would ride every row if kept
+            entered: list[dict] = []
+            start_transport = client._start_transport
+
+            async def spy() -> None:  # what the new session's rows start from
+                entered.append(dict(client._last))
+                await start_transport()
+
+            monkeypatch.setattr(client, "_start_transport", spy)
             opened.clear()
             for transport in list(sim.server.iserver.asyncio_transports):
                 transport.abort()
@@ -442,7 +449,7 @@ async def test_expired_session_falls_back_to_a_new_one(monkeypatch, caplog):
             await wait_until(lambda: client._connected, 10.0)
             await flowing(rows, "temp_sensor1")
             assert sim.held_sessions == 1
-            assert "stale" not in client._last["temperature"]  # a new session starts unknown
+    assert entered == [{}]  # a new session starts unknown
     assert infos(caplog, "not resumed") == [
         "[127_0_0_1] Previous session not resumed (BadSessionIdInvalid); creating a new one"
     ]
@@ -646,6 +653,33 @@ async def test_rows_carry_every_field_at_its_last_value():
     assert all(f["slow"] == 1.5 for f in rows_where("fast", 2.5))
     assert all("slow" not in f for f in while_bad)
     assert all(f["fast"] == 3.5 for f in rows_where("slow", 4.5))
+
+
+async def test_a_value_is_never_logged_before_its_stamp():
+    """A polled static node's rows, at its old stamp, carry nothing sampled since."""
+    node_map = NodeMap.from_dict(
+        {
+            "events": {
+                "e": [
+                    {"name": "static", "node_id": "ns=2;s=Static", "writable": True},
+                    {"name": "moving", "node_id": "ns=2;s=Moving"},
+                ]
+            }
+        }
+    )
+    async with Simulator(port=0, node_map=node_map) as sim:
+        created = await sim.server.get_node(ua.NodeId("Static", 2)).read_data_value()
+        client = OPCUAClient(
+            endpoint=sim.endpoint, node_map=node_map, poll_interval=0.2, transport="poll"
+        )
+        async with running(client) as rows:
+            await wait_until(lambda: len(rows.of("moving")) >= 5, 10.0)
+
+    old = timestamp_ns(created.SourceTimestamp)
+    at_old = [f for _, t, f in rows.rows if t == old]
+    assert at_old and all(set(f) == {"static"} for f in at_old)
+    later = [f for _, t, f in rows.rows if t is not None and t > old and "moving" in f]
+    assert later and all(f["static"] == pytest.approx(created.Value.Value) for f in later)
 
 
 def subscription_warnings(caplog) -> list[str]:
