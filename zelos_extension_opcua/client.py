@@ -942,8 +942,8 @@ class OPCUAClient:
         self._failed_nodes: set[str] = set()
         # Node IDs that have reported an Uncertain value this connection (one INFO each).
         self._uncertain_nodes: set[str] = set()
-        # Event name -> field -> last value this session; every row carries them all.
-        self._last: dict[str, dict[str, Any]] = {}
+        # Event name -> field -> (stamp, last value) this session; every row carries them all.
+        self._last: dict[str, dict[str, tuple[int, Any]]] = {}
 
         self._shared: SharedSource | None = None
         # Map event name -> trace event, captured from add_event. Never getattr on
@@ -1283,6 +1283,13 @@ class OPCUAClient:
             )
         if nodes and not self._poll_targets:
             self._log.error("No mapped node resolved on %s; polling nothing", self.endpoint)
+        mapped: dict[str, set[str]] = {}
+        for event_name, node, _ in self._poll_targets:
+            mapped.setdefault(event_name, set()).add(node.name)
+        self._last = {  # a node no longer mapped stops riding its event's rows
+            event_name: {n: v for n, v in last.items() if n in mapped.get(event_name, ())}
+            for event_name, last in self._last.items()
+        }
 
     # ─── Connection ─────────────────────────────────────────────────────────
 
@@ -2116,8 +2123,9 @@ class OPCUAClient:
         refresh: bool = False,
     ) -> None:
         """Log samples at `sample_time_ns`, one row per event and time, every field
-        carried: the sampled ones, the rest at their last value this session. A
-        node Bad, empty or undecodable leaves its field null until it reads again."""
+        carried: the sampled ones, the rest at their last value this session as of
+        that time (a value is never logged before its own stamp). A node Bad, empty
+        or undecodable leaves its field null until it reads again."""
         rows: dict[tuple[str, int], dict[str, Any]] = {}
         for event_name, node, dv in samples:
             value = self._decode(node, dv)
@@ -2128,10 +2136,15 @@ class OPCUAClient:
             rows.setdefault(key, {})[node.name] = value
         for (event_name, stamp), fields in sorted(rows.items(), key=lambda row: row[0][1]):
             event = self._events.get(event_name)
-            if event is not None:
-                last = self._last.setdefault(event_name, {})
-                last.update(fields)
-                event.log_at(stamp, **last)
+            if event is None:
+                continue
+            last = self._last.setdefault(event_name, {})
+            row = {name: value for name, (at, value) in last.items() if at <= stamp}
+            row.update(fields)
+            for name, value in fields.items():
+                if name not in last or last[name][0] <= stamp:
+                    last[name] = (stamp, value)
+            event.log_at(stamp, **row)
 
     def _health_values(self, data_values: list[ua.DataValue], host_time: float) -> dict[str, Any]:
         """Health fields; a node Bad or empty is dropped for the connection (one DEBUG)."""
