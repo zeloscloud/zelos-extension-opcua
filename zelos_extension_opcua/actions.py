@@ -115,7 +115,12 @@ def _server_field(func: Any) -> Any:
 # ─── Status and discovery ───────────────────────────────────────────────────
 
 
-@zelos_sdk.action("Get Status", "Get connection and polling status; every server when omitted")
+@zelos_sdk.action(
+    "Get Status",
+    "Get connection and polling status; every server when omitted",
+    read_only=True,
+    hidden=True,
+)
 @_server_field
 def get_status(server: str = "") -> dict[str, Any]:
     if server:
@@ -129,7 +134,12 @@ def _clients_for(server: str) -> list[OPCUAClient]:
     return [_get_client(server)] if server else list(_get_runner().clients.values())
 
 
-@zelos_sdk.action("List Nodes", "List the nodes in the map; every server's when omitted")
+@zelos_sdk.action(
+    "List Nodes",
+    "List the nodes in the map; every server's when omitted",
+    read_only=True,
+    hidden=True,
+)
 @_server_field
 def list_nodes(server: str = "") -> dict[str, Any]:
     nodes = [
@@ -149,7 +159,12 @@ def list_nodes(server: str = "") -> dict[str, Any]:
     return {"nodes": nodes, "count": len(nodes)}
 
 
-@zelos_sdk.action("List Writable Nodes", "List writable nodes; every server's when omitted")
+@zelos_sdk.action(
+    "List Writable Nodes",
+    "List writable nodes; every server's when omitted",
+    read_only=True,
+    hidden=True,
+)
 @_server_field
 def list_writable_nodes(server: str = "") -> dict[str, Any]:
     nodes = [
@@ -170,6 +185,8 @@ def list_writable_nodes(server: str = "") -> dict[str, Any]:
     "Discovered Map",
     "The nodes discovered on the last connect, as a node map (json) or csv text; "
     "save it as a node_map_file to pin or edit them",
+    read_only=True,
+    hidden=True,
 )
 @_server_field
 @zelos_sdk.action.select("format", title="Format", choices=["json", "csv"], default="json")
@@ -188,7 +205,9 @@ def discovered_map(format: str = "json", server: str = "") -> dict[str, Any]:
     return {"server": client.name, "format": "json", "count": count, "map": node_map.to_dict()}
 
 
-@zelos_sdk.action("Browse Nodes", "Browse OPC-UA address space from a starting node")
+@zelos_sdk.action(
+    "Browse Nodes", "Browse OPC-UA address space from a starting node", read_only=True
+)
 @_server_field
 @zelos_sdk.action.text(
     "start_node_id",
@@ -212,7 +231,7 @@ def browse_nodes(start_node_id: str, max_depth: int, server: str = "") -> dict[s
 # ─── Read / write by node ID ────────────────────────────────────────────────
 
 
-@zelos_sdk.action("Read Node", "Read a single node by node ID")
+@zelos_sdk.action("Read Node", "Read a single node by node ID", read_only=True)
 @_server_field
 @zelos_sdk.action.text("node_id", title="Node ID", description="e.g., ns=2;s=Temperature")
 def read_node(node_id: str, server: str = "") -> dict[str, Any]:
@@ -244,7 +263,7 @@ def write_node(node_id: str, value: str, server: str = "") -> dict[str, Any]:
 # ─── Read / write by node map name ──────────────────────────────────────────
 
 
-@zelos_sdk.action("Read Named Node", "Read a node by name from the map")
+@zelos_sdk.action("Read Named Node", "Read a node by name from the map", read_only=True)
 @_server_field
 @zelos_sdk.action.text("name", title="Node Name")
 def read_named_node(name: str, server: str = "") -> dict[str, Any]:
@@ -307,6 +326,7 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
     # Read-only and session-less, and the form wants it before a first start.
     standalone=True,
     hidden=True,
+    read_only=True,
 )
 @zelos_sdk.action.object(
     "config",
@@ -346,6 +366,7 @@ def _saved_config() -> dict[str, Any]:
     "List Server Certificates",
     "Server certificates this extension trusts, and those it refused (pki/rejected)",
     standalone=True,
+    read_only=True,
 )
 def list_server_certificates() -> dict[str, Any]:
     return _client.server_certificates(_client.PKI_DIR)

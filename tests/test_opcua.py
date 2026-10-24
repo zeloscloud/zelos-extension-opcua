@@ -649,6 +649,29 @@ class TestActionsUnit:
             "write_node",
         ]
 
+    def test_action_flags(self):
+        """Pins each action's flags, so a new action or a changed flag is a deliberate choice."""
+        from zelos_sdk.actions import ActionsRegistry
+
+        flags = {
+            name: (getattr(actions, name)._action.read_only, getattr(actions, name)._action.hidden)
+            for name in actions.register_actions(ActionsRegistry())
+        }
+        assert flags == {
+            "auto_config": (True, True),
+            "browse_nodes": (True, False),
+            "discovered_map": (True, True),
+            "get_status": (True, True),
+            "list_nodes": (True, True),
+            "list_server_certificates": (True, False),
+            "list_writable_nodes": (True, True),
+            "read_named_node": (True, False),
+            "read_node": (True, False),
+            "trust_server_certificate": (False, False),
+            "write_named_node": (False, False),
+            "write_node": (False, False),
+        }
+
     def test_listing(self, offline_client):
         status = actions.get_status()["servers"][0]
         assert (status["connected"], status["nodes"]) == (False, 4)
