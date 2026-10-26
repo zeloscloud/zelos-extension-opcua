@@ -8,7 +8,7 @@ just format       # ruff format + ruff check --fix
 just check        # ruff check + ruff format --check
 just test         # pytest (integration tests start a real demo server)
 just e2e-interop  # Microsoft OPC PLC in Docker on :4840; manual, pre-release
-just dev          # app mode, reads the Zelos App config
+just run          # app mode, reads the Zelos App config
 just demo         # built-in PLC simulator
 just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --secure, --map, --nodes N
 ```
@@ -17,7 +17,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 | Path | Role |
 |------|------|
-| `main.py` | Click entry point; re-exports `ACTION_PREFIX` |
+| `main.py` | Click entry point |
 | `zelos_extension_opcua/__init__.py` | `ACTION_PREFIX = "OPC-UA"` - must match `name` in `extension.toml` |
 | `zelos_extension_opcua/actions.py` | Free-function action surface + `register_actions()` |
 | `zelos_extension_opcua/client.py` | `OPCUAClient` (one server: connection, subscriptions, batch polling, reconnect) and `OPCUARunner` (the loop, signals, shutdown, action dispatch) |
@@ -45,7 +45,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 - `cli/app.serve()` is the only place that starts clients: config -> clients -> `set_runner` -> `register_actions` -> `open_sources(prefix)` -> `zelos_sdk.init(name=ACTION_PREFIX)` -> `client.start` -> `runner.run()`.
 - Logs: `open_sources` installs the trace handler (INFO+) on the prefix source's `log` event (server name `log` is a config error); cleared prefix, own `opcua_log` source. Earlier records reach stderr only.
 - Registration must precede `init()` (later actions may never be advertised); the prefix source must exist before `init()` so it is reused, not duplicated.
-- Startup problems (bad config, missing/unparseable node map) are one `logger.error` + `sys.exit(1)`; tracebacks are for bugs.
+- Startup problems (bad config, missing/unparsable node map) are one `logger.error` + `sys.exit(1)`; tracebacks are for bugs.
 
 ### Config
 
@@ -106,7 +106,7 @@ just sim *ARGS    # standalone simulator: --profile demo|gateway|s7|device, --se
 
 - `OPCUARunner` owns the one loop; each client is a task, all share one stop event. Signals via `loop.add_signal_handler` only set it; never `signal.signal` + `sys.exit` (drops sessions uncleanly).
 - First contact is required: the runner waits for every client's first connect; any failure logs one ERROR per server and `serve()` exits 1. After a server has connected, drops use the backoff. `mark_unreachable` wraps asyncua's socket open so "never opened" (refused, no route, DNS, timeout) is typed, not guessed from a later timeout.
-- `_run_async` races connect against stop: a black-holed `connect()` parks for minutes, past the manifest's 10s grace.
+- `_run_async` races connect against stop: a black-holed `connect()` parks for minutes, past the agent's default 10 s stop grace.
 - Disconnects run concurrently under `wait_for(..., 3.0)`: ~3s total. A crashing client task sets stop. `runner.stop()` is thread-safe.
 
 ### Node map

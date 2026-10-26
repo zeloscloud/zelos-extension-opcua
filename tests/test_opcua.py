@@ -6,6 +6,7 @@ import logging
 import socket
 import threading
 import time
+import tomllib
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from asyncua import ua
 from asyncua.ua.ua_binary import to_binary
 
 from zelos_extension_opcua import actions
+from zelos_extension_opcua.cli import app
 from zelos_extension_opcua.client import (
     OPCUAClient,
     OPCUARunner,
@@ -648,6 +650,26 @@ class TestActionsUnit:
             "write_named_node",
             "write_node",
         ]
+
+    def test_actions_register_under_the_manifest_name(self, monkeypatch):
+        from zelos_sdk.actions import ActionsRegistry
+
+        names: list[str | None] = []
+
+        def init(name: str | None = None, **_kwargs) -> None:
+            names.append(name)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(zelos_sdk, "init", init)
+        monkeypatch.setattr(zelos_sdk, "actions_registry", ActionsRegistry())
+        monkeypatch.setattr(app, "open_sources", lambda _prefix: None)
+        try:
+            with pytest.raises(SystemExit):
+                app.serve([], "OPC-UA")
+        finally:
+            actions.set_runner(None)
+        manifest = tomllib.loads((Path(__file__).parents[1] / "extension.toml").read_text())
+        assert names == [manifest["name"]]
 
     def test_action_flags(self):
         """Pins each action's flags, so a new action or a changed flag is a deliberate choice."""

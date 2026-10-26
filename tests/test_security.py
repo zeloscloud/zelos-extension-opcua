@@ -202,7 +202,7 @@ async def test_untrusted_cert_stops_the_start(tmp_path, pki, caplog):
     assert list(sim.sessions.values()) == [("SignAndEncrypt", "Basic256Sha256")]
 
 
-async def test_server_trust_list(tmp_path, pki, caplog):
+async def test_server_trust_list(pki, caplog):
     """Unknown certificate: refused at start and saved; trusted, connects; replaced, refused."""
     async with Simulator(port=0, secure=True) as sim:
         # v0.1.1's `auto` is the trust list.
@@ -349,6 +349,26 @@ def test_endpoint_credentials_are_refused(caplog):
     ]
     assert result["status"] == "error" and result["message"].startswith("plc: remove the user")
     assert "secret" not in result["message"]
+
+
+@pytest.mark.parametrize(
+    "saved",
+    [
+        {"demo": False, "servers": [PLC]},
+        {"servers": [{**PLC, "server_certificate": "auto"}]},
+    ],
+)
+def test_saved_settings_of_earlier_versions_start(tmp_path, monkeypatch, saved):
+    """The removed Demo Mode toggle is ignored; 0.1.1's `auto` policy is the trust list."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(saved))
+    monkeypatch.setenv("ZELOS_CONFIG_PATH", str(path))
+    monkeypatch.chdir(Path(__file__).parents[1])
+    started = []
+    monkeypatch.setattr(app, "run_config", lambda config, demo: started.append(config))
+    app.run_app_mode()
+    [client] = resolve(started[0])
+    assert client.endpoint == PLC["endpoint"]
 
 
 @pytest.mark.parametrize(

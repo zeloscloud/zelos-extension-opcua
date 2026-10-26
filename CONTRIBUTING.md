@@ -1,121 +1,142 @@
 # Contributing
 
-## Development Workflow
+## Prerequisites
+
+- [Zelos](https://zeloscloud.io) 26.0.10 or later
+- [Zelos CLI](https://docs.zeloscloud.io/getting-started/install-cli/) 0.1.12 or later
+- [just](https://github.com/casey/just)
+- [uv](https://docs.astral.sh/uv/)
+
+## Layout
+
+`extension.toml` describes everything the extension contributes:
+
+| Part | Files | Manifest |
+| ---- | ----- | -------- |
+| Agent runtime | `main.py`, the Python package, `pyproject.toml`, `config.schema.json` | `[agent]`, `[config]` |
+
+| Path                                         | Purpose                                                                |
+| -------------------------------------------- | ---------------------------------------------------------------------- |
+| `main.py`                                    | Entry point; the app, `demo`, `demo-server` and `trace` commands       |
+| `zelos_extension_opcua/client.py`            | One client per server: connect, subscribe or poll, reconnect, shutdown |
+| `zelos_extension_opcua/actions.py`           | The OPC-UA actions                                                     |
+| `zelos_extension_opcua/discovery.py`         | Browse a server's address space and map every scalar variable          |
+| `zelos_extension_opcua/node_map.py`          | Node map parsing, event grouping and name rules                        |
+| `zelos_extension_opcua/autoconfig.py`        | Find servers for the config form's Auto-configure button               |
+| `zelos_extension_opcua/diagnostics.py`       | Guards for asyncua array lengths, event loop stalls and memory use     |
+| `zelos_extension_opcua/cli/app.py`           | Config load, `servers[]` and `advanced` resolution, startup validation |
+| `zelos_extension_opcua/demo/simulator.py`    | The simulated PLC server demo mode uses                                |
+| `zelos_extension_opcua/demo/plc_device.json` | The node map for the simulated PLC                                     |
+| `zelos_extension_opcua/demo/sim_server.py`   | The configurable simulator behind `demo-server`                        |
+| `zelos_extension_opcua/demo/profiles.py`     | The gateway, S7 and device address spaces, and served node maps        |
+| `tests/test_opcua.py`                        | Node map, codecs, actions, and the client against the demo server      |
+| `tests/test_transport.py`                    | Subscriptions, polling fallback, staleness sweep and sample timestamps |
+| `tests/test_discovery.py`                    | Live discovery, server health and auto-configure                       |
+| `tests/test_security.py`                     | Secure sessions and certificate trust                                  |
+| `tests/test_servers.py`                      | Several servers in one extension                                       |
+| `tests/test_sim.py`                          | The simulator profiles and flags                                       |
+| `tests/test_diagnostics.py`                  | The array-length guard and the stall watchdog                          |
+| `tests/test_interop.py`                      | Microsoft OPC PLC in Docker; manual                                    |
+
+## Commands
+
+| Command                | Description                                                |
+| ---------------------- | ---------------------------------------------------------- |
+| `just install`         | Install dependencies and the pre-commit hooks              |
+| `just format`          | Format code with ruff                                      |
+| `just check`           | Check formatting and lint (ruff)                           |
+| `just test`            | Run tests (pytest)                                         |
+| `just package`         | Package for the Zelos marketplace                          |
+| `just release VERSION` | Bump version, check, test, commit, tag                     |
+| `just clean`           | Remove build output, caches and packages                   |
+| `just demo`            | Run against the built-in PLC simulator, no hardware        |
+| `just sim`             | Run the standalone simulator on `opc.tcp://127.0.0.1:4840` |
+| `just e2e-interop`     | Run the interop tests against Microsoft OPC PLC in Docker  |
+
+`just --list` also shows the recipes each part adds. `just install` installs the
+pre-commit hooks in `.pre-commit-config.yaml`.
+
+## Testing
+
+`just test` starts real OPC-UA servers from the simulator inside the test process, on loopback ports.
+The tests exercise the actual protocol path: batch reads, partial failure, subscriptions, security and reconnection.
+
+The interop tests in `tests/test_interop.py` run against Microsoft OPC PLC, a .NET OPC-UA stack, in Docker.
+They are manual, before a release, and they skip unless `ZELOS_INTEROP=1`.
+They need Docker and a free port 4840.
+
+| Variable              | Value                                                                       |
+| --------------------- | --------------------------------------------------------------------------- |
+| `ZELOS_INTEROP`       | `1` to run the tests; `just e2e-interop` sets it                            |
+| `ZELOS_INTEROP_IMAGE` | The container image; defaults to `mcr.microsoft.com/iotedge/opc-plc:latest` |
 
 ```bash
-just install  # dependencies + pre-commit hooks
-just dev      # run app mode locally
-just demo     # run against the built-in PLC simulator
-just test     # pytest
-just check    # ruff lint + format check
-just format   # auto-fix
+just e2e-interop
 ```
 
-1. Make your changes
-2. `just format`
-3. `just test`
-4. Commit (pre-commit hooks run ruff automatically)
+## Run it in Zelos
 
-## Project Structure
-
-```
-zelos-extension-opcua/
-├── extension.toml                  # Extension manifest (name, version, host, package paths)
-├── config.schema.json              # Configuration UI schema
-├── main.py                         # Click entry point
-├── pyproject.toml                  # Dependencies, ruff and pytest config
-├── uv.lock                         # Locked dependency versions
-├── Justfile                        # Development commands
-├── LICENSE
-├── README.md                       # User documentation
-├── CHANGELOG.md
-├── CLAUDE.md                       # Architecture notes
-├── CONTRIBUTING.md                 # This file
-├── .pre-commit-config.yaml
-├── zelos_extension_opcua/
-│   ├── __init__.py                 # ACTION_PREFIX, package exports
-│   ├── actions.py                  # Action functions + register_actions()
-│   ├── client.py                   # Connection, batch polling, reconnect, shutdown
-│   ├── node_map.py                 # Node/NodeMap parsing and name rules
-│   ├── cli/
-│   │   ├── __init__.py
-│   │   └── app.py                  # Config load, startup validation, serve()
-│   └── demo/
-│       ├── __init__.py
-│       ├── simulator.py            # Demo OPC-UA server
-│       └── plc_device.json         # Demo node map
-├── tests/
-│   └── test_opcua.py               # Unit + integration tests
-├── scripts/
-│   └── bump_version.py             # Updates version numbers
-├── assets/
-│   └── icon.png                    # Marketplace icon
-├── .github/
-│   ├── workflows/
-│   │   ├── CI.yml
-│   │   └── release.yml
-│   └── dependabot.yml
-└── .vscode/
-```
-
-## Common Tasks
-
-### Add a Dependency
+Start the simulator in one terminal:
 
 ```bash
-uv add package-name        # runtime
-uv add --dev package-name  # dev
+just sim
 ```
 
-### Package for the Marketplace
+Then install the extension from this directory and start it against the simulator:
 
 ```bash
-just package   # zelos extensions package .
+zelos extensions install-local .
+zelos extensions start local.opc-ua --config '{"servers": [{"endpoint": "opc.tcp://127.0.0.1:4840"}]}'
+zelos extensions logs local.opc-ua
 ```
 
-Produces a `.tar.gz` for the Zelos Marketplace. CI does this automatically.
+A local install runs from your project directory, so you do not install again after a code
+change:
 
-### Create a Release
+- Agent runtime: stop and start the extension. After a dependency change, stop it and run
+  `zelos extensions reinstall local.opc-ua`.
+- `extension.toml`: run `zelos extensions install-local .` again.
+
+A server with no node map is browsed, and every scalar variable it holds is traced. Run `uv run python main.py demo-server --help` for the other profiles, a secured
+endpoint, or a node map to serve.
+
+To run it outside the agent, with the simulator still running:
+
+```bash
+echo '{"servers": [{"endpoint": "opc.tcp://127.0.0.1:4840"}]}' > config.json
+just run
+```
+
+`just run` reads `./config.json`, which needs at least one server, and connects to the agent at
+`ZELOS_AGENT_URL`, else `http://localhost:2300`. `just demo` starts the simulator and a
+connection to it in one process.
+
+## Packaging
+
+```bash
+just package
+```
+
+The archive lands next to `extension.toml` as `<name>-<version>.tar.gz`, where `<name>` is the
+manifest name in lowercase with every other run of characters turned into one hyphen. It holds
+`extension.toml`, the README, the icon, the config schema and the paths listed in
+`[package] paths`. With an agent runtime it also holds `pyproject.toml`, `uv.lock` and
+`actions.json`, the list of actions that run while the extension is stopped.
+
+## Release
+
+Add the release to `CHANGELOG.md` and commit it, then:
 
 ```bash
 just release 1.0.0
 git push --follow-tags
 ```
 
-## Testing
+The release workflow checks, tests and packages the extension, then attaches the archive to a
+GitHub release. CI runs the same check, test and package steps on every push and pull request.
 
-Integration tests start the real demo OPC-UA server on a loopback port, so they
-exercise the actual protocol path (batch reads, partial failure, reconnection).
-
-```bash
-just test                        # everything
-uv run pytest -v                 # verbose
-uv run pytest -k test_name       # one test
-```
-
-Keep tests targeted. Prefer one integration test that proves a behavior end to
-end over several unit tests that assert on internals.
-
-```python
-# tests/test_opcua.py
-async def test_write_readonly_raises(client):
-    node = client.node_map.get_by_name("input1")
-    with pytest.raises(ValueError, match="not writable"):
-        await client.write_node_value(node, True)
-```
-
-## Code Quality
-
-- ruff, line length 100, google docstrings
-- Type hints on every function signature
-- Comments state the constraint or the failure prevented, not what the code does
-
-## Getting Help
-
-- [Zelos Docs](https://docs.zeloscloud.io)
-- [SDK Guide](https://docs.zeloscloud.io/sdk)
-- [GitHub Issues](https://github.com/zeloscloud/zelos-extension-opcua/issues)
-
-## License
-
-MIT - see [LICENSE](LICENSE)
+To list the extension in the Zelos marketplace, once: push the project to a GitHub repository,
+submit it at [marketplace.zeloscloud.io](https://marketplace.zeloscloud.io/), and install the
+Zelos GitHub App on the repository when asked. After approval, every release you publish reaches
+the marketplace. See
+[Publish to the Marketplace](https://docs.zeloscloud.io/sdk/how-to/package-extensions/#publish-to-the-marketplace).

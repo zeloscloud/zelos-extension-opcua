@@ -81,10 +81,7 @@ TRANSPORTS = ("subscription", "poll")
 KEEPALIVE_SECONDS = 10.0
 LIFETIME_KEEPALIVES = 10
 
-# A subscription silent for (revised MaxKeepAliveCount + 1) revised publishing
-# intervals plus this has stalled: the extra interval is the cycle the keep-alive
-# goes out on, the margin covers transit and Publish queuing (the OPC Foundation
-# .NET client's).
+# Stall slack past (MaxKeepAliveCount + 1) publishing intervals, as the OPC Foundation .NET client.
 KEEPALIVE_MARGIN = 1.0
 # How often stalled subscriptions are looked for; sends nothing.
 WATCH_SECONDS = 1.0
@@ -130,9 +127,7 @@ CONNECTION_STATUS_CODES = frozenset(
         "BadShutdown",
     )
 )
-# In a StatusChangeNotification: the link is gone (asyncua's supervisor sends
-# BadShutdown). Anything else, e.g. BadTimeout (lifetime expired), ends only that
-# subscription.
+# StatusChange codes for a lost link (supervisor: BadShutdown); BadTimeout ends one subscription.
 LINK_LOST_CODES = CONNECTION_STATUS_CODES - {ua.StatusCodes.BadTimeout}
 # ActivateSession on a new channel: the server no longer holds the session
 # (timed out, closed, restarted). Other connection errors are the channel's.

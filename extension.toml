@@ -1,43 +1,25 @@
-# Zelos Extension Manifest
-# See https://docs.zeloscloud.io/sdk/how-to/develop-extensions/ for full documentation
-
 name = "OPC-UA"
 version = "0.1.5"
-description = "OPC-UA protocol extension for Zelos with node mapping and data type support"
-author = "Zelos Cloud"
+description = "Trace OPC UA servers, such as PLCs and gateways, by subscription or polling. Browsing finds every scalar variable, or a node map pins ids, units and scaling. Read, write and browse nodes, with optional signed and encrypted sessions and anonymous or X.509 user login."
+author = "Zelos"
 repository = "https://github.com/zeloscloud/zelos-extension-opcua"
-homepage = "https://github.com/zeloscloud/zelos-extension-opcua"
-keywords = ["opcua", "opc-ua", "industrial", "plc", "scada", "automation"]
-categories = ["Industrial", "IoT", "Protocol"]
-
-# File references (relative paths in archive)
+# At most 20 keywords and 10 categories. Marketplace search matches both, the name, description,
+# author and repository. Zelos AI sees the name, description and keywords, not the categories.
+keywords = ["opcua", "opc-ua", "industrial", "plc", "scada", "automation", "opc ua", "opc.tcp", "iec 62541", "node id", "nodeid", "node map", "address space", "namespace", "subscription", "asyncua", "x.509", "certificate", "basic256sha256", "local discovery server"]
+categories = ["Industrial", "IoT", "Protocol", "Networking"]
 icon = "assets/icon.png"
 readme = "README.md"
 
-# Compatibility (optional, defaults to ^25.0.20). 26.0.4 is the first app that
-# parses the [host]/[package] manifest syntax below; older ones fail on install.
 [zelos]
-version = ">=26.0.4"
+version = ">=26.0.10"
 
-# Configuration schema (enables UI in Zelos App)
 [config]
 schema = "config.schema.json"
 
-# Host: this extension runs as an agent-side process
-[host]
-type = "agent"
-
-[host.agent]
-entry = "main.py"
+[agent]
 runtime = "python"
+entry = "main.py"
 python_version = "3.11"
 
-# Graceful shutdown (optional, defaults to 10). Must live under [host.agent];
-# a top-level [stop] conflicts with [host.agent].
-[host.agent.stop]
-grace_seconds = 10
-
-# Package contents. extension.toml, readme, icon, config schema, pyproject.toml,
-# uv.lock, and actions.json are included automatically.
 [package]
-paths = ["main.py", "zelos_extension_opcua"]
+paths = ["LICENSE", "main.py", "zelos_extension_opcua"]
