@@ -471,6 +471,18 @@ async def test_auto_config_empty_form_finds_nothing(monkeypatch):
     }
 
 
+def test_auto_config_without_the_form_checks_the_saved_servers(tmp_path, monkeypatch):
+    gone = closed_endpoint()
+    saved = tmp_path / "config.json"
+    saved.write_text(json.dumps({"servers": [{"name": "gone", "endpoint": gone}]}))
+    monkeypatch.setenv("ZELOS_CONFIG_PATH", str(saved))
+    monkeypatch.chdir(Path(__file__).parents[1])
+    registry = zelos_sdk.actions.ActionsRegistry()
+    actions.register_actions(registry)
+    result = registry.execute("auto_config", {}).value
+    assert result == {"status": "error", "message": f"Couldn't connect to {gone}."}
+
+
 def test_auto_config_never_downgrades():
     """A server accepting None gets "default": a secure Advanced default still applies."""
     from zelos_extension_opcua.autoconfig import _security

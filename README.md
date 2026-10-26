@@ -129,15 +129,15 @@ just install      # deps + pre-commit hooks
 just format       # ruff format + fix
 just check        # ruff lint + format check
 just test         # pytest
-just dev          # run app mode locally
+just run          # run app mode locally
 just sim          # standalone simulator: --profile demo|gateway|s7|device, --secure
 ```
 
 ## Links
 
 - [Zelos Documentation](https://docs.zeloscloud.io)
-- [SDK Guide](https://docs.zeloscloud.io/sdk)
-- [asyncua Documentation](https://python-opcua.readthedocs.io/)
+- [SDK Guide](https://docs.zeloscloud.io/latest/sdk/)
+- [asyncua Documentation](https://opcua-asyncio.readthedocs.io/)
 - [GitHub Issues](https://github.com/zeloscloud/zelos-extension-opcua/issues)
 
 ## CLI Usage

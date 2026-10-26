@@ -156,12 +156,6 @@ class Node:
         return ns
 
     @property
-    def identifier_type(self) -> str:
-        """Get identifier type from node ID (s=string, i=numeric, g=guid, b=opaque)."""
-        _, id_type, _ = parse_node_id(self.node_id)
-        return id_type
-
-    @property
     def identifier(self) -> str | int | uuid.UUID | bytes:
         """Get identifier value from node ID, typed for asyncua."""
         _, _, identifier = parse_node_id(self.node_id)
@@ -303,22 +297,6 @@ class NodeMap:
             all_nodes.extend(nodes)
         return all_nodes
 
-    @property
-    def event_names(self) -> list[str]:
-        """List of all event names."""
-        return list(self.events.keys())
-
-    def get_event(self, event_name: str) -> list[Node]:
-        """Get all nodes for an event.
-
-        Args:
-            event_name: Name of the event
-
-        Returns:
-            List of nodes for this event
-        """
-        return self.events.get(event_name, [])
-
     def get_by_name(self, name: str) -> Node | None:
         """Find a node by name, or by `<event>/<name>`.
 
@@ -344,28 +322,3 @@ class NodeMap:
             choices = ", ".join(f"{e}/{n.name}" for e, n in matches)
             raise ValueError(f"Node name '{name}' is in several events; use one of: {choices}")
         return matches[0][1] if matches else None
-
-    def get_by_node_id(self, node_id: str) -> Node | None:
-        """Find node by OPC-UA node ID.
-
-        Args:
-            node_id: OPC-UA node ID
-
-        Returns:
-            Node if found, None otherwise
-        """
-        for nodes in self.events.values():
-            for node in nodes:
-                if node.node_id == node_id:
-                    return node
-        return None
-
-    @property
-    def writable_nodes(self) -> list[Node]:
-        """Flat list of all writable nodes."""
-        return [n for n in self.nodes if n.writable is True]
-
-    @property
-    def writable_names(self) -> list[str]:
-        """List of all writable node names."""
-        return [n.name for n in self.writable_nodes]
