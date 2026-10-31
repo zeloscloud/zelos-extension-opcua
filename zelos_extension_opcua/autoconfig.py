@@ -17,6 +17,10 @@ from urllib.parse import urlparse
 import zelos_sdk
 from asyncua import Client, ua
 
+# Not in the browse: a first import can take seconds, and the probes' timeouts would count it.
+from zeroconf import ServiceStateChange
+from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
+
 from zelos_extension_opcua.client import (
     SECURITY_MODES,
     SECURITY_POLICIES,
@@ -102,9 +106,6 @@ async def _lds_urls() -> list[str]:
 
 async def _mdns_urls() -> list[str]:
     """opc.tcp URLs announced over mDNS within MDNS_SECONDS."""
-    from zeroconf import ServiceStateChange
-    from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
-
     names: set[str] = set()
 
     def on_change(zeroconf: Any, service_type: str, name: str, state_change: Any) -> None:
