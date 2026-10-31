@@ -8,6 +8,7 @@ import json
 import logging
 import socket
 import struct
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -405,6 +406,34 @@ async def test_auto_config_finds_local_servers(monkeypatch):
     schema = json.loads((Path(__file__).parents[1] / "config.schema.json").read_text())
     assert schema["ui:options"]["autoconfig"] == f"{ACTION_PREFIX}/auto_config"
     assert "auto_config" in get_standalone_actions()
+
+
+class SlowFirstImport:
+    """Stalls the first import of `package` by `seconds`, as a fresh install's first load does."""
+
+    def __init__(self, package: str, seconds: float) -> None:
+        self.package, self.seconds = package, seconds
+
+    def find_spec(self, name: str, path: object = None, target: object = None) -> None:
+        if name == self.package:
+            time.sleep(self.seconds)
+
+
+async def test_auto_config_finds_a_local_server_while_zeroconf_first_loads(monkeypatch):
+    for name in [m for m in sys.modules if m.partition(".")[0] == "zeroconf"]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(autoconfig, "PROBE_TIMEOUT", 10.0)  # a loaded machine is slow
+    slow = SlowFirstImport("zeroconf", autoconfig.PROBE_TIMEOUT + 2.0)  # past every probe's clock
+    monkeypatch.setattr(sys, "meta_path", [slow, *sys.meta_path])
+    monkeypatch.setattr(autoconfig, "MDNS_SECONDS", 0.1)
+    async with Simulator("demo", port=0) as sim:
+        port = sim.server.bserver.port
+        monkeypatch.setattr(autoconfig, "WELL_KNOWN_PORTS", (port,))
+        monkeypatch.setattr(autoconfig, "LDS_URL", f"opc.tcp://localhost:{port}")
+        result = await asyncio.to_thread(actions.auto_config, {})
+    assert f"opc.tcp://localhost:{port}/freeopcua/server/" in [
+        s["endpoint"] for s in result.get("config", {}).get("servers", [])
+    ], result
 
 
 async def no_mdns() -> list[str]:

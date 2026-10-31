@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The marketplace listing's description, keywords and categories name what the extension does.
 - Needs Zelos 26.0.10 or later.
 
+### Fixed
+- Auto-configure finds the servers on this machine on its first run after install. That run could time out every probe while the mDNS library loaded for the first time, and report that no server answered.
+
 ## [0.1.5] - 2026-10-26
 
 ### Changed
