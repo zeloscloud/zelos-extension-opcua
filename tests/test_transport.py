@@ -493,7 +493,7 @@ async def test_setup_cut_by_a_lost_link_is_rebuilt_on_resume(monkeypatch, caplog
             assert client.status()["subscribed"] == 2
 
 
-async def test_recreate_cut_by_a_lost_link_is_rebuilt_on_resume(monkeypatch, caplog):
+async def test_recreate_cut_by_a_lost_link_is_rebuilt_on_resume(caplog):
     """The link lost between a recreate's delete and create: nothing is lost on resume."""
     caplog.set_level(logging.INFO, logger="zelos_extension_opcua.client")
     async with Simulator(port=0) as sim:

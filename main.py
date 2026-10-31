@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Zelos OPC-UA Extension - CLI entry point.
 
 Modes:
@@ -22,14 +21,8 @@ from pathlib import Path
 
 import rich_click as click
 
-from zelos_extension_opcua import ACTION_PREFIX as _ACTION_PREFIX
 from zelos_extension_opcua.cli import app as app_mode
 from zelos_extension_opcua.client import default_server_name
-
-#: Re-exported so a packaging-time action inventory - which reads this entry
-#: module - sees the same namespace the live registration uses. See the
-#: definition in `zelos_extension_opcua/__init__.py`.
-ACTION_PREFIX = _ACTION_PREFIX
 
 # UTC ISO 8601 with ms, matching the SDK's Rust tracing lines in the same log stream
 logging.Formatter.converter = time.gmtime
@@ -40,9 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# asyncua logs a record per request at INFO, which at a 1 Hz poll is a permanent
-# stream into the trace log (installed in cli/app.serve). Only DEBUG re-opens it -
-# see cli/app.apply_log_level.
+# asyncua logs every request at INFO; only DEBUG re-opens it (cli/app.apply_log_level).
 logging.getLogger("asyncua").setLevel(logging.WARNING)
 
 

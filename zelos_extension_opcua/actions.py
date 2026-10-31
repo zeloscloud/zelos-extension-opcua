@@ -319,10 +319,9 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
 
 @zelos_sdk.action(
     "Auto-configure",
-    "Check each server in the form at its endpoint (unsaved edits included; older apps: "
-    "the saved config) and fill in security left at default. With none, find servers on "
-    "this machine (well-known ports, the local discovery server) and announced over "
-    "mDNS. Review, then save and start.",
+    "Check each server in the form at its endpoint (unsaved edits included) and fill in "
+    "security left at default. With none, find servers on this machine (well-known ports, "
+    "the local discovery server) and announced over mDNS. Review, then save and start.",
     # Read-only and session-less, and the form wants it before a first start.
     standalone=True,
     hidden=True,
@@ -332,7 +331,7 @@ def write_named_node(name: str, value: str, server: str = "") -> dict[str, Any]:
     "config",
     properties={},
     title="Config",
-    description="The config form's current (possibly unsaved) data. Empty: the saved config",
+    description="The config form's current (possibly unsaved) data. Omitted: the saved config",
     required=False,
 )
 def auto_config(config: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -394,7 +394,7 @@ async def _browse_batch(
 
 
 async def walk(
-    rpc: _Counter, chunk: int, filters: PathFilter = PathFilter()
+    rpc: _Counter, chunk: int, filters: PathFilter
 ) -> tuple[list[Found], list[str], int]:
     """Breadth-first from Objects over forward hierarchical references.
 
@@ -681,7 +681,7 @@ async def discover(
     browse_chunk: int,
     read_chunk: int,
     name: str,
-    filters: PathFilter = PathFilter(),
+    filters: PathFilter,
 ) -> Discovery:
     """Walk, describe and name the server's Variables; `name` names the map."""
     started = time.monotonic()
