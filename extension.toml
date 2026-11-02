@@ -1,5 +1,5 @@
 name = "OPC-UA"
-version = "0.1.5"
+version = "0.2.0"
 description = "Trace OPC UA servers, such as PLCs and gateways, by subscription or polling. Browsing finds every scalar variable, or a node map pins ids, units and scaling. Read, write and browse nodes, with optional signed and encrypted sessions and anonymous or X.509 user login."
 author = "Zelos"
 repository = "https://github.com/zeloscloud/zelos-extension-opcua"
