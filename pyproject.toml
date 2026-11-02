@@ -7,7 +7,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 keywords = ["zelos", "extension", "opcua", "opc-ua", "industrial", "plc", "scada"]
 dependencies = [
-    "zelos-sdk>=0.0.13a1",
+    "zelos-sdk>=0.0.13",
     # 1.x sends a ServerUri that .NET-stack and C++ SDK servers reject (BadServerUriInvalid)
     "asyncua>=2.0.1",
     "cryptography>=42.0.0",

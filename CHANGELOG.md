@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Manifest declares the agent runtime as `[agent]`.
 - The marketplace listing's description, keywords and categories name what the extension does.
 - Needs Zelos 26.0.10 or later.
+- zelos-sdk floor 0.0.13.
 
 ### Fixed
 - Auto-configure finds the servers on this machine on its first run after install. That run could time out every probe while the mDNS library loaded for the first time, and report that no server answered.
